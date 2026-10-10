@@ -156,7 +156,7 @@ def test_macos_config_and_login_shell(monkeypatch, tmp_path):
 
 def test_macos_manifest_has_unique_actions_and_native_commands():
     root = Path(__file__).parent.parent
-    manifest = tomllib.loads((root / "herdr-plugin.toml").read_text())
+    manifest = tomllib.loads((root / "legacy/herdr-plugin.toml").read_text())
     ids = [a["id"] for a in manifest["actions"]]
     assert len(set(ids)) == len(ids)
     assert "macos" in manifest["platforms"] and "windows" in manifest["platforms"]

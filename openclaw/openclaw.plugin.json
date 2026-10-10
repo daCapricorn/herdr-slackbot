@@ -1,0 +1,26 @@
+{
+  "id": "herdr-bridge",
+  "name": "Herdr Bridge",
+  "description": "Local Herdr bridge; OpenClaw owns messaging and channel authentication",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "python": {"type": "string"},
+      "projectRoot": {"type": "string"},
+      "socketPath": {"type": "string"},
+      "herdrBin": {"type": "string"},
+      "ownerIds": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+      "route": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "channel": {"type": "string", "enum": ["slack"]},
+          "to": {"type": "string"},
+          "accountId": {"type": "string"}
+        },
+        "required": ["channel", "to", "accountId"]
+      }
+    },
+    "required": ["python", "projectRoot", "ownerIds", "route"]
+  }
+}

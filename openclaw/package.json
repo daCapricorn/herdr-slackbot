@@ -1,0 +1,10 @@
+{
+  "name": "herdr-bridge",
+  "version": "0.2.0",
+  "description": "Herdr terminal events and human approvals through OpenClaw",
+  "type": "module",
+  "license": "MIT",
+  "openclaw": {"extensions": ["./index.js"]},
+  "scripts": {"test": "node --test test/*.test.js"},
+  "engines": {"node": ">=22"}
+}
