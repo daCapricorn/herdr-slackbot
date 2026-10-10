@@ -11,7 +11,11 @@ Decision source: [shared design conversation](https://chatgpt.com/share/e/6aca5d
 
 Verified SDK APIs: `registerService`, `registerCommand`, `registerTool`, `registerInteractiveHandler`, `api.runtime.channel.outbound.loadAdapter` and `api.runtime.config.current()`. Delivery uses the channel's normalization, presentation rendering and `sendPayload`.
 
+OpenClaw 2026.9.9 requires `contracts.tools` in the manifest for registered agent tools. Reloading after that declaration changes needs `openclaw plugins reload herdr-bridge --accept-capabilities`. A metadata-only inspect does not import plugin code; use `openclaw plugins inspect herdr-bridge --runtime --json` to verify actual registrations and diagnostics.
+
 Slack 2026.9.9 only executes certain core approval command buttons. Bridge instead uses a portable callback action `herdr-bridge:<request-id>:<option>` and registers the `slack` / `herdr-bridge` namespace. OpenClaw supplies authenticated sender/account/auth context. Callback text is never authorization.
+
+Button labels are compact numbered summaries; full labels and command evidence remain in the terminal excerpt. Slack's renderer downgrades an entire control row to text if any label exceeds its native limit, so labels are bounded before native rendering. The authenticated `herdr-bridge:probe` callback is a no-op connection check that edits the original card with its result instead of relying on an ephemeral reply.
 
 ## Private protocol
 
@@ -26,16 +30,29 @@ Methods: `status`, `read`, `send`, `pending`, `answer`, `events`, `ack`. Errors 
 
 Events contain stable event IDs, agent identity, timestamp and terminal evidence. `approval.requested` adds request ID, expiry, state sequence, fingerprint and exact options. Unrecognized dialogs become `agent.blocked` without remote options. The tested event reconciler handles fast transitions and reconnection; a scan recovers agents blocked before startup and dialogs changing while still blocked.
 
+Codex approval evidence begins at its current command question; transcript updates above it cannot change the request fingerprint. Unknown screen redraws notify only once per terminal/status generation. Replaced requests become superseded, and queued cards are discarded when the agent advances or the request expires. Dispatch rechecks the status sequence after reading the dialog as well as before it.
+
 ## Rollout and scope
 
 1. Save the old implementation (`c9f17c8`).
 2. Develop on `feature/openclaw-bridge`, branched from `develop`.
 3. Check Python safety tests, JavaScript plugin tests, actual plugin discovery, config validation and live Herdr reads.
 4. Configure owner/route, stop the old runtime, restart Gateway.
-5. Verify a harmless real approval from phone. Provider delivery alone does not verify push notification or human approval.
+5. Verify the no-op callback; separately verify a harmless real terminal approval from phone. Provider delivery alone does not verify push notification or terminal dispatch.
 
 Herdr approvals remain owned by Bridge; they are not inserted into OpenClaw's native `exec.approvals` store. Unsupported dialogs require local handling. New-agent creation, arbitrary raw keypads, implicit thread-to-pane routing and auto-approval are not exposed.
 
 Messages may duplicate after ambiguous provider results. Terminal effects never replay. Herdr has no atomic compare-and-send-keys operation, so fingerprint/identity checks cannot eliminate a simultaneous local operator race.
 
 Legacy tests read `legacy/herdr-plugin.toml`. The root manifest registers `herdr-bridge` and has no old runtime startup hook.
+
+## Verified on 2026-10-10
+
+- Full Python regression: 873 passed, 5 opt-in live tests skipped. JavaScript plugin tests: 6 passed.
+- Real NDJSON worker: `status` returned 3 local agents; `read` returned the requested pane; process exited cleanly on EOF.
+- Actual OpenClaw runtime inspection: `herdr` command, `herdr-bridge` service, `herdr_status` / `herdr_read` tools, no diagnostics.
+- Gateway owns the running worker; the old standalone bot process is stopped. Slack account `default` is connected.
+- OpenClaw provider receipts and a readback of the real bot DM confirmed native approval cards with `openclaw:callback_button` actions and exact Bridge request IDs. These are top-level messages.
+- A real `herdr-bridge:probe` interaction reached the handler and updated the Slack DM card to “Herdr Bridge callback connected. No terminal operation was performed.” Both the Gateway callback log and Slack UI confirmed this. Phone push and actual terminal approval dispatch remain separate checks.
+
+Local configuration is in OpenClaw, with owner-only Slack DM ingress and the two owner-gated read tools enabled. The ignored `openclaw.local.patch.json` contains this machine's paths and owner ID, not tokens.

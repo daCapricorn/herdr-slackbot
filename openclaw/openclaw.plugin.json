@@ -2,6 +2,7 @@
   "id": "herdr-bridge",
   "name": "Herdr Bridge",
   "description": "Local Herdr bridge; OpenClaw owns messaging and channel authentication",
+  "contracts": {"tools": ["herdr_status", "herdr_read"]},
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

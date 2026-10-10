@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .dialog import keys_for, parse_dialog
+from .dialog import KIND_UNKNOWN, keys_for, parse_dialog
 from .events import session_of
 
 
@@ -28,6 +28,20 @@ def public_agent(info):
             "status": info.get("agent_status"), "name": info.get("name"),
             "cwd": info.get("cwd"), "title": info.get("terminal_title_stripped"),
             "workspace_id": info.get("workspace_id")}
+
+
+def current_dialog(screen, kind):
+    # Codex does not draw a top rule. Its transcript above the approval keeps
+    # changing (tool output, elapsed timers); that is not approval evidence.
+    if kind == "codex":
+        lines = screen.splitlines()
+        anchors = [i for i, line in enumerate(lines)
+                   if line.strip() == "Would you like to run the following command?"]
+        if not anchors:
+            return None
+        screen = "\n".join(lines[anchors[-1]:])
+    dialog = parse_dialog(screen, kind) if kind in ("codex", "claude") else None
+    return dialog if dialog and dialog.kind != KIND_UNKNOWN else None
 
 
 class Bridge:
@@ -80,20 +94,28 @@ class Bridge:
         pane = info["pane_id"]
         screen = self.client.read_agent_once(pane, 160, source="visible")
         fresh = self._agent(pane)
-        if identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked":
+        if (identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked"
+                or fresh.get("state_change_seq") != info.get("state_change_seq")):
             return
         kind = info.get("agent")
-        dialog = parse_dialog(screen, kind) if kind in ("codex", "claude") else None
+        dialog = current_dialog(screen, kind)
+        fingerprint = dialog.fingerprint if dialog else None
         with self.lock, self.db:
             rows = self.db.execute("SELECT id, record, state FROM approvals").fetchall()
             for request_id, raw, state in rows:
                 rec = json.loads(raw)
-                if (tuple(rec["identity"]) == identity(info) and rec["pane_id"] == pane
-                        and rec.get("sequence") == info.get("state_change_seq")
-                        and rec["fingerprint"] == (dialog.fingerprint if dialog else screen)
-                        and (state != "pending" or rec["expires_at"] > self.clock())):
-                    # Consumed/uncertain actions are never rearmed by polling.
-                    return
+                if rec["pane_id"] != pane:
+                    continue
+                same_generation = (tuple(rec["identity"]) == identity(info)
+                                   and rec.get("sequence") == info.get("state_change_seq"))
+                if same_generation and state in ("dispatched", "uncertain"):
+                    return  # Never rearm after terminal delivery, even on redraw.
+                if (same_generation and rec.get("evidence_version") == 1
+                        and rec["fingerprint"] == fingerprint and state != "superseded"):
+                    return  # Unknown screens and expired requests also notify only once.
+                if state == "pending":
+                    # Replace stale cards; a callback to them can no longer dispatch.
+                    self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request_id,))
             request_id = uuid.uuid4().hex
             options = []
             if dialog and not dialog.multi_select and not dialog.plan_file:
@@ -101,7 +123,7 @@ class Bridge:
                            if not o.free_text and not o.chat]
             rec = {"id": request_id, "pane_id": pane, "identity": identity(info),
                    "sequence": info.get("state_change_seq"),
-                   "fingerprint": dialog.fingerprint if dialog else screen,
+                   "fingerprint": fingerprint, "evidence_version": 1,
                    "created_at": self.clock(), "expires_at": self.clock() + self.approval_ttl,
                    "options": options}
             self.db.execute("INSERT INTO approvals VALUES (?, ?, 'pending')", (request_id, json.dumps(rec)))
@@ -122,13 +144,29 @@ class Bridge:
                 self._queue("agent.done", info, text=text)
 
     def pending(self):
-        with self.lock:
+        with self.lock, self.db:
+            live = {a["pane_id"]: a for a in self.client.list_agents()}
+            for request_id, raw in self.db.execute("SELECT id, record FROM approvals WHERE state='pending'").fetchall():
+                rec = json.loads(raw)
+                info = live.get(rec["pane_id"])
+                if (not info or identity(info) != tuple(rec["identity"])
+                        or info.get("agent_status") != "blocked"
+                        or info.get("state_change_seq") != rec.get("sequence")):
+                    self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request_id,))
             return [json.loads(r[0]) for r in self.db.execute(
                 "SELECT record FROM approvals WHERE state='pending'")
                     if json.loads(r[0])["expires_at"] > self.clock()]
 
     def events(self):
-        with self.lock:
+        self.pending()  # Retire cards whose pane has already advanced.
+        with self.lock, self.db:
+            for event_id, raw in self.db.execute("SELECT id, event FROM outbox").fetchall():
+                event = json.loads(raw)
+                request = event.get("request")
+                if request:
+                    state = self.db.execute("SELECT state FROM approvals WHERE id=?", (request["id"],)).fetchone()
+                    if not state or state[0] != "pending" or request["expires_at"] <= self.clock():
+                        self.db.execute("DELETE FROM outbox WHERE id=?", (event_id,))
             return [json.loads(row[0]) for row in self.db.execute("SELECT event FROM outbox ORDER BY rowid LIMIT 20")]
 
     def ack(self, event_id):
@@ -151,11 +189,12 @@ class Bridge:
                     or rec.get("sequence") != info.get("state_change_seq")):
                 raise BridgeError("Agent changed or is no longer blocked; nothing was sent")
             screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
-            dialog = parse_dialog(screen, info.get("agent"))
+            dialog = current_dialog(screen, info.get("agent"))
             if not dialog or dialog.fingerprint != rec["fingerprint"]:
                 raise BridgeError("Dialog changed; nothing was sent")
             fresh = self._agent(rec["pane_id"])
-            if identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked":
+            if (identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked"
+                    or fresh.get("state_change_seq") != rec.get("sequence")):
                 raise BridgeError("Agent changed before dispatch; nothing was sent")
             # Commit BEFORE touching the terminal. A lost reply/crash must never replay keys.
             with self.db:

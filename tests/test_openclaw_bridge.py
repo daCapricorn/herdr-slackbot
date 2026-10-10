@@ -159,3 +159,45 @@ def test_root_manifest_never_starts_legacy_socket_consumer():
     assert manifest["id"] == "herdr-bridge"
     assert not manifest.get("startup")
     assert "herdr_slackbot" not in json.dumps(manifest)
+
+
+def test_codex_transcript_redraw_does_not_change_approval(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    client.screen = "• Working (38s)\nNew tool output\n" + client.screen
+    bridge.discover(client.info)
+    assert len(bridge.events()) == 1
+    assert bridge.pending()[0]["id"] == token
+    bridge.answer(token, 0)
+    assert client.keys == [("w4:p2", ["1"])]
+
+
+def test_unknown_screen_redraw_notifies_once(setup):
+    client, bridge = setup
+    client.screen = "Working (5s)"
+    token = request(client, bridge)
+    client.screen = "Working (10s)"
+    bridge.discover(client.info)
+    assert len(bridge.events()) == 1 and bridge.pending()[0]["id"] == token
+    bridge.clock = lambda: 1001
+    bridge.discover(client.info)
+    assert not bridge.events() and not bridge.pending()
+
+
+def test_replacement_dialog_retires_old_card_and_unsent_event(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    client.screen = client.screen.replace("Set-Content", "Remove-Item")
+    bridge.discover(client.info)
+    assert len(bridge.pending()) == 1 and bridge.pending()[0]["id"] != token
+    assert len(bridge.events()) == 1
+    with pytest.raises(BridgeError):
+        bridge.answer(token, 0)
+    assert not client.keys
+
+
+def test_agent_progress_retires_queued_approval(setup):
+    client, bridge = setup
+    request(client, bridge)
+    client.info["agent_status"] = "working"
+    assert not bridge.pending() and not bridge.events()

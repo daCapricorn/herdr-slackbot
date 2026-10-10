@@ -34,6 +34,8 @@ Configure `plugins.entries.herdr-bridge.config` with absolute paths:
 }
 ```
 
+An editable patch template is in `openclaw/example.patch.json`. After filling in paths and owner ID, apply it with `openclaw config patch --file <your-patch.json>`. Set OpenClaw Slack `dmPolicy` to `allowlist` and `allowFrom` to your owner ID so authenticated DM commands can enter the plugin.
+
 `socketPath` also accepts a Windows named pipe. Set `herdrBin` if Herdr is outside the Gateway PATH. On Windows use `.venv/Scripts/python.exe`. The checkout name may remain `herdr-slackbot`.
 
 Stop the previous standalone bot, then restart Gateway:
@@ -56,7 +58,7 @@ Send `/herdr status` as a **text command in the OpenClaw bot DM**. If Slack's co
 | `/herdr send w4:p2 inspect the project` | Prompt an idle/done agent |
 | `/herdr answer <request-id> 0` | Answer one exact request after live revalidation |
 
-Codex/Claude single-choice dialogs become portable `MessagePresentation` buttons. Clicks use OpenClaw's authenticated plugin callback path. Notifications go to the configured DM as top-level messages.
+Recognized Codex command approvals and Claude single-choice dialogs become portable `MessagePresentation` buttons. Clicks use OpenClaw's authenticated plugin callback path. Notifications go to the configured DM as top-level messages.
 
 Bridge lists/reads any kind reported by Herdr, including Pi. Unrecognized dialogs, multi-select, typed inputs and file-backed plans require local handling; remote keys are disabled for these.
 
@@ -65,6 +67,8 @@ Optional `herdr_status` and `herdr_read` tools let OpenClaw inspect terminals in
 ## Reliability
 
 Pending requests and an outbound queue live in Gateway service state. Before sending keys, Bridge checks expiry, option membership, terminal/session identity, state sequence, blocked status and dialog fingerprint. It durably consumes a request before pressing keys. Crashes and lost replies never replay a terminal mutation. One state lock prevents overlapping workers.
+
+Transcript redraws do not create new command approvals. Replaced requests are invalidated; stale or expired queued cards are dropped. The no-op connection check updates its original card so the callback result stays visible.
 
 Message delivery is **at least once**: failed sends stay queued; a lost provider acknowledgement may produce duplicate cards. Copies share the same request ID and can be answered at most once. Gateway/worker restarts preserve state.
 

@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import plugin, { authorized } from "../index.js";
-import { eventPayload, deliver } from "../presentation.js";
+import { eventPayload, deliver, buttonLabel } from "../presentation.js";
+import { readFileSync } from "node:fs";
 
 const config = { route: { channel: "slack", accountId: "default", to: "user:U1" }, ownerIds: ["U1"] };
 const trusted = { channel: "slack", accountId: "default", senderId: "U1", isAuthorizedSender: true };
@@ -19,6 +20,7 @@ test("portable approval actions carry exact request and option, never raw keys",
     { type: "callback", value: `herdr-bridge:${"a".repeat(32)}:0` });
   assert.ok(!payload.presentation.blocks[1].text.includes("```malicious"));
   assert.ok(!payload.channelData);
+  assert.ok(Array.from(buttonLabel({index:1,label:"very long approval ".repeat(20)})).length <= 60);
 });
 test("delivery uses live OpenClaw config, native normalization/rendering and sends once", async () => {
   const calls = [];
@@ -39,10 +41,17 @@ test("registration has no discovery side effects and offers only read tools to m
   const registrations = {};
   plugin.register({ pluginConfig: config, logger: {}, registerService: (s) => registrations.service = s,
     registerCommand: (c) => registrations.command = c, registerInteractiveHandler: (i) => registrations.interactive = i,
-    registerTool: (t) => (registrations.tools ??= []).push(t) });
+    registerTool: (t, opts) => (registrations.tools ??= []).push({factory:t, name:opts.name}) });
   assert.equal(registrations.service.id, "herdr-bridge");
   assert.equal(registrations.interactive.namespace, "herdr-bridge");
   assert.deepEqual(registrations.tools.map((x) => x.name), ["herdr_status", "herdr_read"]);
+  const manifest = JSON.parse(readFileSync(new URL("../openclaw.plugin.json", import.meta.url)));
+  assert.deepEqual(manifest.contracts.tools, registrations.tools.map((x) => x.name));
+  for (const tool of registrations.tools) {
+    assert.equal(tool.factory.contextVersion, 2);
+    assert.equal(tool.factory.create({senderIsOwner:false}), null);
+    assert.equal(tool.factory.create({senderIsOwner:true}).name, tool.name);
+  }
 });
 test("unauthorized callbacks cannot reach the worker or clear a card", async () => {
   let interactive;
@@ -52,4 +61,12 @@ test("unauthorized callbacks cannot reach the worker or clear a card", async () 
   await interactive.handler({ ...trusted, senderId: "U2", interaction: { payload: "a".repeat(32) + ":0" },
     respond: { reply: (r) => text = r.text, editMessage: () => assert.fail("unauthorized edit") } });
   assert.match(text, /not authorized/);
+});
+test("connection probe is authenticated and never starts a terminal action", async () => {
+  let interactive;
+  plugin.register({pluginConfig:config,logger:{},registerService(){},registerCommand(){},registerTool(){},
+    registerInteractiveHandler:(i)=>interactive=i});
+  let response;
+  await interactive.handler({...trusted,interaction:{payload:"probe"},respond:{editMessage:(r)=>response=r.text}});
+  assert.match(response,/No terminal operation/);
 });

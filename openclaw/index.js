@@ -13,8 +13,8 @@ export function authorized(config, ctx) {
 export default {
   id: "herdr-bridge", name: "Herdr Bridge", version: "0.2.0",
   register(api) {
-    const config = api.pluginConfig;
-    let worker, timer, busy = false, stopping = true, controller;
+    let config = api.pluginConfig;
+    let worker, timer, busy = false, stopping = true, controller, pumping;
     const call = (method, params) => {
       if (!worker || stopping) throw new Error("Herdr bridge service is not running");
       return worker.call(method, params);
@@ -27,6 +27,7 @@ export default {
       id: "herdr-bridge",
       reload: { configPrefixes: ["plugins.entries.herdr-bridge.config"] },
       async start(ctx) {
+        config = ctx.config.plugins?.entries?.["herdr-bridge"]?.config ?? api.pluginConfig;
         const stateDir = join(ctx.stateDir, "herdr-bridge");
         await mkdir(stateDir, { recursive: true, mode: 0o700 });
         stopping = false;
@@ -50,20 +51,23 @@ export default {
               if (stopping) break;
               await deliver(api, config.route, eventPayload(event), controller.signal);
               await call("ack", { event_id: event.id });
+              api.logger.info(`Herdr event delivered: ${event.type} ${event.id}`);
             }
             ctx.serviceHealth?.clearFailure();
           } catch (error) {
             if (!stopping) { api.logger.warn(`Herdr delivery deferred: ${error.message}`); ctx.serviceHealth?.reportFailure(error); }
           } finally { busy = false; }
         };
-        timer = setInterval(pump, 5000);
+        const tick = () => { if (!busy && !stopping) pumping = pump(); };
+        timer = setInterval(tick, 5000);
         timer.unref();
-        void pump();
+        tick();
       },
       async stop() {
         stopping = true;
         clearInterval(timer);
         controller?.abort();
+        await pumping;
         await worker?.stop();
         worker = undefined;
       },
@@ -101,6 +105,11 @@ export default {
       async handler(ctx) {
         try {
           allowed(ctx);
+          api.logger.info?.(`Herdr callback received: ${ctx.interaction.payload === "probe" ? "probe" : "approval"}`);
+          if (ctx.interaction.payload === "probe") {
+            await ctx.respond.editMessage({text: "✅ Herdr Bridge callback connected. No terminal operation was performed.", blocks: []});
+            return {handled:true};
+          }
           const match = /^([a-f0-9]{32}):(\d+)$/.exec(ctx.interaction.payload);
           if (!match) throw new Error("Invalid Herdr approval callback");
           const result = await call("answer", { request_id: match[1], option: Number(match[2]) });
@@ -114,12 +123,18 @@ export default {
       ["herdr_status", "status", "List all Herdr agents and exact pane IDs", { type: "object", properties: {}, additionalProperties: false }],
       ["herdr_read", "read", "Read the visible terminal of a specific Herdr pane", { type: "object", properties: { pane: { type: "string" } }, required: ["pane"], additionalProperties: false }],
     ]) {
-      api.registerTool({ name, label: name, description, parameters,
-        async execute(_id, params) {
-          const result = await call(method, params);
-          return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
-        },
-      }, { optional: true });
+      api.registerTool({ contextVersion: 2, create(ctx) {
+        if (ctx.senderIsOwner !== true) return null;
+        return { name, label: name, description, parameters,
+          async execute(_id, params) {
+            ctx.assertInvocationCurrent();
+            if (ctx.senderIsOwner !== true) throw new Error("Herdr tools require the current OpenClaw owner");
+            const result = await call(method, params);
+            ctx.assertInvocationCurrent();
+            return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+          },
+        };
+      } }, { name, optional: true });
     }
   },
 };

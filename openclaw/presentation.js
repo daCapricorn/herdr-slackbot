@@ -5,6 +5,12 @@ export function literal(text) {
 export function code(text) {
   return "```text\n" + String(text ?? "").replaceAll("```", "`\u200b``") + "\n```";
 }
+export function buttonLabel(option) {
+  const label = `${option.index + 1}. ${option.label}`;
+  const chars = Array.from(label);
+  // Compact summaries keep controls portable; full evidence remains in the body.
+  return chars.length > 60 ? chars.slice(0, 59).join("") + "…" : label;
+}
 export function eventPayload(event) {
   const a = event.agent;
   const title = `${a.pane_id} · ${a.kind} · ${a.title || a.name || a.cwd || "Herdr"}`;
@@ -16,7 +22,7 @@ export function eventPayload(event) {
   if (request?.options?.length) {
     blocks.push({ type: "context", text: `Request ${request.id} · expires ${new Date(request.expires_at * 1000).toISOString()}` });
     blocks.push({ type: "buttons", buttons: request.options.map((o) => ({
-      label: o.label,
+      label: buttonLabel(o),
       action: { type: "callback", value: `herdr-bridge:${request.id}:${o.index}` },
     })) });
   } else if (event.type === "agent.blocked") {
@@ -36,7 +42,8 @@ export async function deliver(api, route, payload, signal) {
   const adapter = await api.runtime.channel.outbound.loadAdapter(route.channel);
   if (!adapter?.sendPayload) throw new Error(`OpenClaw channel ${route.channel} has no payload sender`);
   const cfg = api.runtime.config.current();
-  const ctx = { cfg, to: route.to, accountId: route.accountId, text: payload.text ?? "", payload, signal };
+  const ctx = { cfg, to: route.to, accountId: route.accountId, text: payload.text ?? "", payload, signal,
+    assertDirectAdapterHandoff: () => signal?.throwIfAborted() };
   const normalized = adapter.normalizePayload ? adapter.normalizePayload({ cfg, accountId: route.accountId, payload }) : payload;
   if (!normalized) throw new Error("OpenClaw channel suppressed the bridge payload");
   ctx.payload = normalized;
