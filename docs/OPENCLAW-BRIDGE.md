@@ -17,6 +17,8 @@ Slack 2026.9.9 only executes certain core approval command buttons. Bridge inste
 
 Button labels are compact numbered summaries; full labels and command evidence remain in the terminal excerpt. Slack's renderer downgrades an entire control row to text if any label exceeds its native limit, so labels are bounded before native rendering. The authenticated `herdr-bridge:probe` callback is a no-op connection check that edits the original card with its result instead of relying on an ephemeral reply.
 
+Message titles contain the Herdr display name, actual session model and full cwd. Herdr tab labels provide the name when the agent response has no name field. Codex model resolution prefers the exact session and latest turn context; without a session ID it requires a single live pane and a unique non-subagent workspace session. Claude reads the exact session's latest assistant model. Global model defaults are never used. Below the header, a highlighted inline-code summary extracts the pending command or latest assistant paragraph; full terminal evidence remains below it. `presentationTextMode: "fallback"` keeps accessibility/notification text from rendering as a second heading.
+
 ## Private protocol
 
 Stdin/stdout carry one JSON object per line:
@@ -56,5 +58,6 @@ Legacy tests read `legacy/herdr-plugin.toml`. The root manifest registers `herdr
 - A real `herdr-bridge:probe` interaction reached the handler and updated the Slack DM card to “Herdr Bridge callback connected. No terminal operation was performed.” Both the Gateway callback log and Slack UI confirmed this.
 - A real, read-only `/usr/bin/uname -s` approval completed through Slack at 20:53:18 Asia/Dubai. Request `2a4dda9ec40949e6979efd5af8700c00` was recorded as `dispatched`, with exactly one dispatch log entry; the command returned `Darwin`. The recipient confirmed an OpenClaw push while Slack was backgrounded and the phone locked, and that the original card showed `dispatched` after the click. This verifies this configured phone/account, not every Slack notification policy.
 - Follow-up Bridge safety tests: 20 passed, including status-sequence changes during discovery and immediately before dispatch. JavaScript tests: 6 passed. Callback audit logs record request IDs and selected indices without command contents.
+- Heading/summary update: full regression 877 passed, 5 live tests skipped; JavaScript 8 passed. The installed Slack renderer produced one header, then the highlighted summary, transcript, request context and native buttons. A real DM preview confirmed `codex-slackbot · gpt-6.1-sol · /Volumes/My Shared Files/AI/herdr-slackbot` with no duplicate plain heading.
 
 Local configuration is in OpenClaw, with owner-only Slack DM ingress and the two owner-gated read tools enabled. The ignored `openclaw.local.patch.json` contains this machine's paths and owner ID, not tokens.

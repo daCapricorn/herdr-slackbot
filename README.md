@@ -60,6 +60,8 @@ Send `/herdr status` as a **text command in the OpenClaw bot DM**. If Slack's co
 
 Recognized Codex command approvals and Claude single-choice dialogs become portable `MessagePresentation` buttons. Clicks use OpenClaw's authenticated plugin callback path. Notifications go to the configured DM as top-level messages.
 
+Messages show **Herdr name · current model · directory path** once, followed by an inline-code highlighted content summary and the full terminal conversation. The display name uses Herdr's named agent or its tab label (for example `codex-slackbot`). Models come from reported metadata or the actual Codex/Claude session; ambiguous or unavailable matches show `模型未知`, never the global default. Codex workspace matching requires one live pane and one non-subagent session in that directory.
+
 Bridge lists/reads any kind reported by Herdr, including Pi. Unrecognized dialogs, multi-select, typed inputs and file-backed plans require local handling; remote keys are disabled for these.
 
 Optional `herdr_status` and `herdr_read` tools let OpenClaw inspect terminals in natural language. Enable them only in a trusted agent's tool policy. Models receive no approval or terminal-write tool. Human writes require an authenticated configured owner, channel and account.

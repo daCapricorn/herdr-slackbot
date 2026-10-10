@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .dialog import KIND_UNKNOWN, keys_for, parse_dialog
 from .events import session_of
+from .metadata import session_model
 
 
 class BridgeError(ValueError):
@@ -61,7 +62,24 @@ class Bridge:
         self.lock = threading.RLock()
 
     def status(self):
-        return [public_agent(a) for a in self.client.list_agents()]
+        agents = self.client.list_agents()
+        return [self._public_agent(a, agents) for a in agents]
+
+    def _public_agent(self, info, agents=None):
+        result = public_agent(info)
+        try:
+            tabs = self.client.list_tabs(info.get("workspace_id"))
+            tab = next((t for t in tabs if t.get("tab_id") == info.get("tab_id")), {})
+            result["name"] = info.get("name") or tab.get("label")
+        except Exception:
+            pass  # Display metadata must never block terminal event handling.
+        try:
+            agents = self.client.list_agents() if agents is None else agents
+            unique = sum(a.get("agent") == info.get("agent") and a.get("cwd") == info.get("cwd") for a in agents) == 1
+            result["model"] = session_model(info, unique_workspace=unique)
+        except Exception:
+            result["model"] = None
+        return result
 
     def _agent(self, pane):
         if not isinstance(pane, str) or ":p" not in pane:
@@ -79,11 +97,11 @@ class Bridge:
         text = self.client.read_agent_once(pane, max(1, min(int(lines), 300)), source="visible")
         if identity(self._agent(pane)) != identity(info):
             raise BridgeError("Agent changed during read")
-        return {"agent": public_agent(info), "text": text}
+        return {"agent": self._public_agent(info), "text": text}
 
     def _queue(self, kind, agent, **fields):
         event = {"id": uuid.uuid4().hex, "type": kind, "at": self.clock(),
-                 "agent": public_agent(agent), **fields}
+                 "agent": self._public_agent(agent), **fields}
         self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event["id"], json.dumps(event)))
         return event
 
