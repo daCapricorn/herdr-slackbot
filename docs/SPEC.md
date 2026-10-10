@@ -13,7 +13,7 @@ Version 0.2.0 replaces the standalone Slack bot runtime with an OpenClaw-managed
 
 ## Approval invariant
 
-A request binds to terminal/session identity, state sequence, a dialog fingerprint, an expiry and a fixed option set. All are checked against the live terminal before dispatch. The request is consumed durably before keys are sent. Unknown outcomes are not retried. Superseded, stale, expired and consumed requests cannot be used as fresh authorization.
+A request binds to terminal/session identity, state sequence, a dialog fingerprint, an expiry and a fixed option set. All are checked against the live terminal before dispatch. The request is consumed durably before keys are sent. After the send acknowledgement, two consistent live observations must show the original approval closed or a subsequent dialog before the result becomes `confirmed`. A still-open original approval is `unconfirmed`; replacement/read failure leaves acceptance unknown. These outcomes remain consumed, and no keys are automatically retried. Superseded, stale, expired and consumed requests cannot be used as fresh authorization.
 
 OpenClaw authentication supplies the sender provenance; button text and model output do not. Optional agent tools are read-only. Herdr approvals are not inserted into OpenClaw's native `exec.approvals` store.
 

@@ -78,7 +78,7 @@ Clicks and write commands require an authenticated configured owner on the confi
 
 ## Reliability
 
-Before sending keys, Bridge checks expiry, option membership, terminal/session identity, state sequence, blocked status and dialog fingerprint. It durably consumes the request before sending keys, and never automatically retries an uncertain terminal mutation. Replaced requests and stale queued approval cards are invalidated.
+Before sending keys, Bridge checks expiry, option membership, terminal/session identity, state sequence, blocked status and dialog fingerprint. It durably consumes the request before sending keys, then checks whether the original approval actually closed. A send acknowledgement alone cannot produce a success card: unchanged approvals show `unconfirmed`, while stable evidence of progression shows `confirmed`. Confirmation does not verify command completion. Uncertain writes are never automatically retried. Replaced requests and stale queued approval cards are invalidated.
 
 Message delivery is **at least once**: an ambiguous provider acknowledgement can produce duplicate cards. Copies share a request ID and can be answered at most once. Herdr does not provide an atomic compare-and-send-keys operation, so simultaneous local interaction remains a race. Phone push depends on the recipient's Slack and device notification settings; see the [live checklist](docs/LIVE_TEST.md).
 

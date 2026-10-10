@@ -18,9 +18,11 @@ Trigger a recognized approval in the selected terminal. Confirm the top-level DM
 Click the intended option from the configured owner's DM. Confirm:
 
 - The Gateway logs receipt of the callback and dispatch for that request ID.
-- The card is edited to show `dispatched`.
+- The card is edited to show `confirmed` only after the original approval is observed closed.
 - The terminal actually accepts the option and runs the expected read-only command.
-- The command produces its expected result; `dispatched` alone is not proof of command completion.
+- The command produces its expected result; `confirmed` alone is not proof of command completion.
+
+If the original approval stays open, expect `unconfirmed` and local-inspection guidance, with no automatic key retry. A read/replacement failure should report unknown acceptance. The old `dispatched` label only described the send acknowledgement and is retained in the historical verification record below.
 
 For a retained duplicate card, a second click must reject the consumed request. For a superseded dialog, the old card must be rejected. Do not approve a card whose command evidence no longer matches the terminal.
 
@@ -37,3 +39,5 @@ With a pending request, restart Gateway and confirm the current request remains 
 ## Recorded result, 2026-10-10
 
 On the tested macOS installation, actual runtime registration, native card delivery, the no-op callback and a real `/usr/bin/uname -s` approval were verified. The command returned `Darwin`; durable state and logs recorded one dispatch. The recipient separately confirmed push with Slack backgrounded and the phone locked, and the card showed `dispatched`. A subsequent real DM preview confirmed the single header and highlighted summary layout. This is evidence for the tested configuration, not every Slack device policy.
+
+After terminal-confirmation checks were added, a second real Slack approval for `/usr/bin/uname -m` returned `arm64`. The worker sent one digit, observed the original approval closed after about 630 ms, and recorded `confirmed`. Simulated dropped-input cases report `unconfirmed` without retry; the intermittent live failure itself has not yet been reproduced.

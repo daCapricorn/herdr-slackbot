@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Worker } from "./worker.js";
-import { code, deliver, eventPayload, statusPayload } from "./presentation.js";
+import { answerText, code, deliver, eventPayload, statusPayload } from "./presentation.js";
 
 export function authorized(config, ctx) {
   return (ctx.isAuthorizedSender ?? ctx.auth?.isAuthorizedSender) === true
@@ -88,7 +88,7 @@ export default {
           if (verb === "pending") return { text: code(JSON.stringify(await call("pending"), null, 2)) };
           if (verb === "answer" && /^[a-f0-9]{32}$/.test(target ?? "") && /^\d+$/.test(option ?? "")) {
             allowed(ctx);
-            return { text: code(JSON.stringify(await call("answer", { request_id: target, option: Number(option) }))) };
+            return { text: answerText(await call("answer", { request_id: target, option: Number(option) })) };
           }
           if (verb === "send" && target) {
             const text = args.replace(/^send\s+\S+\s*/, "");
@@ -113,8 +113,8 @@ export default {
           const match = /^([a-f0-9]{32}):(\d+)$/.exec(ctx.interaction.payload);
           if (!match) throw new Error("Invalid Herdr approval callback");
           const result = await call("answer", { request_id: match[1], option: Number(match[2]) });
-          api.logger.info?.(`Herdr approval dispatched: ${match[1]} option ${match[2]}`);
-          await ctx.respond.editMessage({ text: `Herdr: ${result.option} — dispatched`, blocks: [] });
+          api.logger.info?.(`Herdr approval ${result.outcome}: ${match[1]} option ${match[2]} reason=${result.verification?.reason ?? "unknown"}`);
+          await ctx.respond.editMessage({ text: answerText(result), blocks: [] });
         } catch (error) {
           api.logger.warn?.(`Herdr callback rejected: ${error.message}`);
           await ctx.respond.reply({ text: error.message });

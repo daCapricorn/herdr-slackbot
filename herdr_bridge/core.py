@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -12,6 +13,9 @@ from pathlib import Path
 from .dialog import KIND_UNKNOWN, keys_for, parse_dialog
 from .events import session_of
 from .metadata import session_model
+
+log = logging.getLogger(__name__)
+CONSUMED_STATES = {"dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
 
 
 class BridgeError(ValueError):
@@ -46,8 +50,13 @@ def current_dialog(screen, kind):
 
 
 class Bridge:
-    def __init__(self, client, state_path, *, clock=time.time, approval_ttl=900):
+    def __init__(self, client, state_path, *, clock=time.time, approval_ttl=900,
+                 monotonic=time.monotonic, sleep=time.sleep,
+                 confirmation_timeout=5.0, confirmation_interval=0.2):
         self.client, self.clock, self.approval_ttl = client, clock, approval_ttl
+        self.monotonic, self.sleep = monotonic, sleep
+        self.confirmation_timeout = confirmation_timeout
+        self.confirmation_interval = confirmation_interval
         Path(state_path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(state_path, check_same_thread=False)
         if os.name != "nt":
@@ -126,7 +135,7 @@ class Bridge:
                     continue
                 same_generation = (tuple(rec["identity"]) == identity(info)
                                    and rec.get("sequence") == info.get("state_change_seq"))
-                if same_generation and state in ("dispatched", "uncertain"):
+                if same_generation and state in CONSUMED_STATES:
                     return  # Never rearm after terminal delivery, even on redraw.
                 if (same_generation and rec.get("evidence_version") == 1
                         and rec["fingerprint"] == fingerprint and state != "superseded"):
@@ -214,16 +223,85 @@ class Bridge:
             if (identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked"
                     or fresh.get("state_change_seq") != rec.get("sequence")):
                 raise BridgeError("Agent changed before dispatch; nothing was sent")
-            # Commit BEFORE touching the terminal. A lost reply/crash must never replay keys.
+            keys = keys_for(dialog, option)
+            rec["dispatch"] = {"option": option, "keys": keys, "started_at": self.clock(),
+                               "focused": fresh.get("focused"), "revision": fresh.get("revision")}
+            # Consume BEFORE touching the terminal, separately from confirmed acceptance.
+            # A lost reply/crash must never replay keys.
             with self.db:
-                self.db.execute("UPDATE approvals SET state='dispatched' WHERE id=?", (request_id,))
+                self.db.execute("UPDATE approvals SET record=?, state='dispatching' WHERE id=?",
+                                (json.dumps(rec), request_id))
             try:
-                self.client.send_keys(rec["pane_id"], keys_for(dialog, option))
+                self.client.send_keys(rec["pane_id"], keys)
             except Exception:
                 with self.db:
                     self.db.execute("UPDATE approvals SET state='uncertain' WHERE id=?", (request_id,))
                 raise
-            return {"request_id": request_id, "outcome": "dispatched", "option": dialog.options[option].label}
+            rec["dispatch"]["acknowledged_at"] = self.clock()
+            verification = self._confirm_answer(rec)
+            rec["verification"] = verification
+            outcome = verification["outcome"]
+            with self.db:
+                self.db.execute("UPDATE approvals SET record=?, state=? WHERE id=?",
+                                (json.dumps(rec), outcome, request_id))
+            log.info("Herdr answer verification: %s option=%s outcome=%s reason=%s elapsed_ms=%s observation=%s",
+                     request_id, option, outcome, verification["reason"], verification["elapsed_ms"],
+                     verification.get("observation"))
+            return {"request_id": request_id, "outcome": outcome,
+                    "option": dialog.options[option].label, "verification": verification}
+
+    def _confirm_answer(self, rec):
+        """Observe only: a provider receipt is not proof the TUI accepted a key.
+
+        Require two consistent observations that the original approval is gone.
+        Never send more keys, even if the original dialog remains unchanged.
+        """
+        start = self.monotonic()
+        deadline = start + self.confirmation_timeout
+        candidate = None
+        observation = None
+        reason = "not_observed"
+        while True:
+            try:
+                info = self._agent(rec["pane_id"])
+                if identity(info) != tuple(rec["identity"]):
+                    reason = "agent_replaced"
+                    break
+                screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
+                fresh = self._agent(rec["pane_id"])
+                if identity(fresh) != tuple(rec["identity"]):
+                    reason = "agent_replaced"
+                    break
+                live = current_dialog(screen, fresh.get("agent"))
+                seq, status = fresh.get("state_change_seq"), fresh.get("agent_status")
+                same_dialog = live is not None and live.fingerprint == rec["fingerprint"]
+                observation = {"status": status, "sequence": seq, "same_dialog": same_dialog}
+                stable = (seq == info.get("state_change_seq") and status == info.get("agent_status"))
+                advanced = (rec.get("sequence") is not None and seq is not None and seq != rec["sequence"])
+                current = None
+                if stable and not same_dialog:
+                    if advanced and status in ("working", "idle", "done"):
+                        current = ("approval_closed", seq, status)
+                    elif status == "blocked" and live is not None:
+                        current = ("next_dialog", seq, live.fingerprint)
+                if current is not None and current == candidate:
+                    return {"outcome": "confirmed", "reason": current[0],
+                            "elapsed_ms": round((self.monotonic() - start) * 1000),
+                            "observation": observation}
+                candidate = current
+                reason = "dialog_still_open" if same_dialog else "not_observed"
+            except Exception:
+                # Reads can fail after a successful write; do not turn that into another write.
+                candidate = None
+                observation = None
+                reason = "read_failed"
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                break
+            self.sleep(min(self.confirmation_interval, remaining))
+        return {"outcome": "unconfirmed" if reason == "dialog_still_open" else "uncertain",
+                "reason": reason, "elapsed_ms": round((self.monotonic() - start) * 1000),
+                "observation": observation}
 
     def send(self, pane, text):
         with self.lock:

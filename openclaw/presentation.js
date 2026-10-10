@@ -79,3 +79,11 @@ export async function deliver(api, route, payload, signal) {
   signal?.throwIfAborted();
   return adapter.sendPayload(ctx);
 }
+export function answerText(result) {
+  const option = String(result.option ?? "Selected option");
+  if (result.outcome === "confirmed")
+    return `✅ Herdr: ${option} — confirmed. The original approval has closed; command completion is not verified.`;
+  if (result.outcome === "unconfirmed")
+    return `⚠️ Herdr: ${option} — unconfirmed. The terminal still shows this approval. No keys were retried; check it locally.`;
+  return `⚠️ Herdr: ${option} — terminal acceptance is unknown. No keys were retried; check it locally.`;
+}
