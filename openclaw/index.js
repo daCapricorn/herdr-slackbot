@@ -113,8 +113,12 @@ export default {
           const match = /^([a-f0-9]{32}):(\d+)$/.exec(ctx.interaction.payload);
           if (!match) throw new Error("Invalid Herdr approval callback");
           const result = await call("answer", { request_id: match[1], option: Number(match[2]) });
+          api.logger.info?.(`Herdr approval dispatched: ${match[1]} option ${match[2]}`);
           await ctx.respond.editMessage({ text: `Herdr: ${result.option} — dispatched`, blocks: [] });
-        } catch (error) { await ctx.respond.reply({ text: error.message }); }
+        } catch (error) {
+          api.logger.warn?.(`Herdr callback rejected: ${error.message}`);
+          await ctx.respond.reply({ text: error.message });
+        }
         return { handled: true };
       },
     });
