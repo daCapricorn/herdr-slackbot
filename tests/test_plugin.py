@@ -209,7 +209,7 @@ def bridge_ws(socket="A", servers=None):
 
 # --- manifest ---------------------------------------------------------------------
 
-MANIFEST = tomllib.loads((REPO_ROOT / "herdr-plugin.toml").read_text(encoding="utf-8"))
+MANIFEST = tomllib.loads((REPO_ROOT / "legacy/herdr-plugin.toml").read_text(encoding="utf-8"))
 
 
 def test_manifest_identity_and_required_fields():
