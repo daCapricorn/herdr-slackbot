@@ -1,8 +1,10 @@
+> Archived standalone Slack bot documentation. For Herdr Bridge, see the [current README](../README.md).
+
 # herdr-slackbot
 
 **English** | [한국어](README.ko.md)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](../LICENSE)
 ![Platform: Windows and macOS](https://img.shields.io/badge/platform-Windows%20%2B%20macOS-0078D6)
 ![Herdr 0.8.2+](https://img.shields.io/badge/Herdr-0.8.2%2B-6f42c1)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB)
@@ -28,15 +30,15 @@ Slack DM ──(Socket Mode)──> herdr-slackbot bridge ──(Unix socket / n
 
 **Home tab:** Open the bot to see the agents on your PC, grouped by workspace. Each row shows status emoji · name/pane · kind · status · terminal title. The buttons at the top start a new agent or send a prompt, and idle/done agents have their own **[Send]** button on the row.
 
-![Home tab: agents grouped by workspace, with New Agent / Send / Refresh buttons](docs/images/home-tab.png)
+![Home tab: agents grouped by workspace, with New Agent / Send / Refresh buttons](../docs/images/home-tab.png)
 
 **New agent (`/herdr new`, [➕ New Agent]):** Opens a new tab in the chosen workspace and starts an agent there. You can pick the model, effort and permission mode; the defaults are Opus · high · auto. Leave the name blank to get `slack-<N>`.
 
-![New agent modal: Model, Effort, Permission mode, Name and Prompt fields](docs/images/new-agent-modal.png)
+![New agent modal: Model, Effort, Permission mode, Name and Prompt fields](../docs/images/new-agent-modal.png)
 
 **Send (`/herdr send`, [📤 Send]):** Pick a running agent and send it a prompt. Once you pick an agent, the conversation so far (your prompts and its answers, newest at the bottom) is shown in the modal. Results come back in that agent's DM thread.
 
-![Send modal: agent picker and Prompt field](docs/images/send-modal.png)
+![Send modal: agent picker and Prompt field](../docs/images/send-modal.png)
 
 ## Quick start
 
@@ -122,4 +124,4 @@ Design and decisions are in `docs/SPEC.md`, and per-milestone progress notes are
 
 ## License
 
-[MIT](LICENSE)
+[MIT](../LICENSE)

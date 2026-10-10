@@ -1,3 +1,5 @@
+# Legacy standalone Slack bot and regression dependencies.
+# For Herdr Bridge runtime, install the project with: pip install -e .
 slack_bolt>=1.18
 slack_sdk>=3.26
 psutil>=5.9; sys_platform == 'darwin'

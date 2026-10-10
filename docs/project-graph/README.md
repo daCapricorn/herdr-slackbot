@@ -1,3 +1,5 @@
+> Historical analysis of the standalone Slack bot, before the OpenClaw migration. The generated graph does not describe the current Bridge architecture; see [OPENCLAW-BRIDGE.md](../OPENCLAW-BRIDGE.md).
+
 # herdr-slackbot 项目理解
 
 这是 macOS 移植前的分析快照。随后实现的 macOS 支持见 [运行指南](../MACOS.md) 和 [验证记录](../progress/MACOS.md)；下述图谱与测试数字保留当时基线。
