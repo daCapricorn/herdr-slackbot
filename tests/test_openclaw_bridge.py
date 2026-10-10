@@ -201,3 +201,21 @@ def test_agent_progress_retires_queued_approval(setup):
     request(client, bridge)
     client.info["agent_status"] = "working"
     assert not bridge.pending() and not bridge.events()
+
+
+@pytest.mark.parametrize("answering", [False, True])
+def test_sequence_change_during_screen_read_fails_closed(setup, answering):
+    client, bridge = setup
+    token = request(client, bridge) if answering else None
+
+    def advancing_read(*args, **kwargs):
+        client.info["state_change_seq"] += 1
+        return client.screen
+
+    client.read_agent_once = advancing_read
+    if answering:
+        with pytest.raises(BridgeError, match="Agent changed before dispatch"):
+            bridge.answer(token, 0)
+    else:
+        bridge.discover(copy.deepcopy(client.info))
+    assert not client.keys and not bridge.events()
