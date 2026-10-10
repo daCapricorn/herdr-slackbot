@@ -7,6 +7,7 @@ This fork changes purpose from a standalone Slack bot to a local Herdr integrati
 - OpenClaw now owns Slack credentials, message delivery, native presentation and authenticated callbacks. The Bridge worker uses private NDJSON stdio and needs no Slack token.
 - Added exact-pane status/read/send commands and request-ID-based human approvals, backed by durable pending requests and an outbound queue.
 - Approval dispatch revalidates live evidence and consumes authorization before sending keys. Uncertain writes are never automatically retried.
+- Approval results now distinguish observed terminal confirmation from a send acknowledgement. Still-open approvals report `unconfirmed`, with persisted diagnostics and no automatic retry.
 - Messages contain the Herdr name/tab label, actual session model, cwd, a rule-based highlighted summary and captured terminal conversation.
 - Added owner-gated read tools for OpenClaw agents. No model-facing approval or terminal-write tool is exposed.
 - Verified the new flow on macOS, including a real read-only approval and locked-phone Slack push.

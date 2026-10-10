@@ -32,6 +32,10 @@ Methods: `status`, `read`, `send`, `pending`, `answer`, `events`, `ack`. Errors 
 
 Events contain stable event IDs, agent identity, timestamp and terminal evidence. `approval.requested` adds request ID, expiry, state sequence, fingerprint and exact options. Unrecognized dialogs become `agent.blocked` without remote options. The tested event reconciler handles fast transitions and reconnection; a scan recovers agents blocked before startup and dialogs changing while still blocked.
 
+Approval consumption is separate from terminal confirmation. A durable `dispatching` state precedes the one key write. After acknowledgement, a five-second polling window checks live identity, status/sequence and the visible dialog. Two consistent observations of progression produce `confirmed`; an unchanged original approval produces `unconfirmed`, while unreadable or replaced agents produce `uncertain`. All remain consumed, including legacy `dispatched` records. Polling never sends a second key. Diagnostic records include the selected option/key sequence, send timing, focus/revision at dispatch and the final observation; logs omit command contents.
+
+Herdr 0.9.3's [send-keys handler](https://github.com/herdrdev/herdr/blob/v0.9.3/src/app/api/agents.rs) returns `ok` after `runtime.try_send_bytes` accepts the encoded bytes. It does not wait for the agent TUI to process them. This is why Bridge must observe terminal acceptance separately.
+
 Codex approval evidence begins at its current command question; transcript updates above it cannot change the request fingerprint. Unknown screen redraws notify only once per terminal/status generation. Replaced requests become superseded, and queued cards are discarded when the agent advances or the request expires. Dispatch rechecks the status sequence after reading the dialog as well as before it.
 
 ## Rollout and scope
@@ -61,3 +65,9 @@ Legacy tests read `legacy/herdr-plugin.toml`. The root manifest registers `herdr
 - The installed Slack renderer produced one header, then the highlighted summary, transcript, request context and native buttons. A real DM preview confirmed the Herdr tab name, actual model and cwd with no duplicate plain heading.
 
 Local configuration is in OpenClaw, with owner-only Slack DM ingress and the two owner-gated read tools enabled. The ignored `openclaw.local.patch.json` contains this machine's paths and owner ID, not tokens.
+
+## Approval confirmation follow-up, 2026-10-10
+
+- Regression after adding terminal confirmation: Python 886 passed, 5 opt-in live tests skipped; JavaScript 9 passed. New cases cover successful send receipts with dropped input, delayed acceptance, transient frames/read failures, replacement agents, next dialogs and crashes during confirmation.
+- After reloading Gateway, a real `/usr/bin/uname -m` approval was answered through Slack. Exactly one digit was sent. Two consistent observations confirmed the original approval closed after approximately 630 ms; durable state recorded `confirmed`, and the command returned `arm64`.
+- The reported intermittent input failure has not been reproduced live. The fix removes success claims based only on send acknowledgement and retains diagnostics for the next occurrence; it does not claim to eliminate input loss inside Herdr or the agent TUI.

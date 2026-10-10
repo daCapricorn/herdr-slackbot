@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import plugin, { authorized } from "../index.js";
-import { eventPayload, deliver, buttonLabel, messageSummary } from "../presentation.js";
+import { answerText, eventPayload, deliver, buttonLabel, messageSummary } from "../presentation.js";
 import { readFileSync } from "node:fs";
 
 const config = { route: { channel: "slack", accountId: "default", to: "user:U1" }, ownerIds: ["U1"] };
@@ -81,4 +81,18 @@ test("message heading identifies pane/model/path and summary appears immediately
 test("completion summary extracts latest assistant paragraph rather than commands or status", () => {
   assert.equal(messageSummary({type:"agent.done",text:"• Ran uname -s\n  └ Darwin\n\n• 已完成新的标题布局，\n  聊天记录继续保留。\n\n› 下一条消息"}),
     "已完成新的标题布局， 聊天记录继续保留。");
+});
+
+test("an acknowledged key write never becomes a success card without terminal confirmation", () => {
+  const dropped = answerText({option:"Yes, proceed",outcome:"unconfirmed"});
+  assert.match(dropped, /unconfirmed/);
+  assert.match(dropped, /still shows this approval/);
+  assert.match(dropped, /No keys were retried/);
+  assert.ok(!dropped.includes("✅"));
+  for (const outcome of ["uncertain", "dispatched", undefined]) {
+    const unknown = answerText({option:"Yes, proceed",outcome});
+    assert.match(unknown, /acceptance is unknown/);
+    assert.ok(!unknown.includes("✅"));
+  }
+  assert.match(answerText({option:"Yes, proceed",outcome:"confirmed"}), /✅.*original approval has closed/);
 });

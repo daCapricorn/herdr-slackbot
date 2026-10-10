@@ -62,7 +62,9 @@ The Gateway supervises the Python worker and stores the SQLite request/outbox da
 
 Top-level notifications contain one bold header (Herdr name, current model, cwd), an inline-code summary, terminal conversation and, for recognized approvals, native buttons. The summary is a bounded rule-based extraction, not an LLM-generated semantic summary. The visible terminal capture remains the evidence and may not include older off-screen history. Models are resolved from actual session metadata; unavailable or ambiguous matches are shown as unknown.
 
-Approval buttons bind to one request ID and option index. Bridge checks the current terminal before dispatch; an expired, superseded or already consumed card cannot replay the keys. A successful click edits the card to `dispatched`. This means keys were dispatched, not that the command itself completed successfully; check the terminal/result notification.
+Approval buttons bind to one request ID and option index. Bridge checks the current terminal before dispatch; an expired, superseded or already consumed card cannot replay the keys. After sending, it polls visible evidence and status for a five-second confirmation window. Two consistent observations that the original approval has closed or moved to a new dialog produce `confirmed`. This does not verify command completion.
+
+If the same approval remains visible, the card shows `unconfirmed` and asks for local inspection. If reads fail or the agent is replaced, acceptance is unknown. No additional keys are sent, and the consumed request stays disabled across restarts. The durable record and logs retain the selected option, key sequence, timing and observed status/sequence for diagnosis. Existing `dispatched` records are consumed legacy records, not proof of terminal acceptance.
 
 Unknown dialogs, multi-select, typed inputs and file-backed plans need local handling. Inspecting an agent such as Pi does not imply remote approval support for that agent's dialogs.
 

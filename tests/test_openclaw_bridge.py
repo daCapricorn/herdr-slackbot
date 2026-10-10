@@ -39,7 +39,7 @@ class Client:
 @pytest.fixture
 def setup(tmp_path):
     client = Client()
-    bridge = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda: 100)
+    bridge = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda: 100, confirmation_timeout=0)
     yield client, bridge
     bridge.close()
 
@@ -67,7 +67,7 @@ def test_answer_one_shot_survives_restart(setup, tmp_path):
     client, bridge = setup
     token = request(client, bridge)
     result = bridge.answer(token, 0)
-    assert result["outcome"] == "dispatched" and client.keys == [("w4:p2", ["1"])]
+    assert result["outcome"] == "unconfirmed" and client.keys == [("w4:p2", ["1"])]
     again = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda: 100)
     with pytest.raises(BridgeError, match="already answered"):
         again.answer(token, 0)
@@ -219,3 +219,155 @@ def test_sequence_change_during_screen_read_fails_closed(setup, answering):
     else:
         bridge.discover(copy.deepcopy(client.info))
     assert not client.keys and not bridge.events()
+
+
+class VerificationClock:
+    def __init__(self):
+        self.now = 0
+        self.on_sleep = lambda: None
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, duration):
+        self.now += duration
+        self.on_sleep()
+
+
+@pytest.fixture
+def verifying(tmp_path):
+    client = Client()
+    timer = VerificationClock()
+    bridge = Bridge(client, tmp_path / "verified.sqlite", clock=lambda: 100,
+                    monotonic=timer.monotonic, sleep=timer.sleep)
+    yield client, bridge, timer
+    bridge.close()
+
+
+def advance(client):
+    client.info.update(agent_status="working", state_change_seq=8)
+    client.screen = "• Running the approved command"
+
+
+def test_success_receipt_with_dropped_input_is_not_confirmed_or_retried(verifying, tmp_path):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    result = bridge.answer(token, 0)
+    assert result["outcome"] == "unconfirmed"
+    assert result["verification"]["reason"] == "dialog_still_open"
+    assert result["verification"]["elapsed_ms"] == 5000
+    assert client.keys == [("w4:p2", ["1"])]
+    stored, state = bridge.db.execute("SELECT record,state FROM approvals WHERE id=?", (token,)).fetchone()
+    assert state == "unconfirmed"
+    assert json.loads(stored)["dispatch"]["option"] == 0
+    assert json.loads(stored)["verification"]["observation"]["same_dialog"] is True
+    again = Bridge(client, tmp_path / "verified.sqlite")
+    again.discover(client.info)
+    assert not again.pending()
+    with pytest.raises(BridgeError, match="already answered"):
+        again.answer(token, 0)
+    again.close()
+    assert len(client.keys) == 1
+
+
+def test_delayed_acceptance_waits_for_stable_live_evidence(verifying):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    timer.on_sleep = lambda: advance(client) if timer.now >= 0.6 else None
+    result = bridge.answer(token, 0)
+    assert result["outcome"] == "confirmed"
+    assert result["verification"]["reason"] == "approval_closed"
+    assert result["verification"]["elapsed_ms"] >= 800
+    assert len(client.keys) == 1
+
+
+def test_status_change_alone_cannot_confirm_a_still_visible_approval(verifying):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    timer.on_sleep = lambda: client.info.update(agent_status="working", state_change_seq=8)
+    result = bridge.answer(token, 0)
+    assert result["outcome"] == "unconfirmed"
+    assert len(client.keys) == 1
+
+
+def test_next_approval_is_observed_without_sending_it_any_keys(verifying):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    def next_dialog():
+        client.screen = client.screen.replace("Set-Content", "Remove-Item")
+        client.info["state_change_seq"] = 9
+    timer.on_sleep = next_dialog
+    result = bridge.answer(token, 0)
+    assert result["outcome"] == "confirmed"
+    assert result["verification"]["reason"] == "next_dialog"
+    bridge.discover(client.info)
+    assert bridge.pending()[0]["id"] != token
+    assert client.keys == [("w4:p2", ["1"])]
+
+
+def test_one_transient_frame_is_not_proof_of_acceptance(verifying):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    screen = client.screen
+    def redraw():
+        if timer.now == 0.2:
+            advance(client)
+        else:
+            client.info.update(agent_status="blocked", state_change_seq=7)
+            client.screen = screen
+    timer.on_sleep = redraw
+    assert bridge.answer(token, 0)["outcome"] == "unconfirmed"
+    assert len(client.keys) == 1
+
+
+@pytest.mark.parametrize("failure", ["replace", "read"])
+def test_failure_after_write_has_unknown_acceptance_and_never_retries(verifying, failure):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    def fail():
+        if failure == "replace":
+            client.info["terminal_id"] = "term-b"
+        else:
+            def unreadable(*args, **kwargs):
+                raise OSError("read unavailable")
+            client.read_agent_once = unreadable
+    timer.on_sleep = fail
+    result = bridge.answer(token, 0)
+    assert result["outcome"] == "uncertain"
+    assert result["verification"]["reason"] == ("agent_replaced" if failure == "replace" else "read_failed")
+    assert len(client.keys) == 1
+    with pytest.raises(BridgeError, match="already answered"):
+        bridge.answer(token, 0)
+
+
+def test_transient_read_error_recovers_without_replaying_write(verifying):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    original = client.read_agent_once
+    def step():
+        if timer.now == 0.2:
+            def unreadable(*args, **kwargs):
+                raise OSError("temporary read failure")
+            client.read_agent_once = unreadable
+        else:
+            client.read_agent_once = original
+            advance(client)
+    timer.on_sleep = step
+    assert bridge.answer(token, 0)["outcome"] == "confirmed"
+    assert len(client.keys) == 1
+
+
+def test_crash_during_verification_preserves_consumed_authorization(verifying, tmp_path):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    def crash(_rec):
+        raise SystemExit("worker crashed after writing keys")
+    bridge._confirm_answer = crash
+    with pytest.raises(SystemExit):
+        bridge.answer(token, 0)
+    again = Bridge(client, tmp_path / "verified.sqlite")
+    again.discover(client.info)
+    with pytest.raises(BridgeError, match="already answered"):
+        again.answer(token, 0)
+    assert not again.pending() and len(client.keys) == 1
+    again.close()
