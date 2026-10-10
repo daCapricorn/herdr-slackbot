@@ -11,12 +11,38 @@ export function buttonLabel(option) {
   // Compact summaries keep controls portable; full evidence remains in the body.
   return chars.length > 60 ? chars.slice(0, 59).join("") + "…" : label;
 }
+function compact(text, max = 200) {
+  const chars = Array.from(String(text ?? "").replace(/\s+/g, " ").trim());
+  return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : chars.join("");
+}
+export function messageSummary(event) {
+  if (event.summary) return compact(event.summary);
+  const text = String(event.text ?? "");
+  if (event.type === "approval.requested") {
+    const dialog = text.slice(Math.max(0, text.lastIndexOf("Would you like to run the following command?")));
+    const command = /(?:^|\n)\s*\$\s+([\s\S]*?)(?=\n\s*(?:[›>]\s*)?1\.\s|$)/m.exec(dialog)?.[1];
+    if (command) return compact(`待审批：${command}`);
+  }
+  const lines = text.split("\n");
+  const starts = lines.flatMap((line, i) => /^\s*•\s+/.test(line) && !/^\s*•\s+(?:Ran|Running|Used|Working|Searching|Thinking)\b/.test(line) ? [i] : []);
+  if (starts.length) {
+    const start = starts.at(-1);
+    const paragraph = [lines[start].replace(/^\s*•\s+/, "")];
+    for (const line of lines.slice(start + 1)) {
+      if (!line.trim() || /^\s*[•›└]/.test(line) || /^\s*(?:Press enter|Would you like|\$)/.test(line)) break;
+      paragraph.push(line.trim());
+    }
+    return compact(paragraph.join(" "));
+  }
+  return event.type === "agent.done" ? "已完成，请查看下方记录。" : "等待你的处理，请查看下方记录。";
+}
 export function eventPayload(event) {
   const a = event.agent;
-  const title = `${a.pane_id} · ${a.kind} · ${a.title || a.name || a.cwd || "Herdr"}`;
+  const title = `${a.name || a.pane_id} · ${a.model || "模型未知"} · ${a.cwd || "目录未知"}`;
+  const summary = messageSummary(event);
   const request = event.request;
   const blocks = [
-    { type: "text", text: event.type === "agent.done" ? "Agent finished" : "Agent needs your attention" },
+    { type: "text", text: "`" + summary.replaceAll("`", "'") + "`" },
     { type: "text", text: code(event.text) },
   ];
   if (request?.options?.length) {
@@ -28,8 +54,8 @@ export function eventPayload(event) {
   } else if (event.type === "agent.blocked") {
     blocks.push({ type: "context", text: "This dialog requires a local answer. Remote keys are disabled for unrecognized, multi-select, typed, or file-backed plan dialogs." });
   }
-  return { text: `${title}\n${event.type}`, presentation: {
-    title: literal(title), tone: event.type === "agent.done" ? "success" : "warning", blocks,
+  return { text: `${title}\n${summary}`, presentationTextMode: "fallback", presentation: {
+    title, tone: event.type === "agent.done" ? "success" : "warning", blocks,
   } };
 }
 export function statusPayload(agents) {

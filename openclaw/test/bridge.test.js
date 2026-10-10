@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import plugin, { authorized } from "../index.js";
-import { eventPayload, deliver, buttonLabel } from "../presentation.js";
+import { eventPayload, deliver, buttonLabel, messageSummary } from "../presentation.js";
 import { readFileSync } from "node:fs";
 
 const config = { route: { channel: "slack", accountId: "default", to: "user:U1" }, ownerIds: ["U1"] };
@@ -69,4 +69,16 @@ test("connection probe is authenticated and never starts a terminal action", asy
   let response;
   await interactive.handler({...trusted,interaction:{payload:"probe"},respond:{editMessage:(r)=>response=r.text}});
   assert.match(response,/No terminal operation/);
+});
+test("message heading identifies pane/model/path and summary appears immediately below", () => {
+  const payload = eventPayload({type:"approval.requested",agent:{name:"codex-slackbot",pane_id:"w4:p2",model:"gpt-6.1-sol",cwd:"/project"},
+    text:"• Old assistant text\nWould you like to run the following command?\n\n  $ uname -s\n\n› 1. Yes, proceed (y)"});
+  assert.equal(payload.presentation.title,"codex-slackbot · gpt-6.1-sol · /project");
+  assert.equal(payload.presentation.blocks[0].text,"`待审批：uname -s`");
+  assert.equal(payload.presentationTextMode,"fallback");
+  assert.ok(payload.presentation.blocks[1].text.includes("Old assistant text"));
+});
+test("completion summary extracts latest assistant paragraph rather than commands or status", () => {
+  assert.equal(messageSummary({type:"agent.done",text:"• Ran uname -s\n  └ Darwin\n\n• 已完成新的标题布局，\n  聊天记录继续保留。\n\n› 下一条消息"}),
+    "已完成新的标题布局， 聊天记录继续保留。");
 });
