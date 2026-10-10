@@ -1,0 +1,54 @@
+{
+  "commit": "ad36ce3a35fb81ed0a8d9a37285fcf43ee309698",
+  "graphify_version": "0.9.82",
+  "mode": "code-only, local AST, no model API",
+  "nodes": 2416,
+  "raw_relations": 7011,
+  "undirected_endpoint_pairs": 6629,
+  "communities": 98,
+  "raw_relation_confidence": {
+    "EXTRACTED": 6285,
+    "INFERRED": 726
+  },
+  "python_source_files": 26,
+  "python_source_covered": 26,
+  "test_files_covered": 31,
+  "source_sha256": {
+    "herdr_slackbot/__init__.py": "2b3ee46926dea92f709e67115d95c49571c0d49ab4987b886c4e4d0e302f6f5f",
+    "herdr_slackbot/__main__.py": "af300fb4f79c074f5e7fcf503774590bfb9a771a79b8c82abb5f9264f36745ec",
+    "herdr_slackbot/agents.py": "9c064f4a6ea3305b3d0624f681120e2dc46a5c821453ef15d8dc1da8172cabb0",
+    "herdr_slackbot/blocks.py": "3e6854d5616e3c1dc5925386267905d95ef556893f1a6b888bf721163db4d9a5",
+    "herdr_slackbot/bridge.py": "4f29af7f91012f1960825efc21fb86d5f2e5dfe5742e2f764c36f999fba52dbe",
+    "herdr_slackbot/claude_session.py": "ab5e9086a3acfe65036b538d8cb5ba3c0e73c7a31dd3635e2cd37443a452b592",
+    "herdr_slackbot/commands.py": "f113d075de924789bd15ad3fd884c2ef78fa07e243bb4d0be8c94c441ca2e294",
+    "herdr_slackbot/config.py": "9cc262c3abb04fb18a63a019ac4b9ee6ce51d6c076caa84111161d44694ade2d",
+    "herdr_slackbot/dialog.py": "4289090b9d82dfa8893500405b6e829f23bf6f4d94e086602dfe0734a2859908",
+    "herdr_slackbot/events.py": "df8c11dd267bc7ebbe2e6730cc7cf36c1fd474e45ff96014a04601b7364a5023",
+    "herdr_slackbot/herdr_client.py": "31f4321817f9d94de3b373e849aebc0e1ff9d85d898b83b602bdedc941496e23",
+    "herdr_slackbot/history.py": "698f5042575c20bff49b05e99f880a943d71d28e245590118d2dcaf7bea4dc9a",
+    "herdr_slackbot/live_check.py": "980f69fd12bc4d582203d0e78076e18250e156396d30db858647d9be63b12b48",
+    "herdr_slackbot/naming.py": "71d95445fce1d07a79cb240fc5112382fc54fa52cb780a0553202404b45bfafb",
+    "herdr_slackbot/notify.py": "864feaba2c9a44d4298237cec1e5a192915cf405ec407ed48af40d24766aec82",
+    "herdr_slackbot/pairing.py": "8c00730706944e554ad3035bc9a242f2d3005e456b875c39329489c3e5d5562d",
+    "herdr_slackbot/parser.py": "5166e124bf2bb149c5351ab86dd03338255e2144ec7b77803ba6b11c3ef0a67f",
+    "herdr_slackbot/plugin.py": "b7c77b79a13b6e07816d5b715d4d23b3afeb43beea361e8aa6f1273ee8617099",
+    "herdr_slackbot/procinfo.py": "2189440f9fe9cb70202a749aeb642b5470bff9a83168edf74dc304cae2c111b8",
+    "herdr_slackbot/results.py": "84ac057b449a95b48ee6d37e41bbd5f3852cf322ed280fcaa865c613014324a0",
+    "herdr_slackbot/setup_cmd.py": "0d72031c0e6cd3d052c3d15e09a182699168794caa699dcc3c12993a54d8e602",
+    "herdr_slackbot/slack_app.py": "9451749a6d9eced034b28c48bb88a08ac9835f4be6302672f6c771f471bedfc5",
+    "herdr_slackbot/slack_manifest.py": "379e9cfe0cfbe649c5d68d8c6a092c82af5bcebfcff6cb1fa7338ccdbb278d81",
+    "herdr_slackbot/slack_transport.py": "98f860626dad6b9e5dbd5ec9165f827c3ca6df6eca7f60d4861970d56b0a5936",
+    "herdr_slackbot/state.py": "c106a65e5b28c8ac71a5d740f669b5fda40355e9c2662ebf9920546ccf3d9f9e",
+    "herdr_slackbot/wizard.py": "5db25ab2c7f7098e83be3598791c055f6cbf4d1e3efbc4d3d7ca108c3a44f283"
+  },
+  "offline_assets_sha256": {
+    "vis-network.min.js": "576bb887733eb01bb52ee75b90ef46d818454de5fddb5b616fb8a298d307ca12",
+    "d3.v7.min.js": "f2094bbf6141b359722c4fe454eb6c4b0f0e42cc10cc7af921fc158fceb86539"
+  },
+  "limitations": [
+    "Static graph is navigation, not proof of runtime calls.",
+    "Clustering collapses same-endpoint relations; raw links remain in JSON.",
+    "Docs, images, fixture JSONL and plugin manifest were not semantically indexed.",
+    "HTML scripts bundled; browser rendering not verified this run."
+  ]
+}

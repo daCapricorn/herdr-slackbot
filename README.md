@@ -3,7 +3,7 @@
 **English** | [한국어](README.ko.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
+![Platform: Windows and macOS](https://img.shields.io/badge/platform-Windows%20%2B%20macOS-0078D6)
 ![Herdr 0.8.2+](https://img.shields.io/badge/Herdr-0.8.2%2B-6f42c1)
 ![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB)
 
@@ -20,7 +20,7 @@ Coding agents stop and wait all the time: a permission prompt, a question, a pla
 - **Private by design:** every user creates **their own Slack app**, the bot only answers **the Slack account it is paired with**, and Socket Mode means no public URL or open port.
 
 ```
-Slack DM ──(Socket Mode)──> herdr-slackbot bridge ──(named pipe)──> Herdr ──> claude / codex agents
+Slack DM ──(Socket Mode)──> herdr-slackbot bridge ──(Unix socket / named pipe)──> Herdr ──> claude / codex agents
           (no public URL)     (runs in a pane of the Herdr workspace herdr-slack)
 ```
 
@@ -39,6 +39,8 @@ Slack DM ──(Socket Mode)──> herdr-slackbot bridge ──(named pipe)─�
 ![Send modal: agent picker and Prompt field](docs/images/send-modal.png)
 
 ## Quick start
+
+**macOS:** use the [macOS setup guide](docs/MACOS.md). It includes the shell bootstrap, local fork installation, and the `setup-macos` / `start-macos` / `restart-macos` / `stop-macos` / `status-macos` plugin actions. The Windows instructions follow below.
 
 1. **Requirements:** Windows 10/11, **Herdr 0.8.2 or later**, **Python 3.11 or later**. Install Python first if you don't have it.
 

@@ -1,5 +1,7 @@
 # herdr-slackbot
 
+macOS 지원: [설치 및 실행 가이드](docs/MACOS.md). Windows용 PowerShell 명령은 그대로 사용할 수 있습니다.
+
 [English](README.md) | **한국어**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

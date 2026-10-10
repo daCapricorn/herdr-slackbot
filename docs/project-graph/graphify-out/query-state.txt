@@ -1,0 +1,35 @@
+Node: StateStore
+  ID:        herdr_slackbot_state_statestore
+  Source:    herdr_slackbot/state.py L96
+  Type:      code
+  Community: Community 45
+  Degree:    63
+
+Connections (63):
+  <-- Bridge [uses] [INFERRED] herdr_slackbot/bridge.py:L353
+  <-- test_bridge_dialog.py [imports] [EXTRACTED] tests/test_bridge_dialog.py:L729
+  <-- test_bridge.py [imports] [EXTRACTED] tests/test_bridge.py:L18
+  <-- bridge.py [imports] [EXTRACTED] herdr_slackbot/bridge.py:L98
+  <-- test_pairing.py [imports] [EXTRACTED] tests/test_pairing.py:L34
+  <-- __main__.py [imports] [EXTRACTED] herdr_slackbot/__main__.py:L141
+  <-- test_bridge_recheck2.py [imports] [EXTRACTED] tests/test_bridge_recheck2.py:L20
+  <-- test_slack_app.py [imports] [EXTRACTED] tests/test_slack_app.py:L242
+  <-- make_env() [uses] [INFERRED] tests/test_bridge.py:L35
+  <-- test_state.py [imports] [EXTRACTED] tests/test_state.py:L10
+  <-- run() [uses] [INFERRED] herdr_slackbot/__main__.py:L208
+  <-- state.py [contains] [EXTRACTED] herdr_slackbot/state.py:L96
+  <-- test_integration.py [imports] [EXTRACTED] tests/test_integration.py:L12
+  <-- test_real_bridge_pairs_live_without_restart() [uses] [INFERRED] tests/test_pairing.py:L393
+  --> .next_counter() [method] [EXTRACTED] herdr_slackbot/state.py:L188
+  <-- test_bridge_activation_resumes_after_a_failed_step() [uses] [INFERRED] tests/test_pairing.py:L439
+  <-- test_real_bridge_through_bolt() [uses] [INFERRED] tests/test_slack_app.py:L247
+  --> .upsert_thread() [method] [EXTRACTED] herdr_slackbot/state.py:L228
+  <-- wire() [uses] [INFERRED] tests/test_integration.py:L37
+  <-- restart() [uses] [INFERRED] tests/test_bridge_dialog.py:L731
+  ... and 43 more
+  Grouped by file:
+    --> herdr_slackbot/state.py: 21 connections
+    <-- tests/test_state.py: 19 connections
+    <-- herdr_slackbot/bridge.py: 1 connection
+    <-- tests/test_bridge_recheck2.py: 1 connection
+    <-- tests/test_pairing.py: 1 connection

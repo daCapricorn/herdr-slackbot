@@ -135,10 +135,15 @@ class HerdrCli:
 # --- config dir discovery ---------------------------------------------------------
 
 def default_config_dir(env: dict | None = None) -> Path | None:
-    """Herdr's per-plugin config dir layout: %APPDATA%\\herdr\\plugins\\config\\<id>."""
+    """Fallback plugin config layout; the Herdr CLI is authoritative when available."""
     env = os.environ if env is None else env
     appdata = env.get("APPDATA")
-    return Path(appdata) / "herdr" / "plugins" / "config" / PLUGIN_ID if appdata else None
+    if appdata:
+        return Path(appdata) / "herdr" / "plugins" / "config" / PLUGIN_ID
+    if sys.platform == "darwin":
+        base = Path(env.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        return base / "herdr" / "plugins" / "config" / PLUGIN_ID
+    return None
 
 
 def strip_verbatim(path: str) -> str:
@@ -179,7 +184,7 @@ def discover_config_dir(cli: HerdrCli | None = None, env: dict | None = None,
 # --- shell command building ------------------------------------------------------
 
 def shell_kind(process_name: str) -> str:
-    name = Path(process_name or "").name.lower()
+    name = (process_name or "").replace("\\", "/").rsplit("/", 1)[-1].lower().lstrip("-")
     if name.endswith(".exe"):
         name = name[:-4]
     return name
@@ -196,13 +201,16 @@ def _sh_quote(s: str) -> str:
 def module_command(shell: str, python_exe: str, plugin_root: str, config_dir: str, subcommand: str,
                    extra: str = "") -> str:
     """A `python -m herdr_slackbot <subcommand> --config-dir ...` line for `shell`. Unknown shells
-    get PowerShell syntax (Herdr's Windows default). `extra` must need no quoting."""
+    use the platform default syntax. `extra` must need no quoting."""
+    if sys.platform == "darwin" and shell not in SHELL_KINDS:
+        shell = "sh"  # a newly created pane may not yet have foreground process metadata
     extra = f" {extra}" if extra else ""
     if shell == "cmd":
         return (f'cd /d "{plugin_root}" && "{python_exe}" -m {BRIDGE_MODULE} {subcommand} '
                 f'--config-dir "{config_dir}"{extra}')
     if shell in ("bash", "sh", "zsh", "fish"):
-        fwd = lambda p: p.replace("\\", "/")  # noqa: E731
+        # Windows drive paths need translating for Git Bash; POSIX backslashes are literal.
+        fwd = lambda p: p.replace("\\", "/") if re.match(r"^[A-Za-z]:[\\/]", p) else p  # noqa: E731
         return (f"cd {_sh_quote(fwd(plugin_root))} && {_sh_quote(fwd(python_exe))} -m {BRIDGE_MODULE} {subcommand} "
                 f"--config-dir {_sh_quote(fwd(config_dir))}{extra}")
     return (f"Set-Location -LiteralPath {_ps_quote(plugin_root)}; & {_ps_quote(python_exe)} -m {BRIDGE_MODULE} "

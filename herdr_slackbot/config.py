@@ -83,7 +83,7 @@ def load_env_file(path: Path) -> dict[str, str]:
 
 
 def sanitize_username(name: str) -> str:
-    """Lowercase and reduce a Windows username to Slack-command-safe characters."""
+    """Lowercase and reduce an OS username to Slack-command-safe characters."""
     cleaned = _SLASH_CHARS_RE.sub("-", (name or "").lower())
     cleaned = re.sub(r"[-_]{2,}", "-", cleaned).strip("-_")
     return cleaned or "user"
@@ -213,7 +213,7 @@ def load_config(env: Mapping[str, str] | None = None, config_dir: Path | None = 
         slack_app_token=values.get("SLACK_APP_TOKEN", ""),
         slack_owner_user_id=values.get("SLACK_OWNER_USER_ID", ""),
         herdr_socket_path=values.get("HERDR_SOCKET_PATH", ""),
-        herdr_bin=values.get("HERDR_BIN") or "herdr",
+        herdr_bin=values.get("HERDR_BIN") or env.get("HERDR_BIN_PATH") or "herdr",
         log_level=(values.get("LOG_LEVEL") or "INFO").upper(),
         result_max_chars=_int(values, "RESULT_MAX_CHARS", 3000),
         fallback_lines=_int(values, "FALLBACK_LINES", 40),

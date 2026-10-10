@@ -1,0 +1,362 @@
+{
+  "herdr_slackbot/__init__.py": {
+    "mtime": 1791616381.4574895,
+    "seen": 1791619350.9624152,
+    "ast_hash": "60d96f84f650cad15059660668baacef",
+    "semantic_hash": "60d96f84f650cad15059660668baacef"
+  },
+  "herdr_slackbot/__main__.py": {
+    "mtime": 1791616381.4575598,
+    "seen": 1791619350.9624162,
+    "ast_hash": "b4771487199489a03d3720d582cd569e",
+    "semantic_hash": "b4771487199489a03d3720d582cd569e"
+  },
+  "herdr_slackbot/agents.py": {
+    "mtime": 1791616381.4576197,
+    "seen": 1791619350.962417,
+    "ast_hash": "efc1c3b351717fb4aedc843f7ed48649",
+    "semantic_hash": "efc1c3b351717fb4aedc843f7ed48649"
+  },
+  "herdr_slackbot/blocks.py": {
+    "mtime": 1791616381.4577339,
+    "seen": 1791619350.962417,
+    "ast_hash": "2d73921b86c2819c0ddaa8714ba0957b",
+    "semantic_hash": "2d73921b86c2819c0ddaa8714ba0957b"
+  },
+  "herdr_slackbot/bridge.py": {
+    "mtime": 1791616381.4581008,
+    "seen": 1791619350.9624178,
+    "ast_hash": "26bc7a1bba489484ab19b3d2ef3481df",
+    "semantic_hash": "26bc7a1bba489484ab19b3d2ef3481df"
+  },
+  "herdr_slackbot/claude_session.py": {
+    "mtime": 1791616381.4581869,
+    "seen": 1791619350.9624178,
+    "ast_hash": "d90f4d0d213a847b8afe4e9ec1cb4a6f",
+    "semantic_hash": "d90f4d0d213a847b8afe4e9ec1cb4a6f"
+  },
+  "herdr_slackbot/commands.py": {
+    "mtime": 1791616381.458244,
+    "seen": 1791619350.962419,
+    "ast_hash": "316ec6ad14b304b56558dd4b8cfe4d0c",
+    "semantic_hash": "316ec6ad14b304b56558dd4b8cfe4d0c"
+  },
+  "herdr_slackbot/config.py": {
+    "mtime": 1791616381.4582975,
+    "seen": 1791619350.962419,
+    "ast_hash": "05dd1bbcde9685358a35f9f3513d652c",
+    "semantic_hash": "05dd1bbcde9685358a35f9f3513d652c"
+  },
+  "herdr_slackbot/dialog.py": {
+    "mtime": 1791616381.4583802,
+    "seen": 1791619350.962419,
+    "ast_hash": "75c0cbadc8ace2c33fa4e54cd6b1b8a1",
+    "semantic_hash": "75c0cbadc8ace2c33fa4e54cd6b1b8a1"
+  },
+  "herdr_slackbot/events.py": {
+    "mtime": 1791616381.4584663,
+    "seen": 1791619350.962419,
+    "ast_hash": "94946d5378d14ff2c5cf2acf851b9d98",
+    "semantic_hash": "94946d5378d14ff2c5cf2acf851b9d98"
+  },
+  "herdr_slackbot/herdr_client.py": {
+    "mtime": 1791616381.4585552,
+    "seen": 1791619350.96242,
+    "ast_hash": "aebfd7fd66de3aa2d4a63959dbcf23a3",
+    "semantic_hash": "aebfd7fd66de3aa2d4a63959dbcf23a3"
+  },
+  "herdr_slackbot/history.py": {
+    "mtime": 1791616381.4586256,
+    "seen": 1791619350.96242,
+    "ast_hash": "d423ec013fc01ffd7a94aed54faf2e62",
+    "semantic_hash": "d423ec013fc01ffd7a94aed54faf2e62"
+  },
+  "herdr_slackbot/live_check.py": {
+    "mtime": 1791616381.4586856,
+    "seen": 1791619350.962421,
+    "ast_hash": "2de08fad5d7c7f5120eda781a5c31736",
+    "semantic_hash": "2de08fad5d7c7f5120eda781a5c31736"
+  },
+  "herdr_slackbot/naming.py": {
+    "mtime": 1791616381.458741,
+    "seen": 1791619350.962421,
+    "ast_hash": "336e7fb05fcc139ec0d826ef45beba3c",
+    "semantic_hash": "336e7fb05fcc139ec0d826ef45beba3c"
+  },
+  "herdr_slackbot/notify.py": {
+    "mtime": 1791616381.4588077,
+    "seen": 1791619350.962421,
+    "ast_hash": "d098e9cf0e117b96c6de430da4af4bd1",
+    "semantic_hash": "d098e9cf0e117b96c6de430da4af4bd1"
+  },
+  "herdr_slackbot/pairing.py": {
+    "mtime": 1791616381.4588795,
+    "seen": 1791619350.962421,
+    "ast_hash": "bb410a13649b905dffb7160df826e2bf",
+    "semantic_hash": "bb410a13649b905dffb7160df826e2bf"
+  },
+  "herdr_slackbot/parser.py": {
+    "mtime": 1791616381.4589398,
+    "seen": 1791619350.9624221,
+    "ast_hash": "40932075f7e324e2952cc63be4037525",
+    "semantic_hash": "40932075f7e324e2952cc63be4037525"
+  },
+  "herdr_slackbot/plugin.py": {
+    "mtime": 1791616381.459034,
+    "seen": 1791619350.9624221,
+    "ast_hash": "24255b8b8d078bb0b41dc81aea6b0de0",
+    "semantic_hash": "24255b8b8d078bb0b41dc81aea6b0de0"
+  },
+  "herdr_slackbot/procinfo.py": {
+    "mtime": 1791616381.45911,
+    "seen": 1791619350.9624221,
+    "ast_hash": "641c2aefa863d0a1ece54a0b6b7023fa",
+    "semantic_hash": "641c2aefa863d0a1ece54a0b6b7023fa"
+  },
+  "herdr_slackbot/results.py": {
+    "mtime": 1791616381.459161,
+    "seen": 1791619350.962423,
+    "ast_hash": "f39ef0f5340e89481698f5076df18531",
+    "semantic_hash": "f39ef0f5340e89481698f5076df18531"
+  },
+  "herdr_slackbot/setup_cmd.py": {
+    "mtime": 1791616381.4592195,
+    "seen": 1791619350.962423,
+    "ast_hash": "27e71d3cc62a08f5448e2bad772799eb",
+    "semantic_hash": "27e71d3cc62a08f5448e2bad772799eb"
+  },
+  "herdr_slackbot/slack_app.py": {
+    "mtime": 1791616381.4593754,
+    "seen": 1791619350.962423,
+    "ast_hash": "ddc6e1c9bb9f63d77b21660cd787fde7",
+    "semantic_hash": "ddc6e1c9bb9f63d77b21660cd787fde7"
+  },
+  "herdr_slackbot/slack_manifest.py": {
+    "mtime": 1791616381.4594352,
+    "seen": 1791619350.962424,
+    "ast_hash": "23a1bf74ba11208cc378f658997c586b",
+    "semantic_hash": "23a1bf74ba11208cc378f658997c586b"
+  },
+  "herdr_slackbot/slack_transport.py": {
+    "mtime": 1791616381.4594986,
+    "seen": 1791619350.962424,
+    "ast_hash": "e72f8e61f1561bf5911bf1580af484bf",
+    "semantic_hash": "e72f8e61f1561bf5911bf1580af484bf"
+  },
+  "herdr_slackbot/state.py": {
+    "mtime": 1791616381.4595647,
+    "seen": 1791619350.962424,
+    "ast_hash": "5b2af06c98f0beb812adce81658a8cf9",
+    "semantic_hash": "5b2af06c98f0beb812adce81658a8cf9"
+  },
+  "herdr_slackbot/wizard.py": {
+    "mtime": 1791616381.459651,
+    "seen": 1791619350.962424,
+    "ast_hash": "0c4f3ece0c7752d6a0ac78f132f5ff12",
+    "semantic_hash": "0c4f3ece0c7752d6a0ac78f132f5ff12"
+  },
+  "pyproject.toml": {
+    "mtime": 1791616381.4597132,
+    "seen": 1791619350.962425,
+    "ast_hash": "8123443506c19fb1b41d22675eb37361",
+    "semantic_hash": "8123443506c19fb1b41d22675eb37361"
+  },
+  "scripts/herdr-slackbot.ps1": {
+    "mtime": 1791616381.4598432,
+    "seen": 1791619350.962425,
+    "ast_hash": "5aa310b7947fd0b232eabe33373a6c0d",
+    "semantic_hash": "5aa310b7947fd0b232eabe33373a6c0d"
+  },
+  "scripts/setup.ps1": {
+    "mtime": 1791616381.4598906,
+    "seen": 1791619350.962425,
+    "ast_hash": "0f8cc88ccb5ca6474c4ce704d21bf068",
+    "semantic_hash": "0f8cc88ccb5ca6474c4ce704d21bf068"
+  },
+  "tests/conftest.py": {
+    "mtime": 1791616381.4599617,
+    "seen": 1791619350.962425,
+    "ast_hash": "97471aa86e957f73dafd78d82c09db03",
+    "semantic_hash": "97471aa86e957f73dafd78d82c09db03"
+  },
+  "tests/fakes.py": {
+    "mtime": 1791616381.4600253,
+    "seen": 1791619350.9624262,
+    "ast_hash": "4517be296acbe823b098e3797409ad8a",
+    "semantic_hash": "4517be296acbe823b098e3797409ad8a"
+  },
+  "tests/test_blocks.py": {
+    "mtime": 1791616381.4614682,
+    "seen": 1791619350.9624262,
+    "ast_hash": "2c1e7accd267c319b102c573c72fc9eb",
+    "semantic_hash": "2c1e7accd267c319b102c573c72fc9eb"
+  },
+  "tests/test_bridge.py": {
+    "mtime": 1791616381.461573,
+    "seen": 1791619350.9624262,
+    "ast_hash": "a3990110e536493a8d893283a0b0c4c8",
+    "semantic_hash": "a3990110e536493a8d893283a0b0c4c8"
+  },
+  "tests/test_bridge_dialog.py": {
+    "mtime": 1791616381.4616761,
+    "seen": 1791619350.962427,
+    "ast_hash": "be6be8bd56df8ebba8815ed199b28960",
+    "semantic_hash": "be6be8bd56df8ebba8815ed199b28960"
+  },
+  "tests/test_bridge_recheck.py": {
+    "mtime": 1791616381.461758,
+    "seen": 1791619350.962427,
+    "ast_hash": "43e9bd8d4b4dfa159c05d887409142b4",
+    "semantic_hash": "43e9bd8d4b4dfa159c05d887409142b4"
+  },
+  "tests/test_bridge_recheck2.py": {
+    "mtime": 1791616381.4618278,
+    "seen": 1791619350.962427,
+    "ast_hash": "fbef59ddf7771b95deafa8c1dee28d96",
+    "semantic_hash": "fbef59ddf7771b95deafa8c1dee28d96"
+  },
+  "tests/test_claude_session.py": {
+    "mtime": 1791616381.4619133,
+    "seen": 1791619350.9624279,
+    "ast_hash": "736b3a7154e52110d6ed696092860e72",
+    "semantic_hash": "736b3a7154e52110d6ed696092860e72"
+  },
+  "tests/test_commands.py": {
+    "mtime": 1791616381.4619713,
+    "seen": 1791619350.9624279,
+    "ast_hash": "39c0096da8e804de14d0e6865562dc31",
+    "semantic_hash": "39c0096da8e804de14d0e6865562dc31"
+  },
+  "tests/test_config.py": {
+    "mtime": 1791616381.4620297,
+    "seen": 1791619350.9624279,
+    "ast_hash": "7a134f74af496cde022fa4300e748623",
+    "semantic_hash": "7a134f74af496cde022fa4300e748623"
+  },
+  "tests/test_conversation.py": {
+    "mtime": 1791616381.4621105,
+    "seen": 1791619350.9624279,
+    "ast_hash": "6f0c7f57e00c622d733a11c08498f155",
+    "semantic_hash": "6f0c7f57e00c622d733a11c08498f155"
+  },
+  "tests/test_dialog.py": {
+    "mtime": 1791616381.4621863,
+    "seen": 1791619350.962429,
+    "ast_hash": "069c76bc9969e44e1f2c52339cab8b5d",
+    "semantic_hash": "069c76bc9969e44e1f2c52339cab8b5d"
+  },
+  "tests/test_events.py": {
+    "mtime": 1791616381.4622762,
+    "seen": 1791619350.962429,
+    "ast_hash": "b2f316e9375ada1f5e1a4c0ba31159d3",
+    "semantic_hash": "b2f316e9375ada1f5e1a4c0ba31159d3"
+  },
+  "tests/test_herdr_client.py": {
+    "mtime": 1791616381.4623451,
+    "seen": 1791619350.962429,
+    "ast_hash": "cb827c0d3a5d9ba22a59f7662dc4ce4c",
+    "semantic_hash": "cb827c0d3a5d9ba22a59f7662dc4ce4c"
+  },
+  "tests/test_home.py": {
+    "mtime": 1791616381.4624207,
+    "seen": 1791619350.96243,
+    "ast_hash": "8965358fd5c2fcf95f9b7e1d1dca0890",
+    "semantic_hash": "8965358fd5c2fcf95f9b7e1d1dca0890"
+  },
+  "tests/test_integration.py": {
+    "mtime": 1791616381.4624767,
+    "seen": 1791619350.96243,
+    "ast_hash": "457cd6b25190362a3603a11957afab1b",
+    "semantic_hash": "457cd6b25190362a3603a11957afab1b"
+  },
+  "tests/test_live.py": {
+    "mtime": 1791616381.4625306,
+    "seen": 1791619350.96243,
+    "ast_hash": "f353cb71a119b33664a4f242b3db2b73",
+    "semantic_hash": "f353cb71a119b33664a4f242b3db2b73"
+  },
+  "tests/test_naming.py": {
+    "mtime": 1791616381.462594,
+    "seen": 1791619350.962431,
+    "ast_hash": "263cb0765ab48950180b080f2b74f023",
+    "semantic_hash": "263cb0765ab48950180b080f2b74f023"
+  },
+  "tests/test_notify.py": {
+    "mtime": 1791616381.4626553,
+    "seen": 1791619350.962431,
+    "ast_hash": "6a66f3853803af83546eb775516c1ca5",
+    "semantic_hash": "6a66f3853803af83546eb775516c1ca5"
+  },
+  "tests/test_pairing.py": {
+    "mtime": 1791616381.4627473,
+    "seen": 1791619350.962431,
+    "ast_hash": "1f382997cbc60ab6810f949efd995fc6",
+    "semantic_hash": "1f382997cbc60ab6810f949efd995fc6"
+  },
+  "tests/test_parser.py": {
+    "mtime": 1791616381.4628212,
+    "seen": 1791619350.962432,
+    "ast_hash": "543b0d5086b90dd15009544696f71408",
+    "semantic_hash": "543b0d5086b90dd15009544696f71408"
+  },
+  "tests/test_plugin.py": {
+    "mtime": 1791616381.4629161,
+    "seen": 1791619350.962432,
+    "ast_hash": "ff2eea14b82ec4ddec1c51ce781106be",
+    "semantic_hash": "ff2eea14b82ec4ddec1c51ce781106be"
+  },
+  "tests/test_readiness.py": {
+    "mtime": 1791616381.463002,
+    "seen": 1791619350.962432,
+    "ast_hash": "055d59e9ed2cb7e7c3410969f8ba42f7",
+    "semantic_hash": "055d59e9ed2cb7e7c3410969f8ba42f7"
+  },
+  "tests/test_send_preview.py": {
+    "mtime": 1791616381.4630845,
+    "seen": 1791619350.962432,
+    "ast_hash": "e7de9d8a291160ea3636370014dff0e7",
+    "semantic_hash": "e7de9d8a291160ea3636370014dff0e7"
+  },
+  "tests/test_setup_cmd.py": {
+    "mtime": 1791616381.463149,
+    "seen": 1791619350.962433,
+    "ast_hash": "260b0dc666b9f2ad04c00d01c00e6181",
+    "semantic_hash": "260b0dc666b9f2ad04c00d01c00e6181"
+  },
+  "tests/test_slack_app.py": {
+    "mtime": 1791616381.4632206,
+    "seen": 1791619350.962433,
+    "ast_hash": "2c02533301e99ca24ad325f43282a136",
+    "semantic_hash": "2c02533301e99ca24ad325f43282a136"
+  },
+  "tests/test_slack_manifest.py": {
+    "mtime": 1791616381.4632819,
+    "seen": 1791619350.962433,
+    "ast_hash": "c2569442cb9522e57d0fce04ef74e57a",
+    "semantic_hash": "c2569442cb9522e57d0fce04ef74e57a"
+  },
+  "tests/test_slack_transport.py": {
+    "mtime": 1791616381.4633448,
+    "seen": 1791619350.962434,
+    "ast_hash": "f076d57a866eee56ceeaa3406c65172d",
+    "semantic_hash": "f076d57a866eee56ceeaa3406c65172d"
+  },
+  "tests/test_state.py": {
+    "mtime": 1791616381.4634058,
+    "seen": 1791619350.962434,
+    "ast_hash": "91f9c4b0ca4df6281cf2c1b53d6e1b53",
+    "semantic_hash": "91f9c4b0ca4df6281cf2c1b53d6e1b53"
+  },
+  "tests/test_thread_history.py": {
+    "mtime": 1791616381.463484,
+    "seen": 1791619350.962434,
+    "ast_hash": "383530fc838922d7cbf55abdf03d027a",
+    "semantic_hash": "383530fc838922d7cbf55abdf03d027a"
+  },
+  "tests/test_wizard.py": {
+    "mtime": 1791616381.4635699,
+    "seen": 1791619350.962434,
+    "ast_hash": "18213b613fb106134309ca04a50a1084",
+    "semantic_hash": "18213b613fb106134309ca04a50a1084"
+  }
+}

@@ -1,0 +1,37 @@
+Node: Bridge
+  ID:        herdr_slackbot_bridge_bridge
+  Source:    herdr_slackbot/bridge.py L352
+  Type:      code
+  Community: Community 6
+  Degree:    156
+
+Connections (156):
+  <-- test_bridge_dialog.py [imports] [EXTRACTED] tests/test_bridge_dialog.py:L727
+  <-- test_bridge.py [imports] [EXTRACTED] tests/test_bridge.py:L11
+  <-- bridge.py [contains] [EXTRACTED] herdr_slackbot/bridge.py:L352
+  <-- test_pairing.py [imports] [EXTRACTED] tests/test_pairing.py:L10
+  <-- __main__.py [imports] [EXTRACTED] herdr_slackbot/__main__.py:L137
+  --> StateStore [uses] [INFERRED] herdr_slackbot/bridge.py:L353
+  <-- test_bridge_recheck2.py [imports] [EXTRACTED] tests/test_bridge_recheck2.py:L9
+  --> HerdrError [uses] [INFERRED] herdr_slackbot/bridge.py:L629
+  --> SubscriptionManager [uses] [INFERRED] herdr_slackbot/bridge.py:L355
+  <-- test_slack_app.py [imports] [EXTRACTED] tests/test_slack_app.py:L240
+  <-- test_bridge_recheck.py [imports] [EXTRACTED] tests/test_bridge_recheck.py:L9
+  <-- build_app() [uses] [INFERRED] herdr_slackbot/slack_app.py:L63
+  <-- make_env() [uses] [INFERRED] tests/test_bridge.py:L36
+  <-- run() [uses] [INFERRED] herdr_slackbot/__main__.py:L208
+  --> SlackTransientError [uses] [INFERRED] herdr_slackbot/bridge.py:L506
+  <-- slack_app.py [imports] [EXTRACTED] herdr_slackbot/slack_app.py:L14
+  <-- test_integration.py [imports] [EXTRACTED] tests/test_integration.py:L7
+  --> Dialog [uses] [INFERRED] herdr_slackbot/bridge.py:L1591
+  --> SlackPermanentError [uses] [INFERRED] herdr_slackbot/bridge.py:L1180
+  --> ResultStore [uses] [INFERRED] herdr_slackbot/bridge.py:L353
+  ... and 136 more
+  Grouped by file:
+    --> herdr_slackbot/bridge.py: 128 connections
+    <-- tests/test_pairing.py: 3 connections
+    <-- tests/test_bridge_dialog.py: 1 connection
+    <-- tests/test_bridge_recheck.py: 1 connection
+    <-- tests/test_bridge_recheck2.py: 1 connection
+    <-- tests/test_integration.py: 1 connection
+    <-- tests/test_slack_app.py: 1 connection

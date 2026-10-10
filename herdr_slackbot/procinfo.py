@@ -1,4 +1,4 @@
-"""Process identity helpers (Windows via ctypes; best effort elsewhere).
+"""Process identity helpers (Windows ctypes, macOS psutil, Linux procfs).
 
 Used by the plugin launcher: a pane is only typed into when its shell has no child
 processes (Herdr on Windows reports the shell as the pane's foreground process even
@@ -20,6 +20,13 @@ def child_processes(pid: int) -> list[tuple[int, str]] | None:
     """Direct children of `pid` as (pid, exe name); None when this can't be determined."""
     if sys.platform == "win32":
         return _win_children(pid)
+    if sys.platform == "darwin":
+        import psutil
+
+        try:
+            return [(child.pid, child.name()) for child in psutil.Process(pid).children()]
+        except (psutil.Error, OSError):
+            return None  # unavailable identity must never be mistaken for an idle shell
     try:
         out = subprocess.run(["ps", "-o", "pid=,comm=", "--ppid", str(pid)], capture_output=True, text=True,
                              timeout=5)
@@ -48,6 +55,13 @@ def process_start_time(pid: int) -> int | None:
         return None
     if sys.platform == "win32":
         return _win_start_time(pid)
+    if sys.platform == "darwin":
+        import psutil
+
+        try:
+            return int(psutil.Process(pid).create_time() * 1_000_000)
+        except (psutil.Error, OSError):
+            return None
     try:
         with open(f"/proc/{pid}/stat", "rb") as fh:
             fields = fh.read().rsplit(b")", 1)[1].split()

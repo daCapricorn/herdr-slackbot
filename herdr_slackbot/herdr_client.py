@@ -1,6 +1,6 @@
 """Herdr socket API client.
 
-Primary transport is the Herdr named pipe (NDJSON: one JSON request line, one
+Primary transport is the Herdr Unix socket or Windows named pipe (NDJSON: one JSON request line, one
 JSON response line). Every request uses a fresh pipe connection, which keeps
 concurrent callers independent. `events.subscribe` keeps its connection open and
 streams events (see `EventStream`).
@@ -21,6 +21,7 @@ import itertools
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -233,6 +234,48 @@ class EventStream:
             pass
 
 
+class _SocketHandle:
+    """Unbuffered socket adapter; shutdown wakes a reader in another thread."""
+
+    def __init__(self, connection: socket.socket):
+        self.connection = connection
+
+    def read(self, size: int) -> bytes:
+        return self.connection.recv(size)
+
+    def write(self, data: bytes) -> None:
+        self.connection.sendall(data)
+
+    def close(self) -> None:
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.connection.close()
+
+
+class UnixSocketTransport(PipeTransport):
+    """Herdr's Unix-domain socket, using the same NDJSON framing as Windows."""
+
+    def __init__(self, socket_path: str, connect_timeout: float = 5.0):
+        if not socket_path:
+            raise HerdrUnavailable("HERDR_SOCKET_PATH is not set")
+        self.path = socket_path
+        self.connect_timeout = connect_timeout
+        self._ids = itertools.count(1)
+
+    def _open(self) -> _SocketHandle:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.settimeout(self.connect_timeout)
+            connection.connect(self.path)
+            connection.settimeout(None)  # subscriptions and agent waits can be long-lived
+        except OSError as exc:
+            connection.close()
+            raise HerdrUnavailable(f"cannot connect to {self.path}: {exc}") from exc
+        return _SocketHandle(connection)
+
+
 def _cancel_blocking_read(native_thread_id: int) -> None:
     """Abort a synchronous ReadFile pending on another thread (Windows only)."""
     if sys.platform != "win32":
@@ -357,11 +400,11 @@ class CliTransport:
         return result
 
     def open_stream(self, method: str, params: dict) -> EventStream:
-        raise HerdrUnavailable("event subscriptions need the Herdr pipe")
+        raise HerdrUnavailable("event subscriptions need the Herdr socket")
 
 
 class AutoTransport:
-    """Pipe first; CLI when the pipe is unavailable.
+    """Native socket first; CLI when it is unavailable.
 
     The CLI is used only when the pipe request was never submitted, or when the
     outcome is unknown for a read-only method. A mutating request with an unknown
@@ -369,7 +412,8 @@ class AutoTransport:
     """
 
     def __init__(self, socket_path: str, herdr_bin: str = "herdr"):
-        self.pipe = PipeTransport(socket_path) if socket_path else None
+        transport = PipeTransport if sys.platform == "win32" else UnixSocketTransport
+        self.pipe = transport(socket_path) if socket_path else None
         self.cli = CliTransport(herdr_bin)
 
     def request(self, method: str, params: dict | None = None) -> dict:

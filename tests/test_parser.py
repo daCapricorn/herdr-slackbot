@@ -141,7 +141,7 @@ def test_codex_uses_fallback_without_input_box(transcript):
     r = extract_result(transcript("codex_answer.txt"), "codex", fallback_lines=6)
     assert not r.parsed
     lines = r.text.splitlines()
-    assert len(lines) == 6
+    assert len([line for line in lines if line.strip()]) == 6
     assert lines[-1].strip().startswith("Worked for 14s")
     assert "Ask Codex to do anything" not in r.text
     assert "GPT-6" not in r.text

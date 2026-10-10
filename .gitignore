@@ -11,3 +11,4 @@ dist/
 state/
 *.log
 slack-app-manifest.json
+docs/project-graph/graphify-out/cache/

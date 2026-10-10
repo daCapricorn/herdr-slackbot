@@ -1,0 +1,35 @@
+Node: SubscriptionManager
+  ID:        herdr_slackbot_events_subscriptionmanager
+  Source:    herdr_slackbot/events.py L197
+  Type:      code
+  Community: Community 8
+  Degree:    47
+
+Connections (47):
+  <-- Bridge [uses] [INFERRED] herdr_slackbot/bridge.py:L355
+  <-- bridge.py [imports] [EXTRACTED] herdr_slackbot/bridge.py:L74
+  <-- test_events.py [imports] [EXTRACTED] tests/test_events.py:L8
+  --> HerdrError [uses] [INFERRED] herdr_slackbot/events.py:L307
+  <-- make_manager() [uses] [INFERRED] tests/test_events.py:L148
+  <-- test_integration.py [imports] [EXTRACTED] tests/test_integration.py:L9
+  <-- events.py [contains] [EXTRACTED] herdr_slackbot/events.py:L197
+  <-- test_live.py [imports] [EXTRACTED] tests/test_live.py:L9
+  <-- test_recheck2_r6_old_lookup_does_not_clear_new_runs_dirty_flag() [uses] [INFERRED] tests/test_events.py:L617
+  <-- test_recheck_r6_old_dispatcher_cannot_touch_restarted_manager() [uses] [INFERRED] tests/test_events.py:L478
+  --> ._reconcile() [method] [EXTRACTED] herdr_slackbot/events.py:L392
+  <-- test_threaded_end_to_end() [uses] [INFERRED] tests/test_events.py:L439
+  <-- wire() [uses] [INFERRED] tests/test_integration.py:L42
+  --> ._stale() [method] [EXTRACTED] herdr_slackbot/events.py:L286
+  --> .resync() [method] [EXTRACTED] herdr_slackbot/events.py:L300
+  <-- test_review5_retry_timer_rechecks_dirty_pane() [uses] [INFERRED] tests/test_events.py:L370
+  --> ._settle_displaced() [method] [EXTRACTED] herdr_slackbot/events.py:L459
+  --> ._subscribe() [method] [EXTRACTED] herdr_slackbot/events.py:L537
+  --> ._adopt() [method] [EXTRACTED] herdr_slackbot/events.py:L484
+  --> .start() [method] [EXTRACTED] herdr_slackbot/events.py:L230
+  ... and 27 more
+  Grouped by file:
+    --> herdr_slackbot/events.py: 22 connections
+    <-- tests/test_events.py: 2 connections
+    <-- herdr_slackbot/bridge.py: 1 connection
+    <-- herdr_slackbot/events.py: 1 connection
+    <-- tests/test_live.py: 1 connection

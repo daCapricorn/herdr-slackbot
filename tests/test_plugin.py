@@ -216,23 +216,24 @@ def test_manifest_identity_and_required_fields():
     assert MANIFEST["id"] == MANIFEST["name"] == PLUGIN_ID
     for key in ("version", "description", "min_herdr_version", "platforms"):
         assert MANIFEST[key]
-    assert MANIFEST["platforms"] == ["windows"]
+    assert set(MANIFEST["platforms"]) == {"windows", "macos"}
 
 
 def test_manifest_hooks_and_actions_call_the_wrapper():
     ids = [a["id"] for a in MANIFEST["actions"]]
     assert len(ids) == len(set(ids))
-    assert set(ids) == {"setup", "start", "restart", "stop", "status"}
+    windows_actions = [a for a in MANIFEST["actions"] if a["platforms"] == ["windows"]]
+    assert {a["id"] for a in windows_actions} == {"setup", "start", "restart", "stop", "status"}
     expected = {"setup": "open-wizard", "start": "launch", "restart": "restart", "stop": "stop",
                 "status": "status -Notify"}
-    for action in MANIFEST["actions"]:
+    for action in windows_actions:
         script = action["command"][-1]
         assert "herdr-slackbot.ps1') " + expected[action["id"]] + ";" in script
         assert "'herdr-slackbot'" in script  # plugin_list fallback looks up our own id
         assert action["title"] and action["platforms"] == ["windows"]
-    (startup,) = MANIFEST["startup"]
+    (startup,) = [s for s in MANIFEST["startup"] if s["platforms"] == ["windows"]]
     assert "herdr-slackbot.ps1') launch;" in startup["command"][-1]
-    (build,) = MANIFEST["build"]
+    (build,) = [b for b in MANIFEST["build"] if b["platforms"] == ["windows"]]
     assert build["command"][-1] == "scripts/setup.ps1"
     assert (REPO_ROOT / "scripts" / "setup.ps1").is_file()
     wrapper = (REPO_ROOT / "scripts" / "herdr-slackbot.ps1").read_text(encoding="utf-8")
@@ -250,7 +251,8 @@ def test_strip_verbatim_and_shell_kind():
     assert P.shell_kind("") == ""
 
 
-def test_bridge_command_quoting_per_shell():
+def test_bridge_command_quoting_per_shell(monkeypatch):
+    monkeypatch.setattr(P.sys, "platform", "win32")
     root, py, cfg = r"D:\it's here", r"D:\it's here\.venv\Scripts\python.exe", r"C:\cfg dir"
     ps = P.bridge_command("powershell", py, root, cfg)
     assert ps == ("Set-Location -LiteralPath 'D:\\it''s here'; & 'D:\\it''s here\\.venv\\Scripts\\python.exe' "
@@ -262,7 +264,8 @@ def test_bridge_command_quoting_per_shell():
     assert "'D:/it'\\''s here/.venv/Scripts/python.exe' -m herdr_slackbot run --config-dir 'C:/cfg dir'" in sh
 
 
-def test_discover_config_dir(tmp_path):
+def test_discover_config_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(P.sys, "platform", "win32")
     class Cli:
         def __init__(self, out=None):
             self.out = out

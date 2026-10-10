@@ -12,6 +12,7 @@ license = {text = "MIT"}
 dependencies = [
     "slack_bolt>=1.18",
     "slack_sdk>=3.26",
+    "psutil>=5.9; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

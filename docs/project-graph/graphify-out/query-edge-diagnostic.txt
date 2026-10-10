@@ -1,0 +1,38 @@
+[graphify] MultiDiGraph edge-collapse diagnostic
+input: /Volumes/My Shared Files/AI/herdr-slackbot/docs/project-graph/graphify-out/graph.json
+input_stage: provided JSON (normal graph.json is post-build)
+effective_directed: False
+nodes: 2416
+unverified_code_nodes: 0
+raw_edges: 7011
+valid_candidate_edges: 7011
+missing_endpoint_edges: 0
+dangling_endpoint_edges: 0
+external_reference_edges: 0
+self_loop_edges: 1
+exact_duplicate_edges: 0
+directed_unique_endpoint_pairs: 6631
+directed_same_endpoint_collapsed_edges: 380
+undirected_unique_endpoint_pairs: 6629
+undirected_same_endpoint_collapsed_edges: 382
+same_endpoint_group_count: 379
+relation_variant_groups: 379
+source_file_variant_groups: 0
+source_location_variant_groups: 0
+context_variant_groups: 0
+post_build_graph_type: Graph
+post_build_edges: 6629
+producer_suppression_sites: 12
+producer_suppression_examples:
+  - L1749 seen_ids arity=unknown
+  - L2282 seen_ids arity=unknown
+  - L2284 seen_doc_refs arity=unknown
+  - L2762 seen_ids arity=unknown
+  - L2909 seen_ids arity=unknown
+  - L3743 seen_keys arity=unknown
+  - L3916 seen_keys arity=unknown
+  - L6273 seen_ids arity=unknown
+examples:
+  - herdr_slackbot_claude_session_agent_result -> herdr_slackbot_parser_resultbody edges=3 relations=['calls', 'references', 'uses'] locations=['L583', 'L586', 'L592'] contexts=['', 'call', 'return_type']
+  - herdr_slackbot_blocks_parse_new_view_state -> herdr_slackbot_blocks_newmodalstate edges=2 relations=['calls', 'references'] locations=['L403', 'L405'] contexts=['call', 'return_type']
+note: normal graph.json is post-build; raw producer loss must be measured earlier.

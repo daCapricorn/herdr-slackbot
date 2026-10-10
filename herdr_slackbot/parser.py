@@ -203,13 +203,26 @@ def strip_codex_input(lines: list[str]) -> list[str]:
     return lines
 
 
-def fallback_tail(text: str, n: int = 40, agent_kind: str | None = None) -> str:
+def fallback_tail(text: str, n: int = 40, agent_kind: str | None = None, *,
+                  preserve_spacing: bool = False) -> str:
     """Last `n` non-blank lines, without the agent's input box/status lines."""
     lines = split_lines(text)
     if agent_kind == "codex":
         lines = strip_codex_input(lines)
     elif find_prompt_box(lines) is not None:
         lines = drop_trailing_notices(strip_prompt_box(lines))
+    if preserve_spacing and n > 0:
+        indices = [i for i, line in enumerate(lines) if line.strip()]
+        if not indices:
+            return ""
+        # Keep paragraph boundaries without counting blank terminal rows toward
+        # the history limit. Collapse the large gaps created by scroll capture.
+        selected = lines[indices[max(0, len(indices) - n)]:indices[-1] + 1]
+        out: list[str] = []
+        for line in selected:
+            if line.strip() or (out and out[-1]):
+                out.append(line if line.strip() else "")
+        return "\n".join(out)
     lines = [line for line in lines if line.strip()]
     return "\n".join(lines[-n:]) if n > 0 else ""
 
@@ -219,7 +232,8 @@ def extract_result(text: str, agent_kind: str | None, fallback_lines: int = 40) 
         parsed = parse_claude(text)
         if parsed is not None:
             return ResultBody(parsed.body, parsed.recap, parsed.duration, True, "screen")
-    return ResultBody(fallback_tail(text, fallback_lines, agent_kind), None, None, False, "tail")
+    return ResultBody(fallback_tail(text, fallback_lines, agent_kind,
+                                   preserve_spacing=agent_kind == "codex"), None, None, False, "tail")
 
 
 def truncate_text(text: str, limit: int) -> tuple[str, bool]:

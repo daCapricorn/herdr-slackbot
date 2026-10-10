@@ -17,13 +17,21 @@ name = "herdr-slackbot"
 version = "0.1.0"
 description = "Slack bot DM bridge for Herdr agents: done/blocked notifications and prompts from Slack (owner-only)."
 min_herdr_version = "0.8.2"
-platforms = ["windows"]
+platforms = ["windows", "macos"]
 
 # Install-time build (herdr plugin install): venv + dependencies + .env skeleton / Slack manifest
 # in the plugin config dir. `herdr plugin link` may skip it; the hook then bootstraps the venv.
 [[build]]
 platforms = ["windows"]
 command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/setup.ps1"]
+
+[[build]]
+platforms = ["macos"]
+command = ["sh", "scripts/setup.sh"]
+
+[[startup]]
+platforms = ["macos"]
+command = ["sh", "-c", 'exec sh "${HERDR_PLUGIN_ROOT:-.}/scripts/herdr-slackbot.sh" launch']
 
 [[startup]]
 platforms = ["windows"]
@@ -34,6 +42,41 @@ command = [
 
 # Plugin actions run headless (stdin redirected, checked on Herdr 0.8.2): `setup` opens a focused tab
 # in the current workspace and types the interactive wizard into its shell.
+# Action IDs must be unique across platforms. macOS uses the -macos suffix; titles match Windows.
+[[actions]]
+id = "setup-macos"
+platforms = ["macos"]
+title = "Slack bridge: setup wizard"
+description = "Open a terminal tab with the interactive Slack setup wizard."
+command = ["sh", "-c", 'exec sh "${HERDR_PLUGIN_ROOT:-.}/scripts/herdr-slackbot.sh" open-wizard']
+
+[[actions]]
+id = "start-macos"
+platforms = ["macos"]
+title = "Slack bridge: start"
+description = "Start the Slack bridge in workspace herdr-slack."
+command = ["sh", "-c", 'exec sh "${HERDR_PLUGIN_ROOT:-.}/scripts/herdr-slackbot.sh" launch']
+
+[[actions]]
+id = "restart-macos"
+platforms = ["macos"]
+title = "Slack bridge: restart"
+description = "Stop the Slack bridge and start it in a fresh tab."
+command = ["sh", "-c", 'exec sh "${HERDR_PLUGIN_ROOT:-.}/scripts/herdr-slackbot.sh" restart']
+
+[[actions]]
+id = "stop-macos"
+platforms = ["macos"]
+title = "Slack bridge: stop"
+description = "Stop the Slack bridge."
+command = ["sh", "-c", 'exec sh "${HERDR_PLUGIN_ROOT:-.}/scripts/herdr-slackbot.sh" stop']
+
+[[actions]]
+id = "status-macos"
+platforms = ["macos"]
+title = "Slack bridge: status"
+description = "Show bridge status and a Herdr notification."
+command = ["sh", "-c", 'exec sh "${HERDR_PLUGIN_ROOT:-.}/scripts/herdr-slackbot.sh" status --notify']
 [[actions]]
 id = "setup"
 platforms = ["windows"]

@@ -16,6 +16,7 @@ from .agents import DEFAULT_PERMISSION_MODE, KIND_CLAUDE, KIND_CODEX, KIND_SPECS
 from .dialog import KIND_PLAN, KIND_QUESTION_REVIEW, KIND_TRUST, KIND_UNKNOWN, Dialog, Option
 from .naming import agent_display_name, agent_option_label, status_emoji, truncate
 from .parser import truncate_text
+from .formatting import native_markdown, terminal_markdown
 
 SECTION_MAX = 3000
 OPTION_TEXT_MAX = 75
@@ -105,6 +106,9 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _BOLD_UNDERSCORE_RE = re.compile(r"__(.+?)__")
 _LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+_TERMINAL_LINK_RE = re.compile(r"([^\s()\[\]<>]+)\s+\((https?://[^)\s]+)\)")
+_INLINE_CODE_RE = re.compile(r"(`+)(.*?)\1")
+_BARE_URL_RE = re.compile(r"(?<![<\w])(https?://[^\s<>]+)")
 _BULLET_RE = re.compile(r"^(\s*)[-*]\s+")
 
 
@@ -115,11 +119,17 @@ def to_mrkdwn(markdown: str) -> str:
     for line in escape(markdown).split("\n"):
         if line.lstrip().startswith("```"):
             in_fence = not in_fence
-            out.append(line)
+            out.append("```")  # Slack does not support fence language labels
             continue
         if in_fence:
             out.append(line)
             continue
+        # Keep Markdown-looking text inside inline code literal.
+        codes: list[str] = []
+        def protect(match: re.Match) -> str:
+            codes.append(match[0])
+            return f"\x00{len(codes) - 1}\x00"
+        line = _INLINE_CODE_RE.sub(protect, line)
         m = _HEADING_RE.match(line)
         if m:
             line = f"*{m.group(2)}*"
@@ -128,10 +138,106 @@ def to_mrkdwn(markdown: str) -> str:
             line = _BOLD_RE.sub(r"*\1*", line)
             line = _BOLD_UNDERSCORE_RE.sub(r"*\1*", line)
         line = _LINK_RE.sub(r"<\2|\1>", line)
+        line = _TERMINAL_LINK_RE.sub(r"<\2|\1>", line)
+        def bare_link(match: re.Match) -> str:
+            url = match[1].rstrip(".,;!?。！？）)")
+            return f"<{url}>" + match[1][len(url):]
+        line = _BARE_URL_RE.sub(bare_link, line)
+        for i, code in enumerate(codes):
+            line = line.replace(f"\x00{i}\x00", code)
         out.append(line)
     if in_fence:
         out.append("```")  # a truncated body may cut a fence open
     return "\n".join(out)
+
+
+def terminal_mrkdwn(text: str) -> str:
+    """Conversation prose renders normally; unrecognized terminal output stays code."""
+    markdown = terminal_markdown(text)
+    if markdown is not None:
+        return to_mrkdwn(markdown)
+    return "```\n" + defuse_fences(escape(text)) + "\n```"
+
+
+def _native_sections(content: str) -> list:
+    """Use native rich text for the Ran label and Markdown for the body."""
+    out: list = []
+    pending: list[str] = []
+    in_fence = False
+
+    def flush() -> None:
+        text = "\n".join(pending).strip()
+        if text:
+            out.append({"type": "markdown", "text": text})
+        pending.clear()
+
+    for line in content.splitlines():
+        if line == "Ran" and not in_fence:
+            flush()
+            out.append({"type": "rich_text", "elements": [{
+                "type": "rich_text_section", "elements": [{
+                    "type": "text", "text": "Ran", "style": {"bold": True},
+                }],
+            }]})
+            continue
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        pending.append(line)
+    flush()
+    return out
+
+
+def _conversation_sections(text: str, room: int, *, native: bool = False) -> tuple[list, bool]:
+    """Separate terminal turns into Slack sections with small role headers.
+
+    The input is already escaped mrkdwn. Never interpret role-looking lines
+    inside code. Preserve chronological order and signal any block-limit cut.
+    """
+    messages: list[tuple[str | None, list[str]]] = []
+    role: str | None = None
+    lines: list[str] = []
+    in_fence = False
+    role_labels = ("**👤 You**", "**🤖 Assistant**") if native else ("*👤 You*", "*🤖 Assistant*")
+    for line in text.splitlines():
+        if not in_fence and line in role_labels:
+            if line == role:
+                while lines and not lines[-1].strip():
+                    lines.pop()
+                lines.append("")
+                continue
+            if role is not None or any(lines):
+                messages.append((role, lines))
+            role, lines = line, []
+            continue
+        if line.startswith("```"):
+            in_fence = not in_fence
+        if in_fence or line.strip() or not lines or lines[-1].strip():
+            lines.append(line)
+    if role is not None or any(lines):
+        messages.append((role, lines))
+    out: list = []
+    for role, lines in messages:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        content = "\n".join(lines).strip()
+        # Agent timing is metadata, so give it a small line below the answer.
+        timing = ""
+        if lines and re.match(r"^\s*Worked for\b", lines[-1]):
+            timing = lines[-1].strip()
+            content = "\n".join(lines[:-1]).strip()
+        group: list = []
+        if out:
+            group.append({"type": "divider"})
+        if role:
+            group.append(context(role.replace("**", "*")))
+        if content:
+            group.extend(_native_sections(content) if native else [section(content)])
+        if timing:
+            group.append(context(timing))
+        if len(out) + len(group) > room:
+            return out, True
+        out.extend(group)
+    return out, False
 
 
 def plain(text: str, emoji: bool = True) -> dict:
@@ -452,7 +558,7 @@ def last_response_blocks(text: str | None, when: str = "", duration: str = "", m
     limit = PREVIEW_CHARS
     while True:
         excerpt, cut = tail_excerpt(text.strip("\n"), limit)
-        body = to_mrkdwn(excerpt) if markdown else "```\n" + defuse_fences(escape(excerpt)) + "\n```"
+        body = to_mrkdwn(excerpt) if markdown else terminal_mrkdwn(excerpt)
         if cut:
             body = PREVIEW_CUT_MARK + "\n" + body
         if len(body) <= SECTION_MAX or limit < 200:
@@ -827,7 +933,9 @@ def parse_dialog_text_view(view: Mapping) -> tuple[str | None, int | None, str, 
 def result_blocks(header: str, context_parts: Sequence[str], body: str, result_id: str | None,
                   recap: str | None = None, limit: int = SECTION_MAX, markdown: bool = True) -> tuple[list, bool]:
     """Result message. Returns (blocks, truncated). A truncated body gets a [View full] button."""
-    converted = to_mrkdwn(body) if markdown else "```\n" + defuse_fences(escape(body)) + "\n```"
+    terminal = terminal_markdown(body) if not markdown else None
+    converted = native_markdown(terminal) if terminal is not None else (
+        to_mrkdwn(body) if markdown else terminal_mrkdwn(body))
     text, truncated = truncate_text(converted, min(limit, SECTION_MAX))
     if truncated and text.count("```") % 2 == 1:
         text, _ = truncate_text(converted, min(limit, SECTION_MAX) - 4)
@@ -838,7 +946,14 @@ def result_blocks(header: str, context_parts: Sequence[str], body: str, result_i
         blocks.append(context(*ctx))
     if recap:
         blocks.append(context("※ " + escape(truncate(recap, 500))))
-    blocks.append(section(text or "_(empty response)_"))
+    if terminal is not None:
+        conversation, cut = _conversation_sections(text, MAX_BLOCKS - len(blocks) - 2, native=True)
+        blocks.extend(conversation)
+        truncated = truncated or cut
+        if cut:
+            blocks.append(context("_… more conversation — View full_"))
+    else:
+        blocks.append(section(text or "_(empty response)_"))
     if truncated and result_id:
         blocks.append(_full_button(result_id))
     return blocks, truncated
