@@ -119,7 +119,9 @@ export function answerPayload(result) {
     }
     blocks.push({type:"buttons",buttons});
   }
-  return {text:original ? `${original.text}\n${text}` : text,presentationTextMode:"fallback",presentation:{
+  // Slack turns fallback-only presentations without controls into plain text.
+  // Leave authored text empty so context continues to render as native blocks.
+  return {text:original ? "" : text,...(original ? {} : {presentationTextMode:"fallback"}),presentation:{
     ...(original ? {title:original.presentation.title,tone:result.outcome === "confirmed" ? "success" : "warning"} : {}),blocks}};
 }
 
@@ -134,7 +136,7 @@ export async function answerEdit(api, route, result) {
   const segments = rendered?.channelData?.slack?.renderedPresentationSegments;
   if (!Array.isArray(segments) || segments.some((s)=>s.kind !== "blocks" || !Array.isArray(s.blocks)))
     throw new Error("OpenClaw Slack renderer did not provide native recovery controls");
-  return {text:payload.text,blocks:segments.flatMap((s)=>s.blocks)};
+  return {text:payload.text || answerText(result),blocks:segments.flatMap((s)=>s.blocks)};
 }
 
 export async function updateAnswerCard(api, route, binding, result, edit, signal) {
