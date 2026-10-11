@@ -178,6 +178,12 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
           const pane = (target?.match(/^w\d+:p\d+$/) ? target : null) ?? binding?.pane_id;
           if (binding && pane !== binding.pane_id) throw new Error("Command targets a different pane channel");
           if (verb === "status") return statusPayload((await call("status")).filter(a=>!binding || a.pane_id === binding.pane_id));
+          if (verb === "sync" && pane) return {text:code(JSON.stringify(await call("sync_status",{pane}),null,2))};
+          if (verb === "bind" && pane) {
+            const threadId = target === pane ? option : target;
+            if (!threadId) throw new Error("Use /openclaw /herdr bind [pane] <thread-id>");
+            return {text:code(JSON.stringify(await call("bind_session",{pane,thread_id:threadId}),null,2))};
+          }
           if (verb === "channels") return {text:code(JSON.stringify(await call("pane_channels",{account_id:ctx.accountId}),null,2))};
           if (verb === "read" && pane) {
             const result = await call("read", { pane });
@@ -206,7 +212,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
             await call("send", { pane, text });
             return { text: `Prompt dispatched to ${pane}.` };
           }
-          return { text: "Use /herdr status | channels | read [pane] | pending | send [pane] <prompt> | answer <request-id> <zero-based-option> | reply <request-id> <text> | check <request-id> | archive (closed pane channel)" };
+          return { text: "Use /openclaw /herdr status | channels | sync [pane] | bind [pane] <thread-id> | read [pane] | pending | send [pane] <prompt> | answer <request-id> <zero-based-option> | reply <request-id> <text> | check <request-id> | archive (closed pane channel)" };
         } catch (error) { return { text: error.message }; }
       },
     });

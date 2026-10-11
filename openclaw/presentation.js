@@ -64,7 +64,7 @@ export function eventPayload(event) {
   if (event.type === "question.requested") {
     blocks.splice(1,0,{type:"text",text:request.question.title});
     if (request.options.length) blocks.splice(2,0,{type:"text",text:request.options.map(o=>`${o.index + 1}. ${o.label}`).join("\n")});
-    blocks.push({type:"context",text:`可点选项，或发送 /herdr reply ${request.id} <你的回答>。问题会在当前 Codex 回合结束时失效。`});
+    blocks.push({type:"context",text:`可点选项，或发送 /openclaw /herdr reply ${request.id} <你的回答>。问题会在当前 Codex 回合结束时失效。`});
   }
   if (request?.options?.length) {
     blocks.push({ type: "context", text: `Request ${request.id}` });

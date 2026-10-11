@@ -6,10 +6,9 @@ import json
 import os
 import re
 import sqlite3
-from contextlib import closing
 from pathlib import Path
 
-from .events import session_of
+from .codex_session import resolve_session, validate_rollout, SessionUnavailable
 
 
 def _latest_turn_offset(path: Path, limit: int = 16 * 1024 * 1024) -> int:
@@ -73,7 +72,7 @@ def _tool_summary(item):
         command = item.get("command")
         if isinstance(command, list):
             command = " ".join(str(part) for part in command)
-        command = _redact(str(command or "")).strip()
+        command = " ".join(_redact(str(command or "")).split())
         if not command:
             return "Ran a command"
         command = command[:220] + ("…" if len(command) > 220 else "")
@@ -142,32 +141,54 @@ class CodexRolloutSync:
             (source_key TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, device INTEGER NOT NULL,
              inode INTEGER NOT NULL, offset INTEGER NOT NULL)""")
         self.db.execute("CREATE TABLE IF NOT EXISTS codex_sync_seen (event_id TEXT PRIMARY KEY)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS codex_session_bindings (terminal_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, cwd TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS codex_sync_status (terminal_id TEXT PRIMARY KEY, record TEXT NOT NULL)")
 
-    def _resolve(self, info):
-        thread_id, cwd = session_of(info), info.get("cwd")
-        if info.get("agent") != "codex" or not thread_id or not cwd:
-            return None
-        databases = sorted(self.home.glob("state_*.sqlite"), key=lambda p: int(p.stem.split("_")[-1]))
-        if not databases:
-            return None
+    def diagnostic(self, info):
+        key = info.get("terminal_id") or info.get("pane_id", "")
+        row = self.db.execute("SELECT record FROM codex_sync_status WHERE terminal_id=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else {"state": "pending", "reason": "Not scanned yet"}
+
+    def _status(self, info, state, **fields):
+        key = info.get("terminal_id") or info.get("pane_id", "")
+        self.db.execute("INSERT OR REPLACE INTO codex_sync_status VALUES (?, ?)",
+                        (key, json.dumps({"state": state, **fields})))
+
+    def _resolve(self, info, unique_workspace=False):
+        key = info.get("terminal_id")
+        binding = self.db.execute("SELECT thread_id,cwd FROM codex_session_bindings WHERE terminal_id=?", (key,)).fetchone()
+        if binding and binding[1] != info.get("cwd"):
+            raise SessionUnavailable("Bound directory changed; bind the current session again")
+        return validate_rollout(resolve_session(info, home=self.home,
+            unique_workspace=unique_workspace, thread_id=binding[0] if binding else None))
+
+    def bound_info(self, info):
+        binding = self.db.execute("SELECT thread_id FROM codex_session_bindings WHERE terminal_id=?",
+                                  (info.get("terminal_id"),)).fetchone()
+        if not binding:
+            return info
+        tid, _, _ = self._resolve(info)
+        return {**info, "agent_session": {"value": tid}}
+
+    def bind(self, info, thread_id):
+        if not info.get("terminal_id"):
+            raise SessionUnavailable("Exact terminal id required for binding")
+        tid, path, cwd = validate_rollout(resolve_session(info, home=self.home, thread_id=thread_id))
+        self.db.execute("INSERT OR REPLACE INTO codex_session_bindings VALUES (?, ?, ?)",
+                        (info["terminal_id"], tid, cwd))
+        self._status(info, "ready", thread_id=tid, source="explicit", reason="Bound; waiting for next scan")
+        return self.diagnostic(info)
+
+    def sync(self, info, enqueue, *, unique_workspace=False):
         try:
-            with closing(sqlite3.connect(databases[-1].resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
-                rows = db.execute("SELECT rollout_path,cwd FROM threads WHERE id=? AND archived=0 AND agent_path IS NULL",
-                                  (thread_id,)).fetchall()
-            if len(rows) != 1 or rows[0][1] != cwd or not rows[0][0]:
-                return None
-            return Path(rows[0][0])
-        except (OSError, sqlite3.Error, ValueError, TypeError):
-            return None
-
-    def sync(self, info, enqueue):
-        path = self._resolve(info)
-        if path is None:
+            thread_id, path, _ = self._resolve(info, unique_workspace)
+        except SessionUnavailable as exc:
+            self._status(info, "unavailable", reason=str(exc))
             return 0
         try:
             stat = path.stat()
             terminal = info.get("terminal_id") or info.get("pane_id", "")
-            source_key = f"{terminal}:{session_of(info)}"
+            source_key = f"{terminal}:{thread_id}"
             row = self.db.execute("SELECT rollout_path,device,inode,offset FROM codex_sync_cursors WHERE source_key=?",
                                   (source_key,)).fetchone()
             same_file = row and row[0] == str(path) and row[1] == stat.st_dev and row[2] == stat.st_ino
@@ -223,6 +244,12 @@ class CodexRolloutSync:
                         ON CONFLICT(source_key) DO UPDATE SET rollout_path=excluded.rollout_path,
                         device=excluded.device,inode=excluded.inode,offset=excluded.offset""",
                         (source_key, str(path), stat.st_dev, stat.st_ino, cursor))
+            # Empty/settled rollouts also need a baseline cursor before the next turn.
+            self.db.execute("""INSERT OR REPLACE INTO codex_sync_cursors
+                (source_key,rollout_path,device,inode,offset) VALUES (?,?,?,?,?)""",
+                (source_key, str(path), stat.st_dev, stat.st_ino, cursor))
+            self._status(info, "syncing", thread_id=thread_id, offset=cursor)
             return cursor - offset
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error) as exc:
+            self._status(info, "unavailable", reason=f"Rollout read failed: {type(exc).__name__}")
             return 0

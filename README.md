@@ -20,7 +20,7 @@ The current integration supports **Slack DMs through OpenClaw**. The core and me
 - List agents and read an exact pane's visible terminal conversation, including command output.
 - Send a prompt to an idle or completed agent.
 - Show recognized Codex command approvals and Claude single-choice dialogs with native buttons, then revalidate the exact request before sending keys.
-- Forward Codex CLI async questions from Queued follow-up inputs, including while the agent is working. Answer a suggested choice in Slack or use `/herdr reply` for free text.
+- Forward Codex CLI async questions from Queued follow-up inputs, including while the agent is working. Answer a suggested choice in Slack or use `/openclaw /herdr reply` for free text.
 - Keep pending approvals/questions and outbound messages across Gateway/worker restarts.
 - Optionally stream new Codex conversation messages into each pane's private Slack channel; tool activity is summarized without tool output.
 
@@ -64,19 +64,21 @@ openclaw gateway restart
 openclaw gateway status
 ```
 
-Send `/herdr status` as a text command in the OpenClaw bot DM. See the [guide](docs/GUIDE.md) for command routing, optional read tools, Windows paths and migration from the old bot.
+Enable `channels.slack.slashCommand` with `{"enabled":true,"name":"openclaw"}`, then send `/openclaw /herdr status` in the OpenClaw bot DM. The Slack App must already have its `/openclaw` slash command configured; plugin registration does not create a native `/herdr` Slack command. See the [guide](docs/GUIDE.md) for command routing, optional read tools, Windows paths and migration from the old bot.
 
 ## Commands
 
 | Command | Result |
 |---|---|
-| `/herdr status` | Agents and exact pane IDs |
-| `/herdr read w4:p2` | That pane's visible terminal |
-| `/herdr pending` | Request IDs and zero-based options |
-| `/herdr send w4:p2 inspect the project` | Prompt an idle/done agent |
-| `/herdr answer <request-id> 0` | Answer one exact request after live checks |
-| `/herdr reply <request-id> <text>` | Answer an exact Codex async question with free text |
-| `/herdr check <request-id>` | Inspect a previous attempt without sending keys |
+| `/openclaw /herdr status` | Agents and exact pane IDs |
+| `/openclaw /herdr read w4:p2` | That pane's visible terminal |
+| `/openclaw /herdr sync w4:p2` | Conversation sync status and failure reason |
+| `/openclaw /herdr bind w4:p2 <thread-id>` | Associate an exact Codex conversation; no terminal input |
+| `/openclaw /herdr pending` | Request IDs and zero-based options |
+| `/openclaw /herdr send w4:p2 inspect the project` | Prompt an idle/done agent |
+| `/openclaw /herdr answer <request-id> 0` | Answer one exact request after live checks |
+| `/openclaw /herdr reply <request-id> <text>` | Answer an exact Codex async question with free text |
+| `/openclaw /herdr check <request-id>` | Inspect a previous attempt without sending keys |
 
 Clicks and write commands require an authenticated configured owner on the configured channel/account. Optional `herdr_status` and `herdr_read` tools give OpenClaw's model read access; the model receives no approval or terminal-write tool.
 
@@ -90,11 +92,11 @@ Approval cards, unsupported blocked-dialog notices and Codex async question card
 
 ## Pane channels
 
-With `paneChannels.enabled: true`, Bridge creates one private Slack channel for every Herdr pane, including ordinary shell panes, and invites the configured owners. Pane events and approval results use that channel instead of the aggregate DM. Names follow the pane/tab display name; renaming updates the channel while preserving its ID. A terminal moved across workspaces retains its channel under the new pane ID. Closed panes retain their channel as history; `/herdr archive` in that channel explicitly archives it. For Codex panes, new user inputs and completed assistant answers are also streamed into the channel; tool calls appear as short summaries without tool output. On first attachment, a working or blocked pane starts from the latest active turn; a settled pane starts at the current end of its rollout. Older session history is not imported. Claude and other agents keep their current notification-only behavior.
+With `paneChannels.enabled: true`, Bridge creates one private Slack channel for every Herdr pane, including ordinary shell panes, and invites the configured owners. Pane events and approval results use that channel instead of the aggregate DM. Names follow the pane/tab display name; renaming updates the channel while preserving its ID. A terminal moved across workspaces retains its channel under the new pane ID. Closed panes retain their channel as history; `/openclaw /herdr archive` in that channel explicitly archives it. For Codex panes, new user inputs and completed assistant answers are also streamed into the channel; tool calls appear as short summaries without tool output. On first attachment, a working or blocked pane starts from the latest active turn; a settled pane starts at the current end of its rollout. Older session history is not imported. Claude and other agents keep their current notification-only behavior.
 
 OpenClaw still sends messages and handles authenticated interactions. Its 2026.9.9 SDK does not expose Slack channel creation/rename/invitation, so a narrow management adapter calls the Slack Conversations API using the current OpenClaw bot credential in memory. No separate token is configured or persisted by Bridge. Add `groups:write` and `groups:write.invites` alongside the existing `groups:read` scope, then reinstall the Slack App. The selected account must use bot identity and a resolved bot token. Without the opt-in setting, existing DM routing continues.
 
-Channel commands infer the bound pane: `/herdr read`, `/herdr pending` and `/herdr send <prompt>`. Explicit cross-pane targets and requests from a different channel are rejected. Pending-request messages and completion notices mention the owners; the 10-second attention delay remains unchanged. Channel notification and mobile settings still govern actual push delivery.
+Channel commands infer the bound pane: `/openclaw /herdr read`, `/openclaw /herdr pending` and `/openclaw /herdr send <prompt>`. Explicit cross-pane targets and requests from a different channel are rejected. Pending-request messages mention the owners; completion notices do not; the 10-second attention delay remains unchanged. Channel notification and mobile settings still govern actual push delivery.
 
 ## Reliability
 

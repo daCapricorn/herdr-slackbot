@@ -59,7 +59,7 @@ def main():
     thread = threading.Thread(target=scan, daemon=True)
     thread.start()
     methods = {name: getattr(bridge, name) for name in (
-        "status", "read", "pending", "events", "ack", "answer", "send",
+        "status", "read", "pending", "sync_status", "bind_session", "events", "ack", "answer", "send",
         "check", "retry", "prepare_answer", "dispatch_reserved", "bind_card", "result_cards", "event_for_delivery",
         "pane_channels", "channel_provisioned", "channel_ready", "channel_archived", "pane_for_channel",
         "route_event", "authorize_request")}

@@ -22,7 +22,7 @@ def setup_source(tmp_path, rows):
     home = tmp_path / "codex"
     home.mkdir()
     rollout = tmp_path / "rollout.jsonl"
-    write_rows(rollout, rows)
+    write_rows(rollout, [row("session_meta", {"id": "session-1", "cwd": "/project"})] + rows)
     state = sqlite3.connect(home / "state_1.sqlite")
     state.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, archived INTEGER, agent_path TEXT)")
     state.execute("INSERT INTO threads VALUES ('session-1', ?, '/project', 0, NULL)", (str(rollout),))
@@ -104,7 +104,7 @@ def test_cursor_replacement_does_not_requeue_already_acknowledged_messages(tmp_p
     source.sync(info, enqueue)
     db.execute("DELETE FROM outbox")  # simulate Slack delivery and ack
     replacement = rollout.with_suffix(".replacement")
-    write_rows(replacement, rows + [row("event_msg", {"type": "item_completed", "item": {"type": "UserMessage", "id": "u2",
+    write_rows(replacement, [row("session_meta", {"id": "session-1", "cwd": "/project"})] + rows + [row("event_msg", {"type": "item_completed", "item": {"type": "UserMessage", "id": "u2",
         "content": [{"type": "text", "text": "twice"}]}}, ordinal=3)])
     os.replace(replacement, rollout)
     source.sync(info, enqueue)
@@ -150,3 +150,66 @@ def test_tool_summary_redacts_inline_credentials_and_never_includes_output(tmp_p
     assert "xoxb-secret" not in body and "secret output" not in body
     assert "[redacted]" in body
     state.close()
+
+
+def test_missing_session_resolves_only_with_unique_pane_and_thread(tmp_path):
+    source, db, state, _, info = setup_source(tmp_path, [])
+    info.pop("agent_session")
+    source.sync(info, lambda *args: None)
+    assert source.diagnostic(info)["state"] == "unavailable"
+    source.sync(info, lambda *args: None, unique_workspace=True)
+    assert source.diagnostic(info)["thread_id"] == "session-1"
+    assert db.execute("SELECT source_key FROM codex_sync_cursors").fetchone()[0] == "terminal-1:session-1"
+    state.execute("INSERT INTO threads VALUES ('other', 'missing', '/project', 0, NULL)")
+    state.commit()
+    source.sync(info, lambda *args: None, unique_workspace=True)
+    assert "ambiguous" in source.diagnostic(info)["reason"]
+
+
+def test_explicit_binding_survives_restart_and_rejects_changed_identity(tmp_path):
+    source, db, state, _, info = setup_source(tmp_path, [])
+    info.pop("agent_session")
+    source.bind(info, "session-1")
+    db.commit()
+    restarted = CodexRolloutSync(db, home=source.home)
+    restarted.sync(info, lambda *args: None)
+    assert restarted.diagnostic(info)["thread_id"] == "session-1"
+    assert restarted.bound_info(info)["agent_session"]["value"] == "session-1"
+    # A recreated terminal does not inherit the previous terminal's binding.
+    changed = {**info, "terminal_id": "terminal-2"}
+    restarted.sync(changed, lambda *args: None)
+    assert restarted.diagnostic(changed)["state"] == "unavailable"
+    restarted.sync({**info, "agent_session": {"value": "other"}}, lambda *args: None)
+    assert "differs" in restarted.diagnostic(info)["reason"]
+    restarted.sync({**info, "cwd": "/different"}, lambda *args: None)
+    assert "directory changed" in restarted.diagnostic(info)["reason"]
+
+
+def test_rollout_identity_mismatch_never_queues_messages(tmp_path):
+    source, db, state, rollout, info = setup_source(tmp_path, [])
+    rollout.write_text(json.dumps(row("session_meta", {"id": "wrong", "cwd": "/project"})) + "\n")
+    source.sync(info, lambda *args: db.execute("INSERT INTO outbox VALUES ('bad','bad')"))
+    assert collect(db) == []
+    assert "identity" in source.diagnostic(info)["reason"]
+
+
+def test_settled_first_scan_records_baseline_then_syncs_next_turn_once(tmp_path):
+    source, db, state, rollout, info = setup_source(tmp_path, [])
+    info.pop("agent_session")
+    info["agent_status"] = "idle"
+    enqueue = lambda event_id, agent, message: db.execute("INSERT INTO outbox VALUES (?, ?)",
+        (event_id, json.dumps(message)))
+    source.sync(info, enqueue, unique_workspace=True)
+    write_rows(rollout, [row("event_msg", {"type": "task_started"}, ordinal=1),
+        row("event_msg", {"type": "user_message", "message": "new turn"}, ordinal=2)])
+    source.sync(info, enqueue, unique_workspace=True)
+    source.sync(info, enqueue, unique_workspace=True)
+    assert [event["text"] for _, event in collect(db)] == ["new turn"]
+
+
+def test_multiline_command_summary_is_single_line_inline_code():
+    from herdr_bridge.codex_sync import _tool_summary
+    summary = _tool_summary({"type": "CommandExecution", "command": "python - <<'PY'\nprint(`unsafe`)\nPY", "stdout": "private"})
+    assert "\n" not in summary
+    assert summary.count("`") == 2
+    assert "private" not in summary
