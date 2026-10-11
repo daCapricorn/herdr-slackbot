@@ -145,4 +145,32 @@ Check delivery, callback, terminal dispatch and phone push independently. A succ
 
 When Herdr omits `agent_session`, automatic discovery requires exactly one Codex pane in the directory and exactly one non-archived, non-subagent Codex thread there. The rollout's `session_meta` must match its database ID and cwd. Neither modification time nor the newest thread is used to guess a session.
 
-For ambiguous directories, use `/openclaw /herdr bind <thread-id>` in the pane channel, or `/openclaw /herdr bind <pane> <thread-id>` in the DM. Obtain the exact ID from the intended Codex conversation. Binding is a Bridge-only association; it does not send terminal input or modify Codex state. It persists across Gateway restart, follows terminal movement, and does not transfer to a recreated terminal. A conflicting Herdr session ID or changed directory stops sync. If Codex resumes a different conversation in the same terminal while Herdr still omits its session ID, explicitly bind the new thread; that switch cannot be proven from pane identity alone.
+For ambiguous directories, use `/openclaw /herdr bind <thread-id>` in the pane channel, or `/openclaw /herdr bind <pane> <thread-id>` in the DM. Obtain the exact ID from the intended Codex conversation. Binding is a Bridge-only association; it does not send terminal input or modify Codex state. It persists across Gateway restart, follows terminal movement, and does not transfer to a recreated terminal. A validated live Herdr session ID supersedes an old saved binding automatically. Manual binding to a different live Herdr session is rejected. Without a native identity, a changed directory stops sync and a conversation switch still requires an explicit bind.
+
+### Codex session switching on macOS
+
+Install the optional companion hooks alongside the existing Herdr integration:
+
+```bash
+.venv/bin/python scripts/install-codex-session-hook.py
+```
+
+The installer preserves other hooks, saves a one-time `hooks.json.herdr-bridge-backup`, and never changes Codex hook trust. Review the two `herdr_bridge.session_hook` entries in the Codex CLI `/hooks` menu: `SessionStart` and `UserPromptSubmit`. This is a Codex terminal command, not a Slack command. Codex skips new hooks until reviewed and trusted. The existing managed Herdr script is not modified. Restarting Gateway does not enable untrusted hooks.
+
+Start each pane that needs automatic association with a pane-local Codex runtime:
+
+```bash
+bash scripts/codex-herdr.sh
+bash scripts/codex-herdr.sh resume <thread-id>
+# Equivalent: codex --no-daemon [resume <thread-id>]
+```
+
+Codex CLI 0.162.1's shared daemon can pass its original pane environment to a hook instead of the TUI's current pane. Its actual hook input has no client/pane identifier. The companion refuses shared-daemon association, even when the inherited pane happens to exist. It requires an ancestor PID matching exactly one live Herdr pane's foreground `codex --no-daemon` process, then rechecks that process and terminal before reporting. This also handles a stale inherited pane ID after movement. Other panes and the shared daemon are not restarted. Shared-daemon sessions retain manual `/openclaw /herdr bind` support.
+
+The hooks validate the exact root session against Codex's database and rollout header and report its session ID through `pane.report_agent_session`. They accept a null `transcript_path`, which can occur with paginated Codex histories. Nested agents, missing identities, changed terminals and stale overlapping hook invocations cannot replace the pane association. These are Codex adapters; Claude conversation sync is not provided by this installer. Private hook diagnostics under `CODEX_HOME/herdr-bridge/hooks` contain identity fields, outcome and error type, without prompt text or transcript contents.
+
+A small private identity/offset record under `CODEX_HOME/herdr-bridge/sessions` records the first streaming position. `/new` or resume changes the exact thread association while preserving the Slack channel. Each terminal/thread retains its own cursor. A newly attached resumed session skips earlier history; an already tracked session continues its saved cursor. Hook cutoff evidence also includes a new turn that finishes before the first Bridge scan. Repeated prompt/compaction hooks retain the cutoff. No hook sends prompts, keys, approvals or Slack messages.
+
+Conversation cursor, seen IDs and outbox writes commit together, and a failed read/enqueue rolls them back together. Provider send failures leave messages queued. Later conversation messages from that pane wait behind the failed message; other panes and separate completion/result notifications can continue. Gateway restart preserves pending messages, bindings and acknowledged cursors. Delivery remains at least once: a provider accepting a message immediately before its acknowledgement is lost can still produce a duplicate on retry. Deterministic offline tests cover pre-handoff failure and recovery; they cannot prove exactly-once provider delivery.
+
+For a resolved Codex stream, completion notices require a newly synced completed answer. A durable completion-event claim suppresses repeated startup/resume status transitions that show an old answer. Final conversation messages and separate completion cards remain distinct; this does not remove the normal completion notification.

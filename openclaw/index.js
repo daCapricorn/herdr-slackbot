@@ -95,8 +95,14 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
             }
             const events = await call("events",paneChannels ? {account_id:config.route.accountId} : undefined);
             let deferred;
+            const failedConversations = new Set();
             for (let event of events) {
               if (stopping) break;
+              const conversation = event.type === "conversation.message"
+                ? (event.agent.terminal_id ?? event.agent.pane_id) : null;
+              // Retain chronological order within a pane after a failed send;
+              // other panes and independent completion/results can still progress.
+              if (conversation && failedConversations.has(conversation)) continue;
               try {
                 if (["approval.requested","agent.blocked","question.requested"].includes(event.type)) {
                   event = await call("event_for_delivery",{event_id:event.id});
@@ -147,6 +153,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
                 await call("ack", { event_id: event.id });
                 api.logger.info(`Herdr event delivered: ${event.type} ${event.id}`);
               } catch (error) {
+                if (conversation) failedConversations.add(conversation);
                 deferred ??= error;
                 api.logger.warn(`Herdr event deferred: ${event.id} ${error.message}`);
               }

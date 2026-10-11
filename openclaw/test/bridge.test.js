@@ -206,8 +206,44 @@ async function runningBridge(t, initial = {}) {
       editMessage:async(message)=> {initial.onEdit?.(message,calls);if (initial.editFail) throw new Error("edit offline");edits.push(message);},
       reply:async(message)=>edits.push({error:message.text})
     }});
-  return {id,attempt,binding,calls,edits,api,context,click,registrations,setResult:r=>result=r};
+  return {id,attempt,binding,calls,edits,api,context,click,registrations,setResult:r=>result=r,
+    restart:async()=> {await registrations.service.stop();await registrations.service.start({stateDir:dir,config:{}});}};
 }
+
+test("conversation outage retains order, recovers after restart and does not resend acknowledged messages", async t => {
+  const pending = new Map([
+    ["user",{id:"user",type:"conversation.message",role:"user",text:"recovery user",agent:{pane_id:"w1:p1",terminal_id:"term-a"}}],
+    ["answer",{id:"answer",type:"conversation.message",role:"assistant",text:"recovery answer",agent:{pane_id:"w1:p1",terminal_id:"term-a"}}],
+    ["other",{id:"other",type:"conversation.message",role:"assistant",text:"other pane",agent:{pane_id:"w1:p2",terminal_id:"term-b"}}],
+  ]);
+  let offline = true;
+  const attempts = [], sent = [];
+  const bridge = await runningBridge(t,{
+    call:async(method,params)=> {
+      if (method === "events") return [...pending.values()];
+      if (method === "ack") pending.delete(params.event_id);
+      return {};
+    },
+    update:async(ctx)=> {
+      attempts.push(ctx.payload.text);
+      if (offline && ctx.payload.text.includes("recovery")) throw new Error("injected Slack offline before handoff");
+      sent.push(ctx.payload.text);
+      return {messageId:String(sent.length)};
+    },
+  });
+  for(let i=0;i<30 && pending.has("other");i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual([...pending.keys()],["user","answer"]);
+  assert.equal(attempts.some(text=>text.includes("recovery answer")),false);
+  assert.equal(sent.length,1); // A separate pane is not held behind the outage.
+  offline = false;
+  await bridge.restart();
+  for(let i=0;i<30 && pending.size;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(pending.size,0);
+  assert.deepEqual(sent.map(text=>text.split("\n").at(-1)),["other pane","recovery user","recovery answer"]);
+  await bridge.restart();
+  for(let i=0;i<10;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(sent.length,3);
+});
 
 test("authorized answer/check/retry callbacks bind the source card and invoke only their own method", async t => {
   const bridge = await runningBridge(t);
