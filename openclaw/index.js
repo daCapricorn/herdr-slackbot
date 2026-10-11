@@ -261,7 +261,12 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
           await editCurrentCard(ctx, requestId);
         } catch (error) {
           api.logger.warn?.(`Herdr callback rejected: ${error.message}`);
-          await ctx.respond.reply({ text: error.message });
+          // A response-URL reply can replace the source card in this host.
+          // Send owner errors separately, preserving its original evidence.
+          if (authorized(config,ctx)) {
+            try { await deliver(api,sourceRoute(ctx),{text:error.message},controller?.signal); }
+            catch (deliveryError) { api.logger.warn?.(`Herdr callback error notification deferred: ${deliveryError.message}`); }
+          }
         }
         return { handled: true };
       },

@@ -57,10 +57,8 @@ test("unauthorized callbacks cannot reach the worker or clear a card", async () 
   let interactive;
   plugin.register({ pluginConfig: config, logger: {}, registerService() {}, registerCommand() {}, registerTool() {},
     registerInteractiveHandler: (i) => interactive = i });
-  let text;
   await interactive.handler({ ...trusted, senderId: "U2", interaction: { payload: "a".repeat(32) + ":0" },
-    respond: { reply: (r) => text = r.text, editMessage: () => assert.fail("unauthorized edit") } });
-  assert.match(text, /not authorized/);
+    respond: { reply: () => assert.fail("unauthorized response-URL replacement"), editMessage: () => assert.fail("unauthorized edit") } });
 });
 test("connection probe is authenticated and never starts a terminal action", async () => {
   let interactive;
@@ -129,6 +127,8 @@ test("checking and confirmed edits retain original context while replacing choic
     const context={...card_context,type,request:{...card_context.request,question:{title:"Original question"}}};
     const result={request_id:id,outcome,option:"Yes",card_context:context};
     const payload=answerPayload(result);
+    assert.equal(payload.text,"");
+    assert.equal(payload.presentationTextMode,undefined);
     assert.equal(payload.presentation.title,"pane-name · model · /project");
     assert.equal(payload.presentation.blocks[0].text,"`original summary`");
     assert.ok(payload.presentation.blocks.some(b=>b.text?.includes("original transcript")));
@@ -210,7 +210,7 @@ test("authorized answer/check/retry callbacks bind the source card and invoke on
   const before = bridge.calls.length;
   await bridge.click(`retry:${bridge.id}:arbitrary-keys`);
   assert.equal(bridge.calls.length,before);
-  assert.match(bridge.edits.at(-1).error,/Invalid/);
+  assert.match(bridge.edits.at(-1).payload.text,/Invalid/);
 });
 
 test("callbacks edit the latest stored result rather than their potentially stale return", async t => {
@@ -289,7 +289,8 @@ test("failure to show initial progress cannot submit a reserved terminal write",
   await bridge.click(`${bridge.id}:0`);
   assert.ok(bridge.calls.some(c=>c.method === "prepare_answer"));
   assert.ok(!bridge.calls.some(c=>c.method === "dispatch_reserved"));
-  assert.match(bridge.edits.at(-1).error,/edit offline/);
+  assert.match(bridge.edits.at(-1).payload.text,/edit offline/);
+  assert.ok(!bridge.edits.some(edit=>edit.error));
 });
 
 test("a failed background edit does not block unrelated queued notifications", async t => {
