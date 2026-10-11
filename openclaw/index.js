@@ -4,11 +4,25 @@ import { Worker } from "./worker.js";
 import { answerText, answerPayload, answerEdit, updateAnswerCard, code, deliver, eventPayload, statusPayload } from "./presentation.js";
 import { SlackPaneChannels } from "./channels.js";
 
+function slackUserId(value) {
+  return typeof value === "string" && /^[UW][A-Z0-9]+$/i.test(value) ? value.toUpperCase() : value;
+}
+
+export function commandContext(ctx) {
+  // OpenClaw native commands expose the authenticated origin in `from`.
+  // `channelId` is the provider name (slack), not the Slack conversation id.
+  const origin = /^slack:(?:(?:channel|group):)?([CDG][A-Z0-9]+)$/i.exec(ctx.from ?? "")?.[1]?.toUpperCase();
+  if (origin && ctx.conversationId && origin !== ctx.conversationId)
+    throw new Error("Conflicting Slack command conversation identity");
+  // Never infer a channel from user-authored args or from slash:<user-id>.
+  return {...ctx, senderId:slackUserId(ctx.senderId), conversationId:origin ?? ctx.conversationId};
+}
+
 export function authorized(config, ctx) {
   return (ctx.isAuthorizedSender ?? ctx.auth?.isAuthorizedSender) === true
     && ctx.channel === config.route.channel
     && ctx.accountId === config.route.accountId
-    && config.ownerIds.includes(ctx.senderId);
+    && config.ownerIds.map(slackUserId).includes(slackUserId(ctx.senderId));
 }
 
 export function registerBridge(api, workerFactory = (...args)=>new Worker(...args), channelFactory = (...args)=>new SlackPaneChannels(...args)) {
@@ -166,6 +180,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
       acceptsArgs: true, requireAuth: true, channels: ["slack"],
       async handler(ctx) {
         try {
+          ctx = commandContext(ctx);
           allowed(ctx);
           const args = (ctx.args ?? "").trim();
           const [verb = "status", target, option] = args.split(/\s+/);

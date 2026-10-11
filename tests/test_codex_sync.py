@@ -52,7 +52,8 @@ def test_sync_starts_at_latest_turn_and_sends_only_user_final_and_tool_summary(t
         row("event_msg", {"type": "item_completed", "turn_id": "current", "item": {
             "type": "CommandExecution", "id": "cmd-1", "command": ["pytest", "-q"], "stdout": "private output"}}, ordinal=5),
         row("event_msg", {"type": "item_completed", "turn_id": "current", "item": {
-            "type": "AgentMessage", "id": "answer-1", "phase": "final_answer", "text": "Fixed it."}}, ordinal=6),
+            "type": "AgentMessage", "id": "answer-1", "phase": "final_answer",
+            "content": [{"type": "Text", "text": "Fixed it."}]}}, ordinal=6),
         row("response_item", {"type": "message", "role": "assistant", "id": "answer-1", "phase": "final_answer",
             "content": [{"type": "output_text", "text": "Fixed it."}]}, ordinal=7),
     ])

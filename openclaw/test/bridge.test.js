@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import plugin, { authorized } from "../index.js";
+import plugin, { authorized, commandContext } from "../index.js";
 import { answerText, eventPayload, deliver, buttonLabel, messageSummary } from "../presentation.js";
 import { readFileSync } from "node:fs";
 
@@ -11,6 +11,16 @@ test("command and callback authorization require host authentication plus owner/
   assert.ok(authorized(config, { ...trusted, isAuthorizedSender: undefined, auth: { isAuthorizedSender: true } }));
   for (const changes of [{ isAuthorizedSender: false }, { senderId: "U2" }, { accountId: "other" }, { channel: "discord" }])
     assert.equal(authorized(config, { ...trusted, ...changes }), false);
+});
+test("native Slack command context canonicalizes only stable IDs and authentic origin", () => {
+  const ctx = commandContext({...trusted,senderId:"u1",channelId:"slack",from:"slack:channel:C2",to:"slash:U1"});
+  assert.ok(authorized(config,ctx));
+  assert.equal(ctx.conversationId,"C2");
+  assert.equal(commandContext({...trusted,from:"slack:group:G2"}).conversationId,"G2");
+  assert.equal(commandContext({...trusted,from:"slack:U1",to:"slash:U1",args:"C2"}).conversationId,undefined);
+  assert.throws(()=>commandContext({...trusted,from:"slack:channel:C2",conversationId:"C3"}),/Conflicting/);
+  for (const changes of [{senderId:"u2"},{isAuthorizedSender:false},{accountId:"other"},{channel:"discord"}])
+    assert.equal(authorized(config,commandContext({...ctx,...changes})),false);
 });
 test("portable approval actions carry exact request and option, never raw keys", () => {
   const payload = eventPayload({ type: "approval.requested", agent: { pane_id: "w4:p2", kind: "codex" },
@@ -487,4 +497,10 @@ test("session binding and sync diagnostics are owner-only and scoped to the pane
   assert.match((await handler({...ctx,args:"bind w4:p1 thread-b"})).text,/different pane/);
   assert.match((await handler({...ctx,senderId:"U2",args:"bind thread-b"})).text,/not authorized/);
   assert.equal(bridge.calls.filter(c=>c.method === "bind_session").length,before);
+  const native = {...trusted,senderId:"u1",channelId:"slack",from:"slack:channel:C2",to:"slash:U1",args:"bind thread-a"};
+  assert.match((await handler(native)).text,/syncing/);
+  assert.equal(bridge.calls.filter(c=>c.method === "bind_session").length,before+1);
+  await handler({...native,args:"sync"});
+  assert.equal(bridge.calls.filter(c=>c.method === "sync_status").at(-1).params.pane,"w4:p2");
+  assert.match((await handler({...native,args:"bind w4:p1 thread-b"})).text,/different pane/);
 });
