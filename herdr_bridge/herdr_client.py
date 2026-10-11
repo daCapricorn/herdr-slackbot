@@ -70,7 +70,7 @@ class HerdrOutcomeUnknown(HerdrError):
 READ_ONLY_METHODS = frozenset({
     "ping", "agent.list", "agent.get", "agent.read", "agent.explain", "workspace.list",
     "workspace.get", "tab.list", "tab.get", "pane.list", "pane.get", "pane.current",
-    "pane.read", "pane.layout", "session.snapshot",
+    "pane.read", "pane.layout", "pane.process_info", "session.snapshot",
 })
 
 
@@ -364,6 +364,8 @@ def cli_args(method: str, params: dict) -> list[str]:
         return ["pane", "list"] + (["--workspace", p["workspace_id"]] if p.get("workspace_id") else [])
     if method == "pane.get":
         return ["pane", "get", p["pane_id"]]
+    if method == "pane.process_info":
+        return ["pane", "process-info", "--pane", p["pane_id"]]
     raise HerdrUnavailable(f"no CLI fallback for {method}")
 
 
@@ -488,6 +490,9 @@ class HerdrClient:
 
     def get_pane(self, pane_id: str) -> dict:
         return self.request("pane.get", {"pane_id": pane_id})["pane"]
+
+    def process_info(self, pane_id: str) -> dict:
+        return self.request("pane.process_info", {"pane_id": pane_id})["process_info"]
 
     def read_agent_once(self, target: str, lines: int, source: str = "recent_unwrapped") -> str:
         result = self.request("agent.read", {"target": target, "source": source, "lines": lines})

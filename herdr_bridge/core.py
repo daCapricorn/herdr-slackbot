@@ -365,6 +365,8 @@ class Bridge:
             if identity(self._agent(info["pane_id"])) != identity(info):
                 return
             with self.lock, self.db:
+                if not self.codex_sync.claim_completion(info):
+                    return
                 self._queue("agent.done", info, text=text)
 
     def pending(self):

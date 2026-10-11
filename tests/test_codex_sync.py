@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import pytest
 
 from herdr_bridge.codex_sync import CodexRolloutSync
 
@@ -181,7 +182,7 @@ def test_explicit_binding_survives_restart_and_rejects_changed_identity(tmp_path
     restarted.sync(changed, lambda *args: None)
     assert restarted.diagnostic(changed)["state"] == "unavailable"
     restarted.sync({**info, "agent_session": {"value": "other"}}, lambda *args: None)
-    assert "differs" in restarted.diagnostic(info)["reason"]
+    assert "Session not found" in restarted.diagnostic(info)["reason"]
     restarted.sync({**info, "cwd": "/different"}, lambda *args: None)
     assert "directory changed" in restarted.diagnostic(info)["reason"]
 
@@ -214,3 +215,102 @@ def test_multiline_command_summary_is_single_line_inline_code():
     assert "\n" not in summary
     assert summary.count("`") == 2
     assert "private" not in summary
+
+
+def test_native_identity_switches_binding_and_keeps_per_thread_cursors(tmp_path):
+    source, db, state, rollout, info = setup_source(tmp_path, [])
+    info.pop("agent_session")
+    source.bind(info, "session-1")
+    info["agent_status"] = "idle"
+    source.sync(info, lambda *args: None)
+    new = tmp_path / "new.jsonl"
+    write_rows(new, [row("session_meta", {"id": "session-2", "cwd": "/project"})])
+    state.execute("INSERT INTO threads VALUES ('session-2', ?, '/project', 0, NULL)", (str(new),))
+    state.commit()
+    changed = {**info, "agent_session": {"value": "session-2"}}
+    source.sync(changed, lambda *args: None)
+    assert source.bound_info(changed)["agent_session"]["value"] == "session-2"
+    assert db.execute("SELECT thread_id FROM codex_session_bindings").fetchone()[0] == "session-2"
+    write_rows(new, [row("event_msg", {"type": "user_message", "message": "new conversation"})])
+    write_rows(rollout, [row("event_msg", {"type": "user_message", "message": "old conversation"})])
+    enqueue = lambda event_id, agent, message: db.execute("INSERT INTO outbox VALUES (?, ?)", (event_id, json.dumps(message)))
+    source.sync(changed, enqueue)
+    source.sync(changed, enqueue)
+    assert [m["text"] for _, m in collect(db)] == ["new conversation"]
+    # A resume back to the old exact thread continues its saved cursor.
+    source.sync({**info, "agent_session": {"value": "session-1"}}, enqueue)
+    assert [m["text"] for _, m in collect(db)] == ["new conversation", "old conversation"]
+    assert db.execute("SELECT count(*) FROM codex_sync_cursors").fetchone()[0] == 2
+
+
+def test_invalid_native_switch_keeps_original_binding_and_cursor(tmp_path):
+    source, db, state, _, info = setup_source(tmp_path, [])
+    source.sync(info, lambda *args: None)
+    before = db.execute("SELECT * FROM codex_sync_cursors").fetchall()
+    source.sync({**info, "agent_session": {"value": "missing"}}, lambda *args: pytest.fail("wrong session"))
+    assert db.execute("SELECT thread_id FROM codex_session_bindings").fetchone()[0] == "session-1"
+    assert db.execute("SELECT * FROM codex_sync_cursors").fetchall() == before
+
+
+@pytest.mark.parametrize("failure", [sqlite3.OperationalError, RuntimeError])
+def test_enqueue_failure_rolls_back_seen_outbox_and_cursor_then_recovers(tmp_path, failure):
+    source, db, state, rollout, info = setup_source(tmp_path, [])
+    source.sync(info, lambda *args: None)
+    baseline = db.execute("SELECT offset FROM codex_sync_cursors").fetchone()[0]
+    write_rows(rollout, [row("event_msg", {"type": "user_message", "message": "recover me"})])
+    def broken(event_id, agent, message):
+        db.execute("INSERT INTO outbox VALUES (?,?)", (event_id, json.dumps(message)))
+        raise failure("injected failure after enqueue")
+    if failure is RuntimeError:
+        with pytest.raises(RuntimeError):
+            source.sync(info, broken)
+    else:
+        source.sync(info, broken)
+    assert collect(db) == []
+    assert db.execute("SELECT count(*) FROM codex_sync_seen").fetchone()[0] == 0
+    assert db.execute("SELECT offset FROM codex_sync_cursors").fetchone()[0] == baseline
+    enqueue = lambda event_id, agent, message: db.execute("INSERT INTO outbox VALUES (?,?)", (event_id, json.dumps(message)))
+    source.sync(info, enqueue)
+    source.sync(info, enqueue)
+    assert [m["text"] for _, m in collect(db)] == ["recover me"]
+
+
+def test_closed_database_restart_preserves_pending_and_acked_messages(tmp_path):
+    source, db, state, rollout, info = setup_source(tmp_path, [])
+    source.sync(info, lambda *args: None)
+    write_rows(rollout, [row("event_msg", {"type": "user_message", "message": "pending during outage"})])
+    enqueue = lambda event_id, agent, message: db.execute("INSERT INTO outbox VALUES (?,?)", (event_id, json.dumps(message)))
+    source.sync(info, enqueue)
+    original = collect(db)
+    db.commit()
+    db.close()
+    db = sqlite3.connect(tmp_path / "bridge.sqlite")
+    source = CodexRolloutSync(db, home=source.home)
+    source.sync(info, lambda *args: pytest.fail("restart must not enqueue duplicates"))
+    assert collect(db) == original
+    db.execute("DELETE FROM outbox")
+    db.commit()
+    db.close()
+    db = sqlite3.connect(tmp_path / "bridge.sqlite")
+    source = CodexRolloutSync(db, home=source.home)
+    source.sync(info, lambda *args: pytest.fail("acked message must not replay"))
+    assert collect(db) == []
+
+
+def test_resume_without_new_answer_cannot_duplicate_completion_notifications(tmp_path):
+    source, db, state, rollout, info = setup_source(tmp_path, [])
+    source.sync(info, lambda *args: None)
+    assert not source.claim_completion(info)
+    write_rows(rollout, [row("event_msg", {"type": "item_completed", "item": {
+        "type": "AgentMessage", "id": "answer-1", "phase": "final_answer", "text": "finished"}})])
+    source.sync(info, lambda *args: None)
+    assert source.claim_completion(info)
+    assert not source.claim_completion(info)
+    db.commit()
+    restarted = CodexRolloutSync(db, home=source.home)
+    restarted.sync(info, lambda *args: pytest.fail("old answer replayed"))
+    assert not restarted.claim_completion(info)
+    write_rows(rollout, [row("event_msg", {"type": "item_completed", "item": {
+        "type": "AgentMessage", "id": "answer-2", "phase": "final_answer", "text": "next task"}})])
+    restarted.sync(info, lambda *args: None)
+    assert restarted.claim_completion(info)

@@ -9,6 +9,8 @@ import sqlite3
 from pathlib import Path
 
 from .codex_session import resolve_session, validate_rollout, SessionUnavailable
+from .events import session_of
+from .session_observation import load_observation
 
 
 def _latest_turn_offset(path: Path, limit: int = 16 * 1024 * 1024) -> int:
@@ -143,6 +145,8 @@ class CodexRolloutSync:
         self.db.execute("CREATE TABLE IF NOT EXISTS codex_sync_seen (event_id TEXT PRIMARY KEY)")
         self.db.execute("CREATE TABLE IF NOT EXISTS codex_session_bindings (terminal_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, cwd TEXT NOT NULL)")
         self.db.execute("CREATE TABLE IF NOT EXISTS codex_sync_status (terminal_id TEXT PRIMARY KEY, record TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS codex_sync_final (source_key TEXT PRIMARY KEY, event_id TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS codex_completion_seen (event_id TEXT PRIMARY KEY)")
 
     def diagnostic(self, info):
         key = info.get("terminal_id") or info.get("pane_id", "")
@@ -154,7 +158,21 @@ class CodexRolloutSync:
         self.db.execute("INSERT OR REPLACE INTO codex_sync_status VALUES (?, ?)",
                         (key, json.dumps({"state": state, **fields})))
 
+    def claim_completion(self, info):
+        if info.get("agent") != "codex" or self.diagnostic(info).get("state") != "syncing":
+            return True  # Preserve notification-only agents/unavailable sources.
+        tid, _, _ = self._resolve(info)
+        key = f"{info.get('terminal_id') or info.get('pane_id', '')}:{tid}"
+        row = self.db.execute("SELECT event_id FROM codex_sync_final WHERE source_key=?", (key,)).fetchone()
+        if not row:
+            return False  # Resume/startup without a new answer is not a new completion.
+        return bool(self.db.execute("INSERT OR IGNORE INTO codex_completion_seen VALUES (?)", (row[0],)).rowcount)
+
     def _resolve(self, info, unique_workspace=False):
+        # An exact live Herdr identity supersedes a saved manual association.
+        # Validate it before changing any binding; never choose a newer cwd match.
+        if session_of(info):
+            return validate_rollout(resolve_session(info, home=self.home))
         key = info.get("terminal_id")
         binding = self.db.execute("SELECT thread_id,cwd FROM codex_session_bindings WHERE terminal_id=?", (key,)).fetchone()
         if binding and binding[1] != info.get("cwd"):
@@ -180,8 +198,23 @@ class CodexRolloutSync:
         return self.diagnostic(info)
 
     def sync(self, info, enqueue, *, unique_workspace=False):
+        self.db.execute("SAVEPOINT codex_sync_read")
         try:
-            thread_id, path, _ = self._resolve(info, unique_workspace)
+            result = self._sync(info, enqueue, unique_workspace=unique_workspace)
+            self.db.execute("RELEASE codex_sync_read")
+            return result
+        except Exception as exc:
+            self.db.execute("ROLLBACK TO codex_sync_read")
+            self.db.execute("RELEASE codex_sync_read")
+            if isinstance(exc, (OSError, sqlite3.Error)):
+                self._status(info, "unavailable", reason=f"Rollout read failed: {type(exc).__name__}")
+                return 0
+            raise
+
+    def _sync(self, info, enqueue, *, unique_workspace=False):
+        try:
+            session = self._resolve(info, unique_workspace)
+            thread_id, path, _ = session
         except SessionUnavailable as exc:
             self._status(info, "unavailable", reason=str(exc))
             return 0
@@ -189,11 +222,16 @@ class CodexRolloutSync:
             stat = path.stat()
             terminal = info.get("terminal_id") or info.get("pane_id", "")
             source_key = f"{terminal}:{thread_id}"
+            if session_of(info) and info.get("terminal_id"):
+                self.db.execute("INSERT OR REPLACE INTO codex_session_bindings VALUES (?, ?, ?)",
+                                (terminal, thread_id, info["cwd"]))
             row = self.db.execute("SELECT rollout_path,device,inode,offset FROM codex_sync_cursors WHERE source_key=?",
                                   (source_key,)).fetchone()
             same_file = row and row[0] == str(path) and row[1] == stat.st_dev and row[2] == stat.st_ino
             if same_file and stat.st_size >= row[3]:
                 offset = row[3]
+            elif not row and (observation := load_observation(self.home, info, session)):
+                offset = observation["offset"]
             elif info.get("agent_status") in ("working", "blocked"):
                 offset = _latest_turn_offset(path)
             else:
@@ -238,6 +276,9 @@ class CodexRolloutSync:
                                                    (event_id,)).rowcount
                         if inserted:
                             enqueue(event_id, info, event)
+                            if event["role"] == "assistant":
+                                self.db.execute("INSERT OR REPLACE INTO codex_sync_final VALUES (?, ?)",
+                                                (source_key, event_id))
                     cursor = next_cursor
                     self.db.execute("""INSERT INTO codex_sync_cursors
                         (source_key,rollout_path,device,inode,offset) VALUES (?,?,?,?,?)
@@ -250,6 +291,5 @@ class CodexRolloutSync:
                 (source_key, str(path), stat.st_dev, stat.st_ino, cursor))
             self._status(info, "syncing", thread_id=thread_id, offset=cursor)
             return cursor - offset
-        except (OSError, sqlite3.Error) as exc:
-            self._status(info, "unavailable", reason=f"Rollout read failed: {type(exc).__name__}")
-            return 0
+        except (OSError, sqlite3.Error):
+            raise  # The enclosing savepoint also rolls back seen IDs and outbox writes.
