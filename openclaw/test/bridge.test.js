@@ -128,6 +128,8 @@ async function runningBridge(t, initial = {}) {
     calls.push({method,params});
     if (initial.call) return initial.call(method,params,result);
     if (method === "events") return initial.events ?? [];
+    if (method === "event_for_delivery") return initial.eventForDelivery === null ? null
+      : (initial.eventForDelivery ?? initial.events?.find(e=>e.id === params.event_id));
     if (method === "result_cards") return {result,cards:initial.cards ?? [binding]};
     if (method === "prepare_answer") {
       if (result.outcome === "confirmed") return {...result,ready_to_dispatch:false};
@@ -326,4 +328,29 @@ test("a text question reply without a bound interactive card still delivers its 
   assert.equal(bridge.edits.length,1);
   assert.match(bridge.edits[0].payload.text,/Codex recorded the answer/);
   assert.equal(bridge.calls.at(-1).method,"ack");
+});
+
+test("locally handled attention is rechecked immediately before sending and never delivered or acknowledged", async t => {
+  const bridge = await runningBridge(t,{eventForDelivery:null,events:[{
+    id:"handled",type:"approval.requested",agent:{pane_id:"w4:p2"},text:"approval",
+    request:{id:"a".repeat(32),expires_at:100,options:[{index:0,label:"Yes"}]}
+  }]});
+  for(let i=0;i<20;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(bridge.edits.length,0);
+  assert.ok(bridge.calls.some(c=>c.method === "event_for_delivery" && c.params.event_id === "handled"));
+  assert.ok(!bridge.calls.some(c=>c.method === "ack"));
+});
+
+test("completion bypasses attention recheck while ready questions use the refreshed delivery event", async t => {
+  const question = {id:"question",type:"question.requested",agent:{pane_id:"w4:p2"},text:"fresh evidence",
+    request:{id:"a".repeat(32),question:{title:"A question"},expires_at:100,options:[{index:0,label:"Purple"}]}};
+  const bridge = await runningBridge(t,{eventForDelivery:question,events:[
+    {id:"question",type:"question.requested",text:"outdated evidence"},
+    {id:"completion",type:"agent.done",agent:{pane_id:"w4:p2"},text:"finished"}
+  ]});
+  for(let i=0;i<20 && bridge.calls.filter(c=>c.method === "ack").length<2;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(bridge.edits.length,2);
+  assert.ok(bridge.edits[0].payload.presentation.blocks.some(b=>b.text?.includes("fresh evidence")));
+  assert.deepEqual(bridge.calls.filter(c=>c.method === "event_for_delivery").map(c=>c.params.event_id),["question"]);
+  assert.deepEqual(bridge.calls.filter(c=>c.method === "ack").map(c=>c.params.event_id),["question","completion"]);
 });

@@ -43,6 +43,10 @@ In Codex CLI 0.162.1, ask the agent to call `request_user_input_async` with a ha
 
 For free text, leave the main composer empty and use `/herdr reply <request-id> <text>`. Confirm the recorded answer matches exactly. Repeated same-answer clicks/commands must not submit again. Answer locally or end the turn before clicking a different question card: the old request must fail without input. Leave a local draft: a remote submission must fail without appending to it. Discovery/restart alone must never open a menu or send an answer. Compare ordinary approval tests separately.
 
+## 7. Unattended-request delay
+
+Resolve a newly discovered approval/question on the computer within 10 seconds: its attention card must not be sent. A separate completion notification remains allowed. Leave another harmless question unanswered: its queued event must stay hidden until `notify_after`, then deliver while the same exact question remains pending. Verify the discovery timestamp, persisted deadline and actual delivery timestamp independently. A provider receipt is not phone-push evidence. Restarting during the grace period must keep the original deadline; replacing/ending the request must cancel its queued card. A long delayed queue must not postpone ready completion/result messages.
+
 ## Recorded result, 2026-10-10
 
 On the tested macOS installation, actual runtime registration, native card delivery, the no-op callback and a real `/usr/bin/uname -s` approval were verified. The command returned `Darwin`; durable state and logs recorded one dispatch. The recipient separately confirmed push with Slack backgrounded and the phone locked, and the card showed `dispatched`. A subsequent real DM preview confirmed the single header and highlighted summary layout. This is evidence for the tested configuration, not every Slack device policy.
@@ -58,3 +62,10 @@ After recovery was added, a real `/usr/bin/uname -s` approval at 22:57 Dubai tim
 - At 10:19 Dubai time, the owner answered the second color question only through Slack. Request `c8fcfee6f9bb4803a3a84199794c8e94`, attempt `e74ae554e90b442bbd2f2fe40dd4358b`, submitted the native answer envelope once. Codex recorded `紫色标签` for exact question ID `["request_user_input_async","call_ae330806efd14d2cb0f7444c6210f004",0]`; two observations produced `confirmed` after 649 ms. No terminal command was executed by this test.
 - Independent Slack readback of original card `1791699571.404789` confirmed “Codex recorded the answer to this question” and no remaining choice buttons. The durable result update was delivered and its outbox event cleared.
 - This live result covers collapsed async questions on Codex CLI 0.162.1, Herdr 0.9.3 and OpenClaw 2026.9.9. Expanded-menu selection, free-text commands, drafts, explicit retries and restart no-replay have deterministic test coverage; they were not all exercised live in this run. A separate locked-phone push test was not repeated for question cards.
+
+## Attention delay verification, 2026-10-11
+
+- Full regression: **956 Python tests passed**, 5 opt-in live tests skipped; **27 JavaScript tests passed**. Deterministic clock tests cover all three attention types, local resolution before the deadline, replacement requests, restart persistence, failed reads, pre-handoff cancellation and immediate completion/result delivery behind a delayed queue.
+- At 10:38 Dubai time, harmless question request `1e3f75bf46e041e995f0b3c9c3988121` was discovered at `2026-10-11T06:38:01.342503Z`. Slack card `1791700695.523849` was created **14.181 seconds later**, consistent with the 10-second grace period plus polling. The queued deadline itself was not captured live before delivery; its exact persistence is covered by the clock tests.
+- The owner answered only through Slack with `延迟卡片已收到`. Attempt `09eef459a9df4a8bbe719420f86a85ce` reached `confirmed` after **441 ms** with reason `question_answered`. Independent Slack readback confirmed the original card's final result and removal of choice buttons. No terminal command was executed by this test.
+- Local handling within 10 seconds and restart during the delay were not repeated live in this run. Phone lock-screen push was not retested; this live check establishes delayed card delivery and answer confirmation.

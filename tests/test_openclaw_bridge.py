@@ -39,7 +39,7 @@ class Client:
 @pytest.fixture
 def setup(tmp_path):
     client = Client()
-    bridge = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda: 100, confirmation_timeout=0)
+    bridge = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda: 100, confirmation_timeout=0, notification_delay=0)
     yield client, bridge
     bridge.close()
 

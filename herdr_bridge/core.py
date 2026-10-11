@@ -17,6 +17,7 @@ from .questions import CodexQuestionSource, QuestionUnavailable, fingerprint as 
 
 log = logging.getLogger(__name__)
 CONSUMED_STATES = {"reserved", "dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
+ATTENTION_EVENTS = {"approval.requested", "agent.blocked", "question.requested"}
 
 
 class BridgeError(ValueError):
@@ -54,13 +55,14 @@ class Bridge:
     def __init__(self, client, state_path, *, clock=time.time, approval_ttl=900,
                  monotonic=time.monotonic, sleep=time.sleep,
                  confirmation_timeout=5.0, confirmation_interval=0.2, followup_timeout=120,
-                 question_source=None):
+                 question_source=None, notification_delay=10.0):
         self.client, self.clock, self.approval_ttl = client, clock, approval_ttl
         self.monotonic, self.sleep = monotonic, sleep
         self.confirmation_timeout = confirmation_timeout
         self.confirmation_interval = confirmation_interval
         self.followup_timeout = followup_timeout
         self.question_source = question_source or CodexQuestionSource()
+        self.notification_delay = max(0.0, float(notification_delay))
         self.active = set()
         self.sending = {}  # pane -> request, only terminal writes/initial confirmation
         Path(state_path).parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +122,8 @@ class Bridge:
     def _queue(self, kind, agent, **fields):
         event = {"id": uuid.uuid4().hex, "type": kind, "at": self.clock(),
                  "agent": self._public_agent(agent), **fields}
+        if kind in ATTENTION_EVENTS:
+            event["notify_after"] = event["at"] + self.notification_delay
         self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event["id"], json.dumps(event)))
         return event
 
@@ -252,14 +256,63 @@ class Bridge:
     def events(self):
         self.pending()  # Retire cards whose pane has already advanced.
         with self.lock, self.db:
-            for event_id, raw in self.db.execute("SELECT id, event FROM outbox").fetchall():
-                event = json.loads(raw)
-                request = event.get("request")
-                if request:
-                    state = self.db.execute("SELECT state FROM approvals WHERE id=?", (request["id"],)).fetchone()
-                    if not state or state[0] != "pending" or request["expires_at"] <= self.clock():
-                        self.db.execute("DELETE FROM outbox WHERE id=?", (event_id,))
-            return [json.loads(row[0]) for row in self.db.execute("SELECT event FROM outbox ORDER BY rowid LIMIT 20")]
+            ready = []
+            for (raw,) in self.db.execute("SELECT event FROM outbox ORDER BY rowid").fetchall():
+                event = self._event_for_delivery(json.loads(raw))
+                if event:
+                    ready.append(event)
+                    if len(ready) == 20:
+                        break  # Deferred attention cannot block ready completion/results.
+            return ready
+
+    def event_for_delivery(self, event_id):
+        """Recheck one queued card immediately before its OpenClaw handoff."""
+        with self.lock, self.db:
+            row = self.db.execute("SELECT event FROM outbox WHERE id=?", (event_id,)).fetchone()
+            return self._event_for_delivery(json.loads(row[0])) if row else None
+
+    def _event_for_delivery(self, event):
+        request = event.get("request")
+        if not request:
+            return event
+        row = self.db.execute("SELECT state FROM approvals WHERE id=?", (request["id"],)).fetchone()
+        if not row or row[0] != "pending" or request["expires_at"] <= self.clock():
+            self.db.execute("DELETE FROM outbox WHERE id=?", (event["id"],))
+            return None
+        if event["type"] not in ATTENTION_EVENTS:
+            return event
+        # The deadline is persisted in JSON. Older queues use their discovery time.
+        due = event.get("notify_after", event.get("at", request["created_at"]) + self.notification_delay)
+        if self.clock() < due:
+            return None
+        live = self._attention_still_pending(request)
+        if live is False:
+            self.db.execute("UPDATE approvals SET state='superseded' WHERE id=? AND state='pending'", (request["id"],))
+            self.db.execute("DELETE FROM outbox WHERE id=?", (event["id"],))
+        return event if live is True else None
+
+    def _attention_still_pending(self, request):
+        """True=still needs attention, False=obsolete, None=read unavailable."""
+        try:
+            info = self._agent(request["pane_id"])
+            if identity(info) != tuple(request["identity"]):
+                return False
+            if request.get("kind") == "codex_question":
+                question = self._question_snapshot(info)["pending"].get(request["question"]["id"])
+                fresh = self._agent(request["pane_id"])
+                if identity(fresh) != identity(info):
+                    return False
+                return bool(question and question_fingerprint(question) == request["fingerprint"])
+            if info.get("agent_status") != "blocked" or info.get("state_change_seq") != request["sequence"]:
+                return False
+            screen = self.client.read_agent_once(request["pane_id"], 160, source="visible")
+            dialog = current_dialog(screen, info.get("agent"))
+            fresh = self._agent(request["pane_id"])
+            return (identity(fresh) == tuple(request["identity"])
+                    and fresh.get("agent_status") == "blocked" and fresh.get("state_change_seq") == request["sequence"]
+                    and (dialog.fingerprint if dialog else None) == request["fingerprint"])
+        except Exception:
+            return None  # Do not send a possibly handled request on failed reads.
 
     def ack(self, event_id):
         with self.lock, self.db:

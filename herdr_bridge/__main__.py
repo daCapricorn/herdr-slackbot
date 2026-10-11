@@ -60,7 +60,7 @@ def main():
     thread.start()
     methods = {name: getattr(bridge, name) for name in (
         "status", "read", "pending", "events", "ack", "answer", "send",
-        "check", "retry", "prepare_answer", "dispatch_reserved", "bind_card", "result_cards")}
+        "check", "retry", "prepare_answer", "dispatch_reserved", "bind_card", "result_cards", "event_for_delivery")}
     output_lock = threading.Lock()
 
     def handle(line):
