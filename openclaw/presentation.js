@@ -83,7 +83,54 @@ export function answerText(result) {
   const option = String(result.option ?? "Selected option");
   if (result.outcome === "confirmed")
     return `✅ Herdr: ${option} — confirmed. The original approval has closed; command completion is not verified.`;
+  if (["checking", "dispatching"].includes(result.outcome))
+    return `⏳ Herdr: ${option} — checking terminal acceptance. Repeated clicks do not resend keys.`;
+  if (result.outcome === "not_sent")
+    return `⚠️ Herdr: ${option} — this attempt has not sent keys. Use Check status, then explicitly submit again.`;
   if (result.outcome === "unconfirmed")
-    return `⚠️ Herdr: ${option} — unconfirmed. The terminal still shows this approval. No keys were retried; check it locally.`;
-  return `⚠️ Herdr: ${option} — terminal acceptance is unknown. No keys were retried; check it locally.`;
+    return `⚠️ Herdr: ${option} — unconfirmed. The terminal still shows this approval. No keys were retried automatically.${result.watching ? " Background checks continue." : " Use Check status to inspect again."}`;
+  return `⚠️ Herdr: ${option} — terminal acceptance is unknown. No keys were retried automatically.${result.watching ? " Background checks continue." : " Use Check status to inspect again."}`;
+}
+
+export function answerPayload(result) {
+  const text = answerText(result);
+  const blocks = [{type:"text",text}];
+  if (result.outcome !== "confirmed") {
+    const buttons = [{label:"检查状态",action:{type:"callback",value:`herdr-bridge:check:${result.request_id}`}}];
+    if (result.retry_token) {
+      blocks.push({type:"context",text:"重新提交会再次发送同一选项；之前的按键仍可能延迟生效。"});
+      buttons.push({label:"重新提交",action:{type:"callback",value:`herdr-bridge:retry:${result.request_id}:${result.retry_token}`}});
+    }
+    blocks.push({type:"buttons",buttons});
+  }
+  return {text,presentationTextMode:"fallback",presentation:{blocks}};
+}
+
+// OpenClaw 2026.9.9 renders native Slack edit blocks as presentation segments.
+export async function answerEdit(api, route, result) {
+  if (result.outcome === "confirmed") return {text:answerText(result),blocks:[]};
+  const adapter = await api.runtime.channel.outbound.loadAdapter(route.channel);
+  const cfg = api.runtime.config.current();
+  const payload = answerPayload(result);
+  const ctx = {cfg,to:route.to,accountId:route.accountId,text:payload.text,payload};
+  const rendered = await adapter?.renderPresentation?.({payload,presentation:payload.presentation,ctx});
+  const segments = rendered?.channelData?.slack?.renderedPresentationSegments;
+  if (!Array.isArray(segments) || segments.some((s)=>s.kind !== "blocks" || !Array.isArray(s.blocks)))
+    throw new Error("OpenClaw Slack renderer did not provide native recovery controls");
+  return {text:payload.text,blocks:segments.flatMap((s)=>s.blocks)};
+}
+
+export async function updateAnswerCard(api, route, binding, result, edit, signal) {
+  if (binding.channel !== route.channel || binding.accountId !== route.accountId
+      || !/^D[A-Z0-9]+$/.test(binding.conversationId) || !/^\d+\.\d+$/.test(binding.messageTs))
+    throw new Error("Approval card binding does not match this Slack DM route");
+  if (edit) {
+    await edit(await answerEdit(api, route, result));
+    return;
+  }
+  // The public SDK has no general background edit API. After a restart, use
+  // OpenClaw's portable sender for a new recovery card instead of private clients.
+  const payload = answerPayload(result);
+  payload.presentation.blocks.splice(1,0,{type:"context",text:`Request ${result.request_id} · 恢复状态`});
+  await deliver(api,route,payload,signal);
 }

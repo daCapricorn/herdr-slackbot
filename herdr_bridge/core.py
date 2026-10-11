@@ -15,7 +15,7 @@ from .events import session_of
 from .metadata import session_model
 
 log = logging.getLogger(__name__)
-CONSUMED_STATES = {"dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
+CONSUMED_STATES = {"reserved", "dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
 
 
 class BridgeError(ValueError):
@@ -52,11 +52,14 @@ def current_dialog(screen, kind):
 class Bridge:
     def __init__(self, client, state_path, *, clock=time.time, approval_ttl=900,
                  monotonic=time.monotonic, sleep=time.sleep,
-                 confirmation_timeout=5.0, confirmation_interval=0.2):
+                 confirmation_timeout=5.0, confirmation_interval=0.2, followup_timeout=120):
         self.client, self.clock, self.approval_ttl = client, clock, approval_ttl
         self.monotonic, self.sleep = monotonic, sleep
         self.confirmation_timeout = confirmation_timeout
         self.confirmation_interval = confirmation_interval
+        self.followup_timeout = followup_timeout
+        self.active = set()
+        self.sending = {}  # pane -> request, only terminal writes/initial confirmation
         Path(state_path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(state_path, check_same_thread=False)
         if os.name != "nt":
@@ -67,6 +70,9 @@ class Bridge:
               (id TEXT PRIMARY KEY, record TEXT NOT NULL, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox
               (id TEXT PRIMARY KEY, event TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS cards
+              (request_id TEXT NOT NULL, binding TEXT NOT NULL,
+               PRIMARY KEY(request_id, binding));
         """)
         self.lock = threading.RLock()
 
@@ -202,62 +208,242 @@ class Bridge:
         return {"acknowledged": event_id}
 
     def answer(self, request_id, option):
-        with self.lock:
-            row = self.db.execute("SELECT record, state FROM approvals WHERE id=?", (request_id,)).fetchone()
-            if not row or row[1] != "pending":
-                raise BridgeError("Request is absent or already answered; nothing was sent")
-            rec = json.loads(row[0])
-            if self.clock() >= rec["expires_at"]:
-                raise BridgeError("Request expired; nothing was sent")
-            if type(option) is not int or option not in {o["index"] for o in rec["options"]}:
-                raise BridgeError("Unsupported option; answer this dialog locally")
-            info = self._agent(rec["pane_id"])
-            if (tuple(rec["identity"]) != identity(info) or info.get("agent_status") != "blocked"
-                    or rec.get("sequence") != info.get("state_change_seq")):
-                raise BridgeError("Agent changed or is no longer blocked; nothing was sent")
-            screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
-            dialog = current_dialog(screen, info.get("agent"))
-            if not dialog or dialog.fingerprint != rec["fingerprint"]:
-                raise BridgeError("Dialog changed; nothing was sent")
-            fresh = self._agent(rec["pane_id"])
-            if (identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked"
-                    or fresh.get("state_change_seq") != rec.get("sequence")):
-                raise BridgeError("Agent changed before dispatch; nothing was sent")
-            keys = keys_for(dialog, option)
-            rec["dispatch"] = {"option": option, "keys": keys, "started_at": self.clock(),
-                               "focused": fresh.get("focused"), "revision": fresh.get("revision")}
-            # Consume BEFORE touching the terminal, separately from confirmed acceptance.
-            # A lost reply/crash must never replay keys.
-            with self.db:
-                self.db.execute("UPDATE approvals SET record=?, state='dispatching' WHERE id=?",
-                                (json.dumps(rec), request_id))
-            try:
-                self.client.send_keys(rec["pane_id"], keys)
-            except Exception:
-                with self.db:
-                    self.db.execute("UPDATE approvals SET state='uncertain' WHERE id=?", (request_id,))
-                raise
-            rec["dispatch"]["acknowledged_at"] = self.clock()
-            verification = self._confirm_answer(rec)
-            rec["verification"] = verification
-            outcome = verification["outcome"]
-            with self.db:
-                self.db.execute("UPDATE approvals SET record=?, state=? WHERE id=?",
-                                (json.dumps(rec), outcome, request_id))
-            log.info("Herdr answer verification: %s option=%s outcome=%s reason=%s elapsed_ms=%s observation=%s",
-                     request_id, option, outcome, verification["reason"], verification["elapsed_ms"],
-                     verification.get("observation"))
-            return {"request_id": request_id, "outcome": outcome,
-                    "option": dialog.options[option].label, "verification": verification}
+        prepared = self.prepare_answer(request_id, option=option)
+        if prepared.pop("ready_to_dispatch"):
+            return self.dispatch_reserved(request_id, prepared["attempt_id"])
+        if prepared["outcome"] in ("checking", "confirmed"):
+            return prepared
+        return self.check(request_id)
 
-    def _confirm_answer(self, rec):
+    def prepare_answer(self, request_id, option=None, retry_from=None):
+        """Reserve a human choice without writing, so OpenClaw can show progress first."""
+        with self.lock:
+            rec, state = self._record(request_id)
+            if retry_from is not None:
+                if retry_from in {a.get("attempt_id") for a in rec.get("attempts", [])}:
+                    return {**self._result(rec, state), "ready_to_dispatch": False}
+                if (state != "unconfirmed" or request_id in self.active
+                        or retry_from != rec.get("dispatch", {}).get("attempt_id")
+                        or not rec.get("verification", {}).get("retryable")):
+                    # An unsubmitted reservation can be resumed only by its exact button.
+                    if state == "reserved" and retry_from == rec["dispatch"]["attempt_id"]:
+                        return {**self._result(rec, state), "outcome": "checking", "ready_to_dispatch": True}
+                    raise BridgeError("Retry is stale or acceptance is unknown; check status first. Nothing was sent")
+                option = rec["dispatch"]["option"]
+                self._reserve(rec, option)
+            else:
+                if type(option) is not int or option not in {o["index"] for o in rec["options"]}:
+                    raise BridgeError("Unsupported option; nothing was sent")
+                if state in CONSUMED_STATES:
+                    if option != rec.get("dispatch", {}).get("option"):
+                        raise BridgeError("A different option was already submitted; nothing was sent")
+                    return {**self._result(rec, state),
+                            "outcome": "checking" if state == "reserved" else self._result(rec, state)["outcome"],
+                            "ready_to_dispatch": state == "reserved"}
+                if state != "pending":
+                    raise BridgeError("Request was superseded; nothing was sent")
+                self._reserve(rec, option)
+            return {**self._result(rec, "reserved"), "outcome": "checking", "ready_to_dispatch": True}
+
+    def dispatch_reserved(self, request_id, attempt_id):
+        with self.lock:
+            rec, state = self._record(request_id)
+            if attempt_id != rec.get("dispatch", {}).get("attempt_id"):
+                raise BridgeError("Submission is stale; nothing was sent")
+            if state != "reserved":
+                return self._result(rec, state)  # A duplicate commit never writes again.
+            _, fresh = self._live_dialog(rec)  # The Slack edit may have taken seconds.
+            if rec["pane_id"] in self.sending:
+                raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
+            rec["dispatch"].update(started_at=self.clock(), focused=fresh.get("focused"), revision=fresh.get("revision"))
+            rec["followup_deadline"] = min(rec["expires_at"], self.clock() + self.followup_timeout)
+            self._save(rec, "dispatching")
+            self._claim_pane(rec)
+            self.active.add(request_id)
+        return self._finish_dispatch(rec)
+
+    def _record(self, request_id):
+        row = self.db.execute("SELECT record, state FROM approvals WHERE id=?", (request_id,)).fetchone()
+        if not row:
+            raise BridgeError("Request is absent; nothing was sent")
+        return json.loads(row[0]), row[1]
+
+    def _save(self, rec, state):
+        with self.db:
+            self.db.execute("UPDATE approvals SET record=?, state=? WHERE id=?",
+                            (json.dumps(rec), state, rec["id"]))
+
+    def _live_dialog(self, rec):
+        if self.clock() >= rec["expires_at"]:
+            raise BridgeError("Request expired; nothing was sent")
+        info = self._agent(rec["pane_id"])
+        if (tuple(rec["identity"]) != identity(info) or info.get("agent_status") != "blocked"
+                or rec.get("sequence") != info.get("state_change_seq")):
+            raise BridgeError("Agent changed or is no longer blocked; nothing was sent")
+        screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
+        dialog = current_dialog(screen, info.get("agent"))
+        if not dialog or dialog.fingerprint != rec["fingerprint"]:
+            raise BridgeError("Dialog changed; nothing was sent")
+        fresh = self._agent(rec["pane_id"])
+        if (identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked"
+                or fresh.get("state_change_seq") != rec.get("sequence")):
+            raise BridgeError("Agent changed before dispatch; nothing was sent")
+        return dialog, fresh
+
+    def _claim_pane(self, rec):
+        if rec["pane_id"] in self.sending:
+            raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
+        self.sending[rec["pane_id"]] = rec["id"]
+
+    def _reserve(self, rec, option):
+        dialog, fresh = self._live_dialog(rec)
+        if rec["pane_id"] in self.sending:
+            raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
+        if rec.get("dispatch"):
+            rec.setdefault("attempts", []).append(rec["dispatch"])
+        rec["dispatch"] = {"attempt_id": uuid.uuid4().hex, "option": option,
+                           "keys": keys_for(dialog, option), "started_at": self.clock(),
+                           "focused": fresh.get("focused"), "revision": fresh.get("revision")}
+        rec.pop("verification", None)
+        rec.pop("watch_expired", None)
+        rec["followup_deadline"] = min(rec["expires_at"], self.clock() + self.followup_timeout)
+        self._save(rec, "reserved")
+
+    def _finish_dispatch(self, rec):
+        try:
+            try:
+                self.client.send_keys(rec["pane_id"], rec["dispatch"]["keys"])
+                rec["dispatch"]["acknowledged_at"] = self.clock()
+            except Exception as exc:
+                # An ambiguous receipt is still consumed; observe, never auto-retry.
+                rec["dispatch"]["error_type"] = type(exc).__name__
+            with self.lock:
+                self._save(rec, "dispatching")
+            verification = self._confirm_answer(rec)
+            with self.lock:
+                self.active.discard(rec["id"])
+                if self.sending.get(rec["pane_id"]) == rec["id"]:
+                    self.sending.pop(rec["pane_id"])
+                return self._store_verification(rec, verification)
+        finally:
+            with self.lock:
+                self.active.discard(rec["id"])
+                if self.sending.get(rec["pane_id"]) == rec["id"]:
+                    self.sending.pop(rec["pane_id"])
+
+    def _result(self, rec, state):
+        selected = rec.get("dispatch", {}).get("option")
+        label = next((o["label"] for o in rec["options"] if o["index"] == selected), "Selected option")
+        verification = rec.get("verification", {})
+        retryable = (state in ("unconfirmed", "reserved") and verification.get("retryable") is True
+                     and rec["id"] not in self.active and self.clock() < rec["expires_at"])
+        return {"request_id": rec["id"], "outcome": "checking" if rec["id"] in self.active else ("not_sent" if state == "reserved" else state),
+                "option": label, "option_index": selected, "verification": verification,
+                "attempt_id": rec.get("dispatch", {}).get("attempt_id"),
+                "retry_token": rec.get("dispatch", {}).get("attempt_id") if retryable else None,
+                "watching": (state != "confirmed" and self.clock() < rec.get("followup_deadline", 0)
+                             and verification.get("reason") != "agent_replaced")}
+
+    def _store_verification(self, rec, verification):
+        rec["verification"] = verification
+        outcome = "reserved" if verification["outcome"] == "not_sent" else verification["outcome"]
+        result = self._result(rec, outcome)
+        # The outbox carries only the latest result. Repeated edits are harmless.
+        signature = [outcome, verification["reason"], result["retry_token"], result["watching"]]
+        changed = signature != rec.get("last_result_signature")
+        rec["last_result_signature"] = signature
+        with self.db:
+            self.db.execute("UPDATE approvals SET record=?,state=? WHERE id=?",
+                            (json.dumps(rec),outcome,rec["id"]))
+            if changed:
+                prefix = "approval-update-" + rec["id"] + "-"
+                self.db.execute("DELETE FROM outbox WHERE id LIKE ?", (prefix + "%",))
+                event_id = prefix + uuid.uuid4().hex
+                self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event_id, json.dumps({
+                    "id": event_id, "type": "approval.updated", "result": result})))
+        log.info("Herdr answer verification: %s attempt=%s outcome=%s reason=%s elapsed_ms=%s",
+                 rec["id"], result["attempt_id"], outcome, verification["reason"], verification["elapsed_ms"])
+        return result
+
+    def check(self, request_id, *, timeout=None):
+        with self.lock:
+            rec, state = self._record(request_id)
+            if state not in CONSUMED_STATES:
+                raise BridgeError("No approval attempt to check; nothing was sent")
+            if request_id in self.active or state == "confirmed":
+                return self._result(rec, state)
+            if state == "reserved":
+                try:
+                    self._live_dialog(rec)
+                    retryable = True
+                except Exception:
+                    retryable = False
+                return self._store_verification(rec, {"outcome": "not_sent", "reason": "not_submitted",
+                                                     "retryable": retryable, "elapsed_ms": 0})
+            # Legacy/crashed records are queryable, never silently rearmed.
+            rec["dispatch"].setdefault("attempt_id", uuid.uuid4().hex)
+            self._save(rec, state)
+            self.active.add(request_id)
+        try:
+            verification = self._confirm_answer(rec, timeout=timeout)
+            with self.lock:
+                self.active.discard(request_id)
+                return self._store_verification(rec, verification)
+        finally:
+            with self.lock:
+                self.active.discard(request_id)
+
+    def retry(self, request_id, attempt_id):
+        prepared = self.prepare_answer(request_id, retry_from=attempt_id)
+        if prepared.pop("ready_to_dispatch"):
+            return self.dispatch_reserved(request_id, prepared["attempt_id"])
+        return prepared
+
+    def reconcile_answers(self):
+        with self.lock:
+            rows = self.db.execute("SELECT record,state FROM approvals WHERE state IN "
+                                   "('reserved','dispatching','dispatched','unconfirmed','uncertain')").fetchall()
+        for raw, state in rows:
+            rec = json.loads(raw)
+            if (self.clock() < rec.get("followup_deadline", 0)
+                    and rec.get("verification", {}).get("reason") != "agent_replaced"):
+                self.check(rec["id"], timeout=self.confirmation_interval * 2)
+            elif rec.get("followup_deadline") and not rec.get("watch_expired"):
+                with self.lock:
+                    rec, state = self._record(rec["id"])
+                    if rec["id"] in self.active or state == "confirmed":
+                        continue
+                    rec["watch_expired"] = True
+                    self._store_verification(rec, rec.get("verification") or {
+                        "outcome": "not_sent" if state == "reserved" else "uncertain",
+                        "reason": "not_observed", "elapsed_ms": 0})
+
+    def bind_card(self, request_id, binding):
+        # Called only by the authorized OpenClaw handler; no response URLs/tokens.
+        fields = {k: binding[k] for k in ("channel", "accountId", "conversationId", "messageTs")}
+        if (fields["channel"] != "slack" or not all(isinstance(v, str) and v for v in fields.values())
+                or not fields["conversationId"].startswith("D")):
+            raise BridgeError("Approval result cards require a Slack DM")
+        with self.lock, self.db:
+            self._record(request_id)
+            self.db.execute("INSERT OR IGNORE INTO cards VALUES (?, ?)",
+                            (request_id, json.dumps(fields, sort_keys=True)))
+        return {"bound": request_id}
+
+    def result_cards(self, request_id):
+        with self.lock:
+            rec, state = self._record(request_id)
+            return {"result": self._result(rec, state), "cards": [json.loads(r[0]) for r in
+                    self.db.execute("SELECT binding FROM cards WHERE request_id=?", (request_id,))]}
+
+    def _confirm_answer(self, rec, *, timeout=None):
         """Observe only: a provider receipt is not proof the TUI accepted a key.
 
         Require two consistent observations that the original approval is gone.
         Never send more keys, even if the original dialog remains unchanged.
         """
         start = self.monotonic()
-        deadline = start + self.confirmation_timeout
+        deadline = start + (self.confirmation_timeout if timeout is None else timeout)
         candidate = None
         observation = None
         reason = "not_observed"
@@ -277,17 +463,17 @@ class Bridge:
                 same_dialog = live is not None and live.fingerprint == rec["fingerprint"]
                 observation = {"status": status, "sequence": seq, "same_dialog": same_dialog}
                 stable = (seq == info.get("state_change_seq") and status == info.get("agent_status"))
-                advanced = (rec.get("sequence") is not None and seq is not None and seq != rec["sequence"])
+                advanced = (rec.get("sequence") is not None and seq is not None and seq > rec["sequence"])
                 current = None
                 if stable and not same_dialog:
                     if advanced and status in ("working", "idle", "done"):
                         current = ("approval_closed", seq, status)
-                    elif status == "blocked" and live is not None:
+                    elif advanced and status == "blocked" and live is not None:
                         current = ("next_dialog", seq, live.fingerprint)
                 if current is not None and current == candidate:
                     return {"outcome": "confirmed", "reason": current[0],
                             "elapsed_ms": round((self.monotonic() - start) * 1000),
-                            "observation": observation}
+                            "observation": observation, "retryable": False}
                 candidate = current
                 reason = "dialog_still_open" if same_dialog else "not_observed"
             except Exception:
@@ -301,7 +487,9 @@ class Bridge:
             self.sleep(min(self.confirmation_interval, remaining))
         return {"outcome": "unconfirmed" if reason == "dialog_still_open" else "uncertain",
                 "reason": reason, "elapsed_ms": round((self.monotonic() - start) * 1000),
-                "observation": observation}
+                "observation": observation,
+                "retryable": (reason == "dialog_still_open" and stable and status == "blocked"
+                              and seq == rec.get("sequence"))}
 
     def send(self, pane, text):
         with self.lock:

@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Worker } from "./worker.js";
-import { answerText, code, deliver, eventPayload, statusPayload } from "./presentation.js";
+import { answerText, answerEdit, updateAnswerCard, code, deliver, eventPayload, statusPayload } from "./presentation.js";
 
 export function authorized(config, ctx) {
   return (ctx.isAuthorizedSender ?? ctx.auth?.isAuthorizedSender) === true
@@ -10,9 +10,7 @@ export function authorized(config, ctx) {
     && config.ownerIds.includes(ctx.senderId);
 }
 
-export default {
-  id: "herdr-bridge", name: "Herdr Bridge", version: "0.2.0",
-  register(api) {
+export function registerBridge(api, workerFactory = (...args)=>new Worker(...args)) {
     let config = api.pluginConfig;
     let worker, timer, busy = false, stopping = true, controller, pumping;
     const call = (method, params) => {
@@ -23,6 +21,23 @@ export default {
       if (!authorized(config, ctx)) throw new Error("This channel/account/sender is not authorized for Herdr");
       ctx.assertOwnerCurrent?.();
     };
+    const edits = new Map();
+    // Authenticated callback editors stay in memory; never persist response URLs.
+    const cardEditors = new Map();
+    const cardKey = (binding) => `${binding.accountId}:${binding.conversationId}:${binding.messageTs}`;
+    const serializeEdit = async (binding, edit) => {
+      const key = cardKey(binding);
+      const prior = edits.get(key) ?? Promise.resolve();
+      const next = prior.catch(()=>{}).then(edit);
+      edits.set(key,next);
+      try { return await next; }
+      finally { if (edits.get(key) === next) edits.delete(key); }
+    };
+    const editCurrentCard = (ctx, requestId) => serializeEdit({accountId:ctx.accountId,
+      conversationId:ctx.conversationId,messageTs:ctx.interaction.messageTs}, async()=> {
+      const {result} = await call("result_cards",{request_id:requestId});
+      await ctx.respond.editMessage(await answerEdit(api,config.route,result));
+    });
     api.registerService({
       id: "herdr-bridge",
       reload: { configPrefixes: ["plugins.entries.herdr-bridge.config"] },
@@ -33,7 +48,7 @@ export default {
         stopping = false;
         controller = new AbortController();
         const startWorker = () => {
-          worker = new Worker(config, join(stateDir, "bridge.sqlite"), api.logger);
+          worker = workerFactory(config, join(stateDir, "bridge.sqlite"), api.logger);
           worker.start();
         };
         startWorker();
@@ -47,12 +62,37 @@ export default {
               startWorker();
             }
             const events = await call("events");
+            let deferred;
             for (const event of events) {
               if (stopping) break;
-              await deliver(api, config.route, eventPayload(event), controller.signal);
-              await call("ack", { event_id: event.id });
-              api.logger.info(`Herdr event delivered: ${event.type} ${event.id}`);
+              try {
+                if (event.type === "approval.updated") {
+                  const requestId = event.result.request_id;
+                  const {cards} = await call("result_cards", {request_id:requestId});
+                  let recoverySent = false;
+                  for (const binding of cards) {
+                    if (stopping) break;
+                    await serializeEdit(binding,async()=> {
+                      const {result} = await call("result_cards",{request_id:requestId});
+                      const edit = cardEditors.get(cardKey(binding));
+                      if (!edit && recoverySent) return;
+                      await updateAnswerCard(api, config.route, binding, result, edit, controller.signal);
+                      if (!edit) recoverySent = true;
+                    });
+                  }
+                  if (stopping) break;
+                } else {
+                  await deliver(api, config.route, eventPayload(event), controller.signal);
+                }
+                await call("ack", { event_id: event.id });
+                api.logger.info(`Herdr event delivered: ${event.type} ${event.id}`);
+              } catch (error) {
+                deferred ??= error;
+                api.logger.warn(`Herdr event deferred: ${event.id} ${error.message}`);
+              }
             }
+            if (deferred) throw deferred;
+
             ctx.serviceHealth?.clearFailure();
           } catch (error) {
             if (!stopping) { api.logger.warn(`Herdr delivery deferred: ${error.message}`); ctx.serviceHealth?.reportFailure(error); }
@@ -68,6 +108,8 @@ export default {
         clearInterval(timer);
         controller?.abort();
         await pumping;
+        await Promise.allSettled([...edits.values()]);
+        cardEditors.clear();
         await worker?.stop();
         worker = undefined;
       },
@@ -90,13 +132,15 @@ export default {
             allowed(ctx);
             return { text: answerText(await call("answer", { request_id: target, option: Number(option) })) };
           }
+          if (verb === "check" && /^[a-f0-9]{32}$/.test(target ?? ""))
+            return {text:answerText(await call("check",{request_id:target}))};
           if (verb === "send" && target) {
             const text = args.replace(/^send\s+\S+\s*/, "");
             allowed(ctx);
             await call("send", { pane: target, text });
             return { text: `Prompt dispatched to ${target}.` };
           }
-          return { text: "Use /herdr status | read w4:p2 | pending | send w4:p2 <prompt> | answer <request-id> <zero-based-option>" };
+          return { text: "Use /herdr status | read w4:p2 | pending | send w4:p2 <prompt> | answer <request-id> <zero-based-option> | check <request-id>" };
         } catch (error) { return { text: error.message }; }
       },
     });
@@ -110,11 +154,45 @@ export default {
             await ctx.respond.editMessage({text: "✅ Herdr Bridge callback connected. No terminal operation was performed.", blocks: []});
             return {handled:true};
           }
-          const match = /^([a-f0-9]{32}):(\d+)$/.exec(ctx.interaction.payload);
-          if (!match) throw new Error("Invalid Herdr approval callback");
-          const result = await call("answer", { request_id: match[1], option: Number(match[2]) });
-          api.logger.info?.(`Herdr approval ${result.outcome}: ${match[1]} option ${match[2]} reason=${result.verification?.reason ?? "unknown"}`);
-          await ctx.respond.editMessage({ text: answerText(result), blocks: [] });
+          const payload = ctx.interaction.payload;
+          const answer = /^([a-f0-9]{32}):(\d+)$/.exec(payload);
+          const check = /^check:([a-f0-9]{32})$/.exec(payload);
+          const retry = /^retry:([a-f0-9]{32}):([a-f0-9]{32})$/.exec(payload);
+          const requestId = (answer ?? check ?? retry)?.[1];
+          if (!requestId) throw new Error("Invalid Herdr approval callback");
+          cardEditors.set(cardKey({accountId:ctx.accountId,conversationId:ctx.conversationId,
+            messageTs:ctx.interaction.messageTs}),message=>ctx.respond.editMessage(message));
+          if (cardEditors.size > 1024) cardEditors.delete(cardEditors.keys().next().value);
+          // Persist the authenticated source card before any terminal write.
+          await call("bind_card", {request_id:requestId,binding:{channel:ctx.channel,accountId:ctx.accountId,
+            conversationId:ctx.conversationId,messageTs:ctx.interaction.messageTs}});
+          let result;
+          if (answer || retry) {
+            const prepared = await call("prepare_answer", {request_id:requestId,
+              ...(answer ? {option:Number(answer[2])} : {retry_from:retry[2]})});
+            if (prepared.ready_to_dispatch) {
+              // No terminal write occurs before this progress card is shown.
+              await serializeEdit({accountId:ctx.accountId,conversationId:ctx.conversationId,
+                messageTs:ctx.interaction.messageTs},async()=> {
+                const {result:latest} = await call("result_cards",{request_id:requestId});
+                const progress = latest.outcome === "not_sent" && latest.attempt_id === prepared.attempt_id
+                  ? {...latest,outcome:"checking",retry_token:null} : latest;
+                await ctx.respond.editMessage(await answerEdit(api,config.route,progress));
+              });
+              allowed(ctx);
+              result = await call("dispatch_reserved",{request_id:requestId,attempt_id:prepared.attempt_id});
+            } else if (prepared.outcome === "checking" || prepared.outcome === "confirmed") {
+              result = prepared;
+            } else {
+              result = await call("check",{request_id:requestId});
+            }
+          } else {
+            result = await call("check", {request_id:requestId});
+          }
+          api.logger.info?.(`Herdr approval ${result.outcome}: ${requestId} reason=${result.verification?.reason ?? "unknown"}`);
+          // Background edits use latest persisted results. The per-card queue also
+          // prevents a slow earlier callback from overwriting a later confirmation.
+          await editCurrentCard(ctx, requestId);
         } catch (error) {
           api.logger.warn?.(`Herdr callback rejected: ${error.message}`);
           await ctx.respond.reply({ text: error.message });
@@ -140,5 +218,9 @@ export default {
         };
       } }, { name, optional: true });
     }
-  },
+}
+
+export default {
+  id: "herdr-bridge", name: "Herdr Bridge", version: "0.2.0",
+  register: registerBridge,
 };

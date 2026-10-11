@@ -8,6 +8,7 @@ This fork changes purpose from a standalone Slack bot to a local Herdr integrati
 - Added exact-pane status/read/send commands and request-ID-based human approvals, backed by durable pending requests and an outbound queue.
 - Approval dispatch revalidates live evidence and consumes authorization before sending keys. Uncertain writes are never automatically retried.
 - Approval results now distinguish observed terminal confirmation from a send acknowledgement. Still-open approvals report `unconfirmed`, with persisted diagnostics and no automatic retry.
+- Slack clicks reserve an attempt and show progress before dispatch. Added per-pane dispatch exclusion, idempotent repeated clicks, read-only status checks, bounded durable background follow-up and explicit attempt-bound retries after live revalidation. Recovery results update the original card while its callback editor is available, or send a portable recovery card after Gateway restart.
 - Messages contain the Herdr name/tab label, actual session model, cwd, a rule-based highlighted summary and captured terminal conversation.
 - Added owner-gated read tools for OpenClaw agents. No model-facing approval or terminal-write tool is exposed.
 - Verified the new flow on macOS, including a real read-only approval and locked-phone Slack push.

@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from .events import SubscriptionManager
 from .herdr_client import HerdrClient
@@ -47,6 +48,7 @@ def main():
     def scan():
         while not stopped.is_set():
             try:
+                bridge.reconcile_answers()
                 for info in client.list_agents():
                     bridge.discover(info)
             except Exception:
@@ -56,21 +58,31 @@ def main():
     manager.start()
     thread = threading.Thread(target=scan, daemon=True)
     thread.start()
-    methods = {name: getattr(bridge, name) for name in ("status", "read", "pending", "events", "ack", "answer", "send")}
-    try:
-        for line in sys.stdin:
-            request = {}
-            try:
-                request = json.loads(line)
-                method = request["method"]
-                if method not in methods:
-                    raise ValueError("Unknown bridge method")
-                result = methods[method](**request.get("params", {}))
-                response = {"id": request.get("id"), "result": result}
-            except Exception as exc:
-                response = {"id": request.get("id") if isinstance(request, dict) else None,
-                            "error": {"code": getattr(exc, "code", "bridge_error"), "message": str(exc)}}
+    methods = {name: getattr(bridge, name) for name in (
+        "status", "read", "pending", "events", "ack", "answer", "send",
+        "check", "retry", "prepare_answer", "dispatch_reserved", "bind_card", "result_cards")}
+    output_lock = threading.Lock()
+
+    def handle(line):
+        request = {}
+        try:
+            request = json.loads(line)
+            method = request["method"]
+            if method not in methods:
+                raise ValueError("Unknown bridge method")
+            result = methods[method](**request.get("params", {}))
+            response = {"id": request.get("id"), "result": result}
+        except Exception as exc:
+            response = {"id": request.get("id") if isinstance(request, dict) else None,
+                        "error": {"code": getattr(exc, "code", "bridge_error"), "message": str(exc)}}
+        with output_lock:
             print(json.dumps(response, ensure_ascii=False), flush=True)
+
+    try:
+        # A slow approval check must not prevent a duplicate click/status query.
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for line in sys.stdin:
+                executor.submit(handle, line)
     finally:
         stopped.set()
         manager.stop()

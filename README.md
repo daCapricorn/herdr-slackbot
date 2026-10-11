@@ -73,14 +73,15 @@ Send `/herdr status` as a text command in the OpenClaw bot DM. See the [guide](d
 | `/herdr pending` | Request IDs and zero-based options |
 | `/herdr send w4:p2 inspect the project` | Prompt an idle/done agent |
 | `/herdr answer <request-id> 0` | Answer one exact request after live checks |
+| `/herdr check <request-id>` | Inspect a previous attempt without sending keys |
 
 Clicks and write commands require an authenticated configured owner on the configured channel/account. Optional `herdr_status` and `herdr_read` tools give OpenClaw's model read access; the model receives no approval or terminal-write tool.
 
 ## Reliability
 
-Before sending keys, Bridge checks expiry, option membership, terminal/session identity, state sequence, blocked status and dialog fingerprint. It durably consumes the request before sending keys, then checks whether the original approval actually closed. A send acknowledgement alone cannot produce a success card: unchanged approvals show `unconfirmed`, while stable evidence of progression shows `confirmed`. Confirmation does not verify command completion. Uncertain writes are never automatically retried. Replaced requests and stale queued approval cards are invalidated.
+Before sending keys, Bridge checks expiry, option membership, terminal/session identity, state sequence, blocked status and dialog fingerprint. Slack clicks first reserve an attempt and show progress, then recheck the live dialog before sending once. A send acknowledgement alone cannot produce a success card: unchanged approvals show `unconfirmed`, while stable evidence of progression shows `confirmed`. Confirmation does not verify command completion. A five-second initial check is followed by read-only background checks for up to two minutes, bounded by request expiry. Replaced requests and stale queued approval cards are invalidated.
 
-Message delivery is **at least once**: an ambiguous provider acknowledgement can produce duplicate cards. Copies share a request ID and can be answered at most once. Herdr does not provide an atomic compare-and-send-keys operation, so simultaneous local interaction remains a race. Phone push depends on the recipient's Slack and device notification settings; see the [live checklist](docs/LIVE_TEST.md).
+Message delivery is **at least once**: an ambiguous provider acknowledgement can produce duplicate cards. Copies share a request ID; repeated clicks return the current result without resending. An unchanged live approval can expose a separate **重新提交** button bound to that attempt, which explicitly permits one new submission of the same option after fresh checks. Unknown acceptance cannot be retried until checks establish the original unchanged dialog. No keys are automatically replayed. Herdr cannot atomically compare the dialog and send keys, and earlier input can arrive late, so even explicit retries cannot guarantee exactly-once terminal handling. Phone push depends on Slack/device settings; see the [live checklist](docs/LIVE_TEST.md).
 
 ## Development and project history
 
