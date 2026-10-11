@@ -123,7 +123,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
                     if (!event) continue;
                   }
                   const payload = eventPayload(event);
-                  if (paneChannels) {
+                  if (paneChannels && ["approval.requested","agent.blocked","question.requested"].includes(event.type)) {
                     const mention = config.ownerIds.map(id=>`<@${id}>`).join(" ");
                     payload.text = `${mention}\n${payload.text}`;
                     payload.presentation.blocks.unshift({type:"text",text:mention});

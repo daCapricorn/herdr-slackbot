@@ -375,17 +375,21 @@ test("slow channel provisioning does not delay an existing channel's completion"
   } finally {release();}
 });
 
-test("two pane events use their own persisted channels and mention only the configured owners",async t=> {
+test("pane events use their own channels and only attention messages mention owners",async t=> {
   const events=[{id:"one",type:"agent.done",agent:{pane_id:"w4:p1"},text:"first"},
-    {id:"two",type:"agent.done",agent:{pane_id:"w4:p2"},text:"second"}];
+    {id:"two",type:"agent.blocked",agent:{pane_id:"w4:p2"},text:"second"}];
   const bridge=await runningBridge(t,{config:channelConfig,channelFactory,call:async(method,params)=> {
     if(method === "events") return events;
+    if(method === "event_for_delivery") return events.find(e=>e.id === params.event_id);
     if(method === "route_event") return {channel:"slack",accountId:"default",team_id:"T1",to:params.event_id === "one" ? "channel:C1" : "channel:C2"};
     return {};
   }});
   for(let i=0;i<20 && bridge.edits.length<2;i++) await new Promise(resolve=>setImmediate(resolve));
   assert.deepEqual(bridge.edits.map(e=>e.to),["channel:C1","channel:C2"]);
-  assert.ok(bridge.edits.every(e=>e.payload.text.startsWith("<@U1>\n")));
+  assert.ok(!bridge.edits[0].payload.text.includes("<@U1>"));
+  assert.ok(!JSON.stringify(bridge.edits[0].payload.presentation).includes("<@U1>"));
+  assert.ok(bridge.edits[1].payload.text.startsWith("<@U1>\n"));
+  assert.equal(bridge.edits[1].payload.presentation.blocks[0].text,"<@U1>");
   assert.equal(bridge.calls.filter(c=>c.method === "ack").length,2);
 });
 
