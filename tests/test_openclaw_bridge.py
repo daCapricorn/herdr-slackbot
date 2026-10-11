@@ -68,9 +68,9 @@ def test_answer_one_shot_survives_restart(setup, tmp_path):
     token = request(client, bridge)
     result = bridge.answer(token, 0)
     assert result["outcome"] == "unconfirmed" and client.keys == [("w4:p2", ["1"])]
-    again = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda: 100)
-    with pytest.raises(BridgeError, match="already answered"):
-        again.answer(token, 0)
+    again = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda: 100, confirmation_timeout=0)
+    assert again.answer(token, 0)["outcome"] == "unconfirmed"
+    assert len(client.keys) == 1
     again.discover(client.info)
     assert not again.pending()
     again.close()
@@ -114,11 +114,11 @@ def test_lost_reply_does_not_rearm_or_retry(setup):
     client, bridge = setup
     token = request(client, bridge)
     client.error = HerdrOutcomeUnknown("lost reply")
-    with pytest.raises(HerdrOutcomeUnknown):
-        bridge.answer(token, 0)
+    assert bridge.answer(token, 0)["outcome"] == "unconfirmed"
     bridge.discover(client.info)
-    with pytest.raises(BridgeError):
-        bridge.answer(token, 0)
+    assert bridge.answer(token, 0)["outcome"] == "unconfirmed"
+    raw = bridge.db.execute("SELECT record FROM approvals WHERE id=?", (token,)).fetchone()[0]
+    assert json.loads(raw)["dispatch"]["error_type"] == "HerdrOutcomeUnknown"
     assert len(client.keys) == 1 and not bridge.pending()
 
 
@@ -261,11 +261,10 @@ def test_success_receipt_with_dropped_input_is_not_confirmed_or_retried(verifyin
     assert state == "unconfirmed"
     assert json.loads(stored)["dispatch"]["option"] == 0
     assert json.loads(stored)["verification"]["observation"]["same_dialog"] is True
-    again = Bridge(client, tmp_path / "verified.sqlite")
+    again = Bridge(client, tmp_path / "verified.sqlite", confirmation_timeout=0)
     again.discover(client.info)
     assert not again.pending()
-    with pytest.raises(BridgeError, match="already answered"):
-        again.answer(token, 0)
+    assert again.answer(token, 0)["outcome"] == "unconfirmed"
     again.close()
     assert len(client.keys) == 1
 
@@ -336,8 +335,8 @@ def test_failure_after_write_has_unknown_acceptance_and_never_retries(verifying,
     assert result["outcome"] == "uncertain"
     assert result["verification"]["reason"] == ("agent_replaced" if failure == "replace" else "read_failed")
     assert len(client.keys) == 1
-    with pytest.raises(BridgeError, match="already answered"):
-        bridge.answer(token, 0)
+    assert bridge.answer(token, 0)["outcome"] == "uncertain"
+    assert len(client.keys) == 1
 
 
 def test_transient_read_error_recovers_without_replaying_write(verifying):
@@ -365,9 +364,258 @@ def test_crash_during_verification_preserves_consumed_authorization(verifying, t
     bridge._confirm_answer = crash
     with pytest.raises(SystemExit):
         bridge.answer(token, 0)
-    again = Bridge(client, tmp_path / "verified.sqlite")
+    again = Bridge(client, tmp_path / "verified.sqlite", confirmation_timeout=0)
     again.discover(client.info)
-    with pytest.raises(BridgeError, match="already answered"):
-        again.answer(token, 0)
+    assert again.answer(token, 0)["outcome"] == "unconfirmed"
     assert not again.pending() and len(client.keys) == 1
     again.close()
+
+
+def test_changed_dialog_without_sequence_progress_is_not_confirmation(verifying):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    timer.on_sleep = lambda: setattr(client, "screen", client.screen.replace("Set-Content", "Remove-Item"))
+    assert bridge.answer(token, 0)["outcome"] == "uncertain"
+    assert len(client.keys) == 1
+
+
+def test_sequence_regression_cannot_confirm(verifying):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    def reset():
+        advance(client)
+        client.info["state_change_seq"] = 6
+    timer.on_sleep = reset
+    assert bridge.answer(token, 0)["outcome"] == "uncertain"
+
+
+def test_confirmed_duplicates_are_cached_even_if_terminal_is_gone(verifying):
+    client, bridge, timer = verifying
+    token = request(client, bridge)
+    timer.on_sleep = lambda: advance(client)
+    original = bridge.answer(token, 0)
+    client.get_agent = lambda *args: (_ for _ in ()).throw(OSError("gone"))
+    assert bridge.answer(token, 0) == original
+    with pytest.raises(BridgeError, match="different option"):
+        bridge.answer(token, 1)
+    assert len(client.keys) == 1
+
+
+def test_same_click_and_status_return_checking_while_write_is_in_flight(setup):
+    import threading
+    client, bridge = setup
+    token = request(client, bridge)
+    entered, release = threading.Event(), threading.Event()
+    send = client.send_keys
+    def slow_send(*args):
+        send(*args)
+        entered.set()
+        assert release.wait(2)
+    client.send_keys = slow_send
+    thread = threading.Thread(target=lambda: bridge.answer(token, 0))
+    thread.start()
+    try:
+        assert entered.wait(2)
+        assert bridge.answer(token, 0)["outcome"] == "checking"
+        assert bridge.check(token)["outcome"] == "checking"
+        with pytest.raises(BridgeError, match="different option"):
+            bridge.answer(token, 1)
+        assert len(client.keys) == 1
+    finally:
+        release.set()
+        thread.join(2)
+    assert not thread.is_alive()
+
+
+def test_explicit_retry_has_its_own_attempt_and_duplicate_button_cannot_replay(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    first = bridge.answer(token, 0)
+    second = bridge.retry(token, first["retry_token"])
+    assert second["attempt_id"] != first["attempt_id"]
+    assert len(client.keys) == 2
+    assert bridge.retry(token, first["retry_token"]) == second
+    assert bridge.answer(token, 0)["attempt_id"] == second["attempt_id"]
+    assert len(client.keys) == 2
+    raw = bridge.db.execute("SELECT record FROM approvals WHERE id=?", (token,)).fetchone()[0]
+    assert len(json.loads(raw)["attempts"]) == 1
+
+
+@pytest.mark.parametrize("change", ["dialog", "identity", "sequence", "expiry"])
+def test_retry_rechecks_current_evidence_before_sending(setup, change):
+    client, bridge = setup
+    token = request(client, bridge)
+    result = bridge.answer(token, 0)
+    if change == "dialog":
+        client.screen = client.screen.replace("Set-Content", "Remove-Item")
+    elif change == "identity":
+        client.info["terminal_id"] = "replacement"
+    elif change == "sequence":
+        client.info["state_change_seq"] += 2
+    else:
+        bridge.clock = lambda: 1001
+    with pytest.raises(BridgeError):
+        bridge.retry(token, result["retry_token"])
+    assert len(client.keys) == 1
+
+
+def test_unknown_acceptance_has_no_retry_until_read_only_check_recovers(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    bridge.answer(token, 0)
+    read = client.read_agent_once
+    client.read_agent_once = lambda *a, **kw: (_ for _ in ()).throw(OSError("offline"))
+    unknown = bridge.check(token)
+    assert unknown["outcome"] == "uncertain" and unknown["retry_token"] is None
+    with pytest.raises(BridgeError, match="unknown"):
+        bridge.retry(token, unknown["attempt_id"])
+    client.read_agent_once = read
+    assert bridge.check(token)["retry_token"]
+    assert len(client.keys) == 1
+
+
+def test_background_confirmation_and_card_binding_survive_restart(setup, tmp_path):
+    client, bridge = setup
+    token = request(client, bridge)
+    binding = {"channel":"slack", "accountId":"default", "conversationId":"D123", "messageTs":"123.456"}
+    bridge.bind_card(token, binding)
+    bridge.answer(token, 0)
+    first_update = next(e for e in bridge.events() if e["type"] == "approval.updated")
+    again = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda:100)
+    advance(client)
+    again.reconcile_answers()
+    cards = again.result_cards(token)
+    assert cards["result"]["outcome"] == "confirmed" and cards["cards"] == [binding]
+    updates = [e for e in again.events() if e["type"] == "approval.updated"]
+    assert len(updates) == 1 and updates[0]["id"] != first_update["id"]
+    again.ack(first_update["id"])  # A delayed ACK must not delete a newer update.
+    assert again.events() == updates
+    assert len(client.keys) == 1
+    again.close()
+
+
+def test_crashed_dispatch_resumes_only_observation(setup, tmp_path):
+    client, bridge = setup
+    token = request(client, bridge)
+    bridge._confirm_answer = lambda rec: (_ for _ in ()).throw(SystemExit())
+    with pytest.raises(SystemExit):
+        bridge.answer(token, 0)
+    again = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda:100)
+    advance(client)
+    again.reconcile_answers()
+    assert again.result_cards(token)["result"]["outcome"] == "confirmed"
+    assert len(client.keys) == 1
+    again.close()
+
+
+def test_background_checks_expire_without_resending_or_renewing_authorization(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    bridge.answer(token, 0)
+    bridge.clock = lambda:221
+    bridge.reconcile_answers()
+    result = bridge.result_cards(token)["result"]
+    assert result["watching"] is False
+    assert any(e["type"] == "approval.updated" and not e["result"]["watching"] for e in bridge.events())
+    assert len(client.keys) == 1
+    bridge.clock = lambda:1001
+    assert bridge.check(token)["retry_token"] is None
+
+
+def test_explicit_retry_gets_its_own_bounded_followup_after_previous_watch_expired(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    first = bridge.answer(token, 0)
+    bridge.clock = lambda:221
+    bridge.reconcile_answers()
+    second = bridge.retry(token, first["attempt_id"])
+    assert second["watching"] is True
+    for event in bridge.events():
+        bridge.ack(event["id"])
+    bridge.clock = lambda:342
+    bridge.reconcile_answers()
+    updates = [e for e in bridge.events() if e["type"] == "approval.updated"]
+    assert len(updates) == 1 and updates[0]["result"]["watching"] is False
+    assert updates[0]["result"]["attempt_id"] == second["attempt_id"]
+    assert len(client.keys) == 2
+
+
+def test_same_dialog_at_new_generation_never_offers_retry(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    bridge.answer(token, 0)
+    client.info["state_change_seq"] += 2
+    result = bridge.check(token)
+    assert result["outcome"] == "unconfirmed" and result["retry_token"] is None
+    with pytest.raises(BridgeError):
+        bridge.retry(token, result["attempt_id"])
+    assert len(client.keys) == 1
+
+
+def test_reservation_survives_restart_without_sending_keys(setup, tmp_path):
+    client, bridge = setup
+    token = request(client, bridge)
+    prepared = bridge.prepare_answer(token, option=0)
+    assert prepared["ready_to_dispatch"] and prepared["outcome"] == "checking"
+    assert not client.keys
+    again = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda:100, confirmation_timeout=0)
+    again.reconcile_answers()
+    result = again.result_cards(token)["result"]
+    assert result["outcome"] == "not_sent" and result["retry_token"] == prepared["attempt_id"]
+    assert not client.keys
+    again.dispatch_reserved(token, prepared["attempt_id"])
+    again.dispatch_reserved(token, prepared["attempt_id"])
+    assert len(client.keys) == 1
+    again.close()
+
+
+def test_reservation_revalidates_after_ui_edit(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    prepared = bridge.prepare_answer(token, option=0)
+    client.screen = client.screen.replace("Set-Content", "Remove-Item")
+    with pytest.raises(BridgeError, match="Dialog changed"):
+        bridge.dispatch_reserved(token, prepared["attempt_id"])
+    assert not client.keys
+    assert bridge.check(token)["retry_token"] is None
+
+
+def test_pane_gate_blocks_another_request_while_first_attempt_is_in_flight(setup):
+    import threading
+    client, bridge = setup
+    first = request(client, bridge)
+    started, release = threading.Event(), threading.Event()
+    send = client.send_keys
+    def slow_send(*args):
+        send(*args)
+        started.set()
+        assert release.wait(2)
+    client.send_keys = slow_send
+    thread = threading.Thread(target=lambda: bridge.answer(first, 0))
+    thread.start()
+    try:
+        assert started.wait(2)
+        client.info["state_change_seq"] += 2
+        bridge.discover(client.info)
+        second = bridge.pending()[0]["id"]
+        assert second != first
+        with pytest.raises(BridgeError, match="another approval"):
+            bridge.prepare_answer(second, option=0)
+        assert len(client.keys) == 1
+    finally:
+        release.set()
+        thread.join(2)
+    assert not thread.is_alive() and not bridge.sending
+
+
+def test_duplicate_retry_reservation_cannot_make_another_attempt(setup):
+    client, bridge = setup
+    token = request(client, bridge)
+    first = bridge.answer(token, 0)
+    prepared = bridge.prepare_answer(token, retry_from=first["retry_token"])
+    duplicate = bridge.prepare_answer(token, retry_from=first["retry_token"])
+    assert not duplicate["ready_to_dispatch"]
+    assert duplicate["attempt_id"] == prepared["attempt_id"]
+    bridge.dispatch_reserved(token, prepared["attempt_id"])
+    bridge.dispatch_reserved(token, prepared["attempt_id"])
+    assert len(client.keys) == 2

@@ -96,3 +96,183 @@ test("an acknowledged key write never becomes a success card without terminal co
   }
   assert.match(answerText({option:"Yes, proceed",outcome:"confirmed"}), /✅.*original approval has closed/);
 });
+
+test("unconfirmed cards expose separate read-only check and attempt-bound retry controls", async () => {
+  const {answerPayload, answerEdit} = await import("../presentation.js");
+  const id = "a".repeat(32), attempt = "b".repeat(32);
+  const payload = answerPayload({request_id:id,outcome:"unconfirmed",retry_token:attempt});
+  const actions = payload.presentation.blocks.at(-1).buttons.map(b=>b.action.value);
+  assert.deepEqual(actions,[`herdr-bridge:check:${id}`,`herdr-bridge:retry:${id}:${attempt}`]);
+  const unknown = answerPayload({request_id:id,outcome:"uncertain"});
+  assert.equal(unknown.presentation.blocks.at(-1).buttons.length,1);
+  const success = answerPayload({request_id:id,outcome:"confirmed"});
+  assert.ok(!success.presentation.blocks.some(b=>b.type === "buttons"));
+  const api = {runtime:{config:{current:()=>({})},channel:{outbound:{loadAdapter:async()=>({
+    renderPresentation:({payload})=>({channelData:{slack:{renderedPresentationSegments:[{kind:"blocks",blocks:payload.presentation.blocks}]}}})
+  })}}}};
+  assert.deepEqual((await answerEdit(api,config.route,{request_id:id,outcome:"uncertain"})).blocks,unknown.presentation.blocks);
+  api.runtime.channel.outbound.loadAdapter = async()=>({renderPresentation:()=>null});
+  await assert.rejects(answerEdit(api,config.route,{request_id:id,outcome:"uncertain"}),/native recovery controls/);
+});
+
+async function runningBridge(t, initial = {}) {
+  const {registerBridge} = await import("../index.js");
+  const {mkdtemp, rm} = await import("node:fs/promises");
+  const {tmpdir} = await import("node:os");
+  const dir = await mkdtemp(`${tmpdir()}/herdr-plugin-test-`);
+  const id = "a".repeat(32), attempt = "b".repeat(32);
+  const binding = {channel:"slack",accountId:"default",conversationId:"D123",messageTs:"123.456"};
+  const registrations = {}, calls = [], edits = [];
+  let result = {request_id:id,outcome:"unconfirmed",attempt_id:attempt,retry_token:attempt,option:"Yes"};
+  const worker = {child:{exitCode:null},start(){},async stop(){}, async call(method,params) {
+    calls.push({method,params});
+    if (initial.call) return initial.call(method,params,result);
+    if (method === "events") return initial.events ?? [];
+    if (method === "result_cards") return {result,cards:initial.cards ?? [binding]};
+    if (method === "prepare_answer") {
+      if (result.outcome === "confirmed") return {...result,ready_to_dispatch:false};
+      result = {...result,outcome:"not_sent",retry_token:null};
+      return {...result,outcome:"checking",ready_to_dispatch:true};
+    }
+    if (method === "dispatch_reserved") {
+      result = {...result,outcome:"unconfirmed",retry_token:attempt};
+      return result;
+    }
+    if (method === "check") return result;
+    return {};
+  }};
+  const context = {send:initial.update ?? (async(message)=>edits.push(message))};
+  const api = {pluginConfig:config,logger:{info(){},warn(){}},
+    registerService:s=>registrations.service=s,registerCommand:c=>registrations.command=c,
+    registerInteractiveHandler:h=>registrations.interactive=h,registerTool(){},
+    runtime:{config:{current:()=>({})},channel:{
+      outbound:{loadAdapter:async()=>({sendPayload:ctx=>context.send(ctx),renderPresentation:({payload})=>({...payload,channelData:{slack:{
+        renderedPresentationSegments:[{kind:"blocks",blocks:payload.presentation.blocks}]
+      }}})})}
+    }}
+  };
+  registerBridge(api,()=>worker);
+  await registrations.service.start({stateDir:dir,config:{}});
+  t.after(async()=> {await registrations.service.stop();await rm(dir,{recursive:true,force:true});});
+  const click = async(payload)=>registrations.interactive.handler({...trusted,conversationId:binding.conversationId,
+    interaction:{payload,messageTs:binding.messageTs},respond:{
+      editMessage:async(message)=> {initial.onEdit?.(message,calls);if (initial.editFail) throw new Error("edit offline");edits.push(message);},
+      reply:async(message)=>edits.push({error:message.text})
+    }});
+  return {id,attempt,binding,calls,edits,api,context,click,registrations,setResult:r=>result=r};
+}
+
+test("authorized answer/check/retry callbacks bind the source card and invoke only their own method", async t => {
+  const bridge = await runningBridge(t);
+  for (const [payload,method,params] of [
+    [`${bridge.id}:0`,"prepare_answer",{request_id:bridge.id,option:0}],
+    [`check:${bridge.id}`,"check",{request_id:bridge.id}],
+    [`retry:${bridge.id}:${bridge.attempt}`,"prepare_answer",{request_id:bridge.id,retry_from:bridge.attempt}],
+  ]) {
+    bridge.calls.length = 0;
+    await bridge.click(payload);
+    const bound = bridge.calls.findIndex(c=>c.method === "bind_card");
+    const invoked = bridge.calls.findIndex(c=>c.method === method);
+    assert.ok(bound >= 0 && invoked > bound);
+    assert.deepEqual(bridge.calls[invoked].params,params);
+    assert.deepEqual(bridge.calls[bound].params.binding,bridge.binding);
+    assert.equal(bridge.calls.filter(c=>["prepare_answer","check"].includes(c.method)).length,1);
+    assert.equal(bridge.calls.filter(c=>c.method === "dispatch_reserved").length,method === "check" ? 0 : 1);
+    assert.ok(bridge.edits.at(-1).blocks.at(-1).buttons);
+  }
+  const before = bridge.calls.length;
+  await bridge.click(`retry:${bridge.id}:arbitrary-keys`);
+  assert.equal(bridge.calls.length,before);
+  assert.match(bridge.edits.at(-1).error,/Invalid/);
+});
+
+test("callbacks edit the latest stored result rather than their potentially stale return", async t => {
+  const bridge = await runningBridge(t);
+  bridge.setResult({request_id:bridge.id,outcome:"confirmed",option:"Yes"});
+  await bridge.click(`check:${bridge.id}`);
+  assert.match(bridge.edits.at(-1).text,/confirmed/);
+  assert.equal(bridge.edits.at(-1).blocks.length,0);
+});
+
+test("after restart persisted updates send a portable recovery card before acknowledging the outbox", async t => {
+  const bridge = await runningBridge(t,{events:[{id:"event-1",type:"approval.updated",result:{request_id:"a".repeat(32)}}]});
+  // The initial service pump is asynchronous; allow only bounded scheduling turns.
+  for (let i=0; i<20 && !bridge.calls.some(c=>c.method === "ack");i++)
+    await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(bridge.edits.length,1);
+  assert.equal(bridge.edits[0].to,config.route.to);
+  assert.match(bridge.edits[0].payload.presentation.blocks[1].text,/恢复状态/);
+  assert.equal(bridge.edits[0].payload.presentation.blocks.at(-1).buttons[0].action.value,`herdr-bridge:check:${bridge.id}`);
+  assert.deepEqual(bridge.calls.at(-1),{method:"ack",params:{event_id:"event-1"}});
+});
+
+test("background recovery fails closed on account or DM mismatch", async t => {
+  const {updateAnswerCard} = await import("../presentation.js");
+  const bridge = await runningBridge(t);
+  const result = {request_id:bridge.id,outcome:"uncertain"};
+  await assert.rejects(updateAnswerCard(bridge.api,config.route,{...bridge.binding,accountId:"other"},result),/does not match/);
+  await assert.rejects(updateAnswerCard(bridge.api,config.route,{...bridge.binding,conversationId:"C123"},result),/does not match/);
+  assert.equal(bridge.edits.length,0);
+});
+
+test("a live authenticated editor updates the original card without a native approval context or new delivery", async t => {
+  const {updateAnswerCard} = await import("../presentation.js");
+  const bridge = await runningBridge(t);
+  const edits = [];
+  await updateAnswerCard(bridge.api,config.route,bridge.binding,
+    {request_id:bridge.id,outcome:"confirmed"},async message=>edits.push(message));
+  assert.equal(bridge.edits.length,0);
+  assert.match(edits[0].text,/confirmed/);
+  assert.deepEqual(edits[0].blocks,[]);
+});
+
+test("restart recovery sends only one replacement for duplicate bound cards", async t => {
+  const bridge = await runningBridge(t,{events:[{id:"duplicate",type:"approval.updated",result:{request_id:"a".repeat(32)}}],cards:[
+    {channel:"slack",accountId:"default",conversationId:"D123",messageTs:"123.456"},
+    {channel:"slack",accountId:"default",conversationId:"D123",messageTs:"123.789"},
+  ]});
+  for(let i=0;i<20 && !bridge.calls.some(c=>c.method === "ack");i++)
+    await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(bridge.edits.length,1);
+});
+
+test("failed Slack edits leave background updates unacknowledged for later retry", async t => {
+  const bridge = await runningBridge(t,{events:[{id:"event-2",type:"approval.updated",result:{request_id:"a".repeat(32)}}]});
+  bridge.context.send = async()=> {throw new Error("Slack offline");};
+  for (let i=0;i<20;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(!bridge.calls.some(c=>c.method === "ack"));
+});
+
+test("progress is displayed before dispatch and contains no original option/retry buttons", async t => {
+  let first = true;
+  const bridge = await runningBridge(t,{onEdit:(message,calls)=> {
+    if (!first) return;
+    first = false;
+    assert.ok(!calls.some(c=>c.method === "dispatch_reserved"));
+    assert.match(message.text,/checking terminal acceptance/);
+    assert.deepEqual(message.blocks.at(-1).buttons.map(b=>b.label),["检查状态"]);
+  }});
+  await bridge.click(`${bridge.id}:0`);
+  assert.equal(first,false);
+  assert.ok(bridge.calls.some(c=>c.method === "dispatch_reserved"));
+});
+
+test("failure to show initial progress cannot submit a reserved terminal write", async t => {
+  const bridge = await runningBridge(t,{editFail:true});
+  await bridge.click(`${bridge.id}:0`);
+  assert.ok(bridge.calls.some(c=>c.method === "prepare_answer"));
+  assert.ok(!bridge.calls.some(c=>c.method === "dispatch_reserved"));
+  assert.match(bridge.edits.at(-1).error,/edit offline/);
+});
+
+test("a failed background edit does not block unrelated queued notifications", async t => {
+  let count = 0;
+  const id = "a".repeat(32);
+  const bridge = await runningBridge(t,{events:[
+    {id:"bad",type:"approval.updated",result:{request_id:id}},
+    {id:"good",type:"approval.updated",result:{request_id:id}},
+  ],update:async()=> {if (++count === 1) throw new Error("gone");}});
+  for(let i=0;i<20 && !bridge.calls.some(c=>c.method === "ack");i++)
+    await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(bridge.calls.filter(c=>c.method === "ack").map(c=>c.params.event_id),["good"]);
+});
