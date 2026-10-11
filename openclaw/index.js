@@ -63,9 +63,13 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
             }
             const events = await call("events");
             let deferred;
-            for (const event of events) {
+            for (let event of events) {
               if (stopping) break;
               try {
+                if (["approval.requested","agent.blocked","question.requested"].includes(event.type)) {
+                  event = await call("event_for_delivery",{event_id:event.id});
+                  if (!event) continue; // Handled locally or deferred: do not deliver/ack.
+                }
                 if (event.type === "approval.updated") {
                   const requestId = event.result.request_id;
                   const {cards,result} = await call("result_cards", {request_id:requestId});

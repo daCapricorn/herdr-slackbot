@@ -31,6 +31,10 @@ Confirmation requires two observations of a durable Codex user message containin
 
 Notifications are top-level DM messages. One header shows the Herdr name/tab label, actual model and cwd. A rule-based summary follows in inline-code highlighting, then captured terminal evidence and approval controls. Session ambiguity shows an unknown model rather than a configured default. Terminal capture is visible evidence, not an archive of all off-screen history.
 
+Approval cards, unsupported blocked-dialog notices and Codex async question cards wait **10 seconds from first discovery**. Bridge retains the pending request immediately, but releases its notification only if the same request is still unresolved. Local answers, turn completion, expiry or replacement cancel the queued card. A replacement request starts its own delay; duplicate scans and Gateway restarts preserve the existing deadline. Live-read failures defer delivery until evidence is available. Completion notices and answer-result updates have no added delay. The five-second delivery poll can make a card arrive a few seconds after the deadline; this is a minimum grace period, not an exact phone push timer.
+
+The plugin asks the worker to recheck each attention event again immediately before OpenClaw handoff. Delayed events do not occupy the ready batch ahead of completion/results. This read-and-send sequence cannot eliminate a local answer racing with an already-started provider request.
+
 The outbound queue retries delivery until acknowledgement. An ambiguous provider result may duplicate a card; copies share a request ID. Message delivery is at least once, while terminal mutations are never automatically replayed.
 
 During a Gateway process, background results use the authenticated callback editor to update the original card. Editors are not persisted. After restart or editor eviction, a new recovery card carries the same request ID and eligible controls through OpenClaw's portable sender. SQLite stores card locations and latest result events, without response URLs or provider tokens. Results are acknowledged in the outbox only after edit/delivery succeeds.

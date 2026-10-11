@@ -170,7 +170,7 @@ def bridge(tmp_path):
     client, source = Client(), QuestionSource()
     client.info.update(cwd="/project", agent_status="working")
     client.screen = COLLAPSED
-    bridge = Bridge(client, tmp_path / "bridge.sqlite", question_source=source,
+    bridge = Bridge(client, tmp_path / "bridge.sqlite", question_source=source, notification_delay=0,
                     confirmation_timeout=0.02, confirmation_interval=0.001)
     yield client, source, bridge
     bridge.close()
