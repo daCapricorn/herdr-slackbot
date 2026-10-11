@@ -209,6 +209,13 @@ class Bridge:
                  "agent": self._public_agent(agent), **fields}
         if kind in ATTENTION_EVENTS:
             event["notify_after"] = event["at"] + self.notification_delay
+        if kind in ("approval.requested", "question.requested"):
+            # Keep display evidence after the delivery event is acknowledged.
+            rec = fields["request"]
+            context = {k: event[k] for k in ("type", "agent", "text", "summary") if k in event}
+            context["request"] = {k: rec[k] for k in ("id", "options", "expires_at", "question") if k in rec}
+            rec["card_context"] = context
+            self.db.execute("UPDATE approvals SET record=? WHERE id=?", (json.dumps(rec), rec["id"]))
         self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event["id"], json.dumps(event)))
         return event
 
@@ -594,6 +601,7 @@ class Bridge:
         retryable = (state in ("unconfirmed", "reserved") and verification.get("retryable") is True
                      and rec["id"] not in self.active and self.clock() < rec["expires_at"])
         return {"request_id": rec["id"], "kind": rec.get("kind", "approval"),
+                "card_context": rec.get("card_context"),
                 "outcome": "checking" if rec["id"] in self.active else ("not_sent" if state == "reserved" else state),
                 "option": label, "option_index": selected, "verification": verification,
                 "attempt_id": rec.get("dispatch", {}).get("attempt_id"),

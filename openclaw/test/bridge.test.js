@@ -115,6 +115,31 @@ test("unconfirmed cards expose separate read-only check and attempt-bound retry 
   await assert.rejects(answerEdit(api,config.route,{request_id:id,outcome:"uncertain"}),/native recovery controls/);
 });
 
+test("checking and confirmed edits retain original context while replacing choice buttons",async()=> {
+  const {answerPayload,answerEdit}=await import("../presentation.js");
+  const id="a".repeat(32);
+  const card_context={type:"approval.requested",agent:{name:"pane-name",model:"model",cwd:"/project"},
+    text:"original transcript\n$ uname -s",summary:"original summary",
+    request:{id,expires_at:200,options:[{index:0,label:"Yes"}]}};
+  const api={runtime:{config:{current:()=>({})},channel:{outbound:{loadAdapter:async()=>({
+    renderPresentation:({payload})=>({channelData:{slack:{renderedPresentationSegments:[{kind:"blocks",blocks:payload.presentation.blocks}]}}})
+  })}}}};
+  for(const type of ["approval.requested","question.requested"])
+  for(const outcome of ["checking","unconfirmed","confirmed"]) {
+    const context={...card_context,type,request:{...card_context.request,question:{title:"Original question"}}};
+    const result={request_id:id,outcome,option:"Yes",card_context:context};
+    const payload=answerPayload(result);
+    assert.equal(payload.presentation.title,"pane-name · model · /project");
+    assert.equal(payload.presentation.blocks[0].text,"`original summary`");
+    assert.ok(payload.presentation.blocks.some(b=>b.text?.includes("original transcript")));
+    const buttons=payload.presentation.blocks.filter(b=>b.type === "buttons").flatMap(b=>b.buttons);
+    assert.ok(!buttons.some(b=>b.action.value === `herdr-bridge:${id}:0`));
+    assert.equal(buttons.length,outcome === "confirmed" ? 0 : 1);
+    const edited=await answerEdit(api,config.route,result);
+    assert.deepEqual(edited.blocks,payload.presentation.blocks);
+  }
+});
+
 async function runningBridge(t, initial = {}) {
   const {registerBridge} = await import("../index.js");
   const {mkdtemp, rm} = await import("node:fs/promises");
