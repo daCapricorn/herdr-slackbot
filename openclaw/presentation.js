@@ -106,7 +106,9 @@ export function answerText(result) {
 
 export function answerPayload(result) {
   const text = answerText(result);
-  const blocks = [{type:"text",text}];
+  const original = result.card_context ? eventPayload(result.card_context) : null;
+  const blocks = original ? original.presentation.blocks.filter(b=>b.type !== "buttons") : [];
+  blocks.splice(original ? 1 : 0,0,{type:"text",text});
   if (result.outcome !== "confirmed") {
     const buttons = [{label:"检查状态",action:{type:"callback",value:`herdr-bridge:check:${result.request_id}`}}];
     if (result.retry_token) {
@@ -117,12 +119,13 @@ export function answerPayload(result) {
     }
     blocks.push({type:"buttons",buttons});
   }
-  return {text,presentationTextMode:"fallback",presentation:{blocks}};
+  return {text:original ? `${original.text}\n${text}` : text,presentationTextMode:"fallback",presentation:{
+    ...(original ? {title:original.presentation.title,tone:result.outcome === "confirmed" ? "success" : "warning"} : {}),blocks}};
 }
 
 // OpenClaw 2026.9.9 renders native Slack edit blocks as presentation segments.
 export async function answerEdit(api, route, result) {
-  if (result.outcome === "confirmed") return {text:answerText(result),blocks:[]};
+  if (result.outcome === "confirmed" && !result.card_context) return {text:answerText(result),blocks:[]};
   const adapter = await api.runtime.channel.outbound.loadAdapter(route.channel);
   const cfg = api.runtime.config.current();
   const payload = answerPayload(result);

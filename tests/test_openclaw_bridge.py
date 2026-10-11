@@ -63,6 +63,23 @@ def test_discovery_is_durable_and_ack_only_removes_outbox(setup, tmp_path):
     second.close()
 
 
+def test_card_context_survives_delivery_ack_terminal_change_and_restart(setup, tmp_path):
+    client, bridge = setup
+    token = request(client, bridge)
+    event = bridge.events()[0]
+    bridge.ack(event["id"])
+    client.screen = "new terminal contents"
+    reopened = Bridge(client, tmp_path / "bridge.sqlite", clock=lambda: 100)
+    try:
+        context = reopened.result_cards(token)["result"]["card_context"]
+        assert context["text"] == event["text"]
+        assert context["agent"] == event["agent"]
+        assert context["request"]["options"] == event["request"]["options"]
+        assert "card_context" not in context["request"]
+    finally:
+        reopened.close()
+
+
 def test_answer_one_shot_survives_restart(setup, tmp_path):
     client, bridge = setup
     token = request(client, bridge)
