@@ -48,7 +48,20 @@ Runtime inspection should show the `herdr` command, `herdr-bridge` service and t
 
 The Gateway supervises the Python worker and stores the SQLite request/outbox database in its service state directory. Do not start a second worker against the same state. Logs go through OpenClaw; callback logs include the request ID and option index without command contents.
 
-## Use the OpenClaw bot DM
+## Enable one private channel per pane
+
+Add `groups:write` and `groups:write.invites` to the bot scopes, retain `groups:read`, and reinstall the Slack App. Enable with:
+
+```bash
+openclaw config set plugins.entries.herdr-bridge.config.paneChannels '{"enabled":true,"prefix":"herdr"}'
+openclaw gateway restart
+```
+
+Every pane, including shells, gets a private channel. Configured owners are invited before it becomes a delivery destination. Names follow pane/tab labels and retain an identity suffix. Renames and terminal moves preserve channel IDs. `/herdr channels` in the DM shows bindings. `/herdr read`, `/herdr pending` and `/herdr send <prompt>` in a pane channel infer that pane; explicit cross-pane targets are rejected. Questions still use their exact request ID with `/herdr reply`. Closing a pane retains history; `/herdr archive` in its channel explicitly archives it. Ordinary channel prose is not automatically submitted to the terminal. Full conversation streaming is deferred.
+
+OpenClaw sends all messages and handles interactions. A narrow Slack management adapter uses the current resolved OpenClaw bot token in memory for creation, invitation, naming and topic metadata. There is no separate Bridge credential. The selected account must use bot identity. Owner mentions accompany new pane notifications; actual mobile push remains subject to your Slack settings. The 10-second grace period applies to pending attention events, not completion or answer-result updates.
+
+## Use the OpenClaw bot DM or pane channel
 
 | Text command | Behavior |
 |---|---|
@@ -76,7 +89,7 @@ Unknown dialogs, multi-select, typed approval inputs and file-backed plans need 
 
 ## Codex Queued follow-up inputs
 
-Codex CLI async questions can remain queued while the agent works, without a Herdr `blocked` transition. Bridge scans structured session evidence every five seconds and forwards each question independently to the configured DM. The card keeps the full question, full suggestion labels and terminal capture. Click a suggestion, or send `/herdr reply <request-id> <your answer>` for free text. Neither discovery nor delivery opens the local menu or answers automatically.
+Codex CLI async questions can remain queued while the agent works, without a Herdr `blocked` transition. Bridge scans structured session evidence every five seconds and forwards each question independently to its pane channel, or the configured DM when pane channels are disabled. The card keeps the full question, full suggestion labels and terminal capture. Click a suggestion, or send `/herdr reply <request-id> <your answer>` for free text. Neither discovery nor delivery opens the local menu or answers automatically.
 
 The adapter has been checked against Codex CLI **0.162.1**. The Gateway worker needs read access to the same user's `CODEX_HOME` (default `~/.codex`), including its state database and rollout files. An exact Herdr session ID takes precedence. Otherwise there must be only one live Codex pane and one unarchived non-subagent Codex session for that directory; session ambiguity disables discovery/dispatch.
 

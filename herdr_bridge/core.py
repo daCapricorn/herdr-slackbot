@@ -14,6 +14,7 @@ from .dialog import KIND_UNKNOWN, keys_for, parse_dialog
 from .events import session_of
 from .metadata import session_model
 from .questions import CodexQuestionSource, QuestionUnavailable, fingerprint as question_fingerprint, input_plan
+from .channels import PaneChannels
 
 log = logging.getLogger(__name__)
 CONSUMED_STATES = {"reserved", "dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
@@ -80,6 +81,90 @@ class Bridge:
                PRIMARY KEY(request_id, binding));
         """)
         self.lock = threading.RLock()
+        self.channels = PaneChannels(self.db)
+        self.db.commit()
+
+    def pane_channels(self, account_id):
+        panes = self.client.list_panes()
+        tabs = {t["tab_id"]: t for w in self.client.list_workspaces()
+                for t in self.client.list_tabs(w["workspace_id"])}
+        agents = self.client.list_agents()
+        by_pane = {a["pane_id"]: a for a in agents}
+        metadata = []
+        for pane in panes:
+            agent = by_pane.get(pane["pane_id"])
+            display = self._public_agent(agent, agents) if agent else pane
+            metadata.append({**pane, "name": pane.get("name") or pane.get("label")
+                             or tabs.get(pane.get("tab_id"), {}).get("label")
+                             or display.get("name") or pane["pane_id"], "model": display.get("model")})
+        with self.lock, self.db:
+            return self.channels.reconcile(account_id, metadata)
+
+    def channel_provisioned(self, binding_id, channel_id, team_id):
+        if not isinstance(channel_id, str) or not channel_id.startswith(("C", "G")):
+            raise BridgeError("Expected a Slack channel ID")
+        with self.lock, self.db:
+            rec = self.channels.get(binding_id)
+            if rec.get("channel_id") and (rec["channel_id"] != channel_id or rec.get("team_id") != team_id):
+                raise BridgeError("Pane already has another channel binding")
+            other = self.channels.from_channel(rec["account_id"], channel_id)
+            if other and other["id"] != binding_id:
+                raise BridgeError("Slack channel already belongs to another pane")
+            rec.update(channel_id=channel_id, team_id=team_id, state="provisioning")
+            return self.channels.save(rec)
+
+    def channel_ready(self, binding_id, channel_name, topic):
+        with self.lock, self.db:
+            rec = self.channels.get(binding_id)
+            if not rec.get("channel_id"):
+                raise BridgeError("Channel has not been created")
+            rec.update(state="ready", channel_name=channel_name, topic=topic)
+            return self.channels.save(rec)
+
+    def channel_archived(self, binding_id):
+        with self.lock, self.db:
+            rec = self.channels.get(binding_id)
+            if not rec.get("closed"):
+                raise BridgeError("Close the Herdr pane before archiving its channel")
+            rec["state"] = "archived"
+            return self.channels.save(rec)
+
+    def pane_for_channel(self, account_id, conversation_id):
+        with self.lock:
+            return self.channels.from_channel(account_id, conversation_id)
+
+    def route_event(self, event_id, account_id):
+        with self.lock, self.db:
+            row = self.db.execute("SELECT event FROM outbox WHERE id=?", (event_id,)).fetchone()
+            if not row:
+                return None
+            event = json.loads(row[0])
+            if event["type"] == "approval.updated":
+                rec, _ = self._record(event["result"]["request_id"])
+                return rec.get("delivery_route")
+            if event.get("route"):
+                return event["route"]
+            a = event["agent"]
+            route = self.channels.route(account_id, a["pane_id"], a.get("terminal_id"))
+            if route:
+                event["route"] = route
+                self.db.execute("UPDATE outbox SET event=? WHERE id=?", (json.dumps(event), event_id))
+                if event.get("request"):
+                    rec, _ = self._record(event["request"]["id"])
+                    rec["delivery_route"] = route
+                    self.db.execute("UPDATE approvals SET record=? WHERE id=?", (json.dumps(rec), rec["id"]))
+            return route
+
+    def authorize_request(self, request_id, account_id, conversation_id):
+        with self.lock:
+            rec, _ = self._record(request_id)
+            route = rec.get("delivery_route")
+            if route:
+                if route["accountId"] != account_id or route["conversationId"] != conversation_id:
+                    raise BridgeError("Request belongs to a different pane channel")
+            elif not isinstance(conversation_id, str) or not conversation_id.startswith("D"):
+                raise BridgeError("Legacy requests can only be answered in Slack DM")
+            return {"pane_id": rec["pane_id"]}
 
     def status(self):
         agents = self.client.list_agents()
@@ -253,12 +338,17 @@ class Bridge:
                 "SELECT record FROM approvals WHERE state='pending'")
                     if json.loads(r[0])["expires_at"] > self.clock()]
 
-    def events(self):
+    def events(self, account_id=None):
         self.pending()  # Retire cards whose pane has already advanced.
         with self.lock, self.db:
             ready = []
             for (raw,) in self.db.execute("SELECT event FROM outbox ORDER BY rowid").fetchall():
-                event = self._event_for_delivery(json.loads(raw))
+                queued = json.loads(raw)
+                if account_id and queued["type"] != "approval.updated":
+                    a = queued["agent"]
+                    if not queued.get("route") and not self.channels.route(account_id, a["pane_id"], a.get("terminal_id")):
+                        continue
+                event = self._event_for_delivery(queued)
                 if event:
                     ready.append(event)
                     if len(ready) == 20:
@@ -592,10 +682,10 @@ class Bridge:
         # Called only by the authorized OpenClaw handler; no response URLs/tokens.
         fields = {k: binding[k] for k in ("channel", "accountId", "conversationId", "messageTs")}
         if (fields["channel"] != "slack" or not all(isinstance(v, str) and v for v in fields.values())
-                or not fields["conversationId"].startswith("D")):
-            raise BridgeError("Approval result cards require a Slack DM")
+                or not fields["conversationId"].startswith(("D", "C", "G"))):
+            raise BridgeError("Approval result cards require a Slack conversation")
         with self.lock, self.db:
-            self._record(request_id)
+            self.authorize_request(request_id, fields["accountId"], fields["conversationId"])
             self.db.execute("INSERT OR IGNORE INTO cards VALUES (?, ?)",
                             (request_id, json.dumps(fields, sort_keys=True)))
         return {"bound": request_id}

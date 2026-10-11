@@ -136,8 +136,9 @@ export async function answerEdit(api, route, result) {
 
 export async function updateAnswerCard(api, route, binding, result, edit, signal) {
   if (binding.channel !== route.channel || binding.accountId !== route.accountId
-      || !/^D[A-Z0-9]+$/.test(binding.conversationId) || !/^\d+\.\d+$/.test(binding.messageTs))
-    throw new Error("Approval card binding does not match this Slack DM route");
+      || !/^[DCG][A-Z0-9]+$/.test(binding.conversationId) || !/^\d+\.\d+$/.test(binding.messageTs)
+      || (!binding.conversationId.startsWith("D") && route.to !== `channel:${binding.conversationId}`))
+    throw new Error("Approval card binding does not match this Slack conversation route");
   if (edit) {
     await edit(await answerEdit(api, route, result));
     return;
