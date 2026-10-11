@@ -286,3 +286,19 @@ def test_review1_cli_timeout_is_unknown_outcome(monkeypatch):
     monkeypatch.setattr(hc.subprocess, "run", slow)
     with pytest.raises(HerdrOutcomeUnknown):
         CliTransport(timeout=1).request("agent.prompt", {"target": "a", "text": "x"})
+
+
+def test_encoded_pane_submission_uses_one_rpc_and_is_not_read_only():
+    calls = []
+    class Transport:
+        def request(self, method, params):
+            calls.append((method, params))
+            return {"type": "ok"}
+    client = HerdrClient(Transport())
+    text = '<send_user_message_question_reply>\n[{"answer":"purple"}]\n</send_user_message_question_reply>'
+    assert client.submit_pane('w4:p2', text) == {"type": "ok"}
+    assert calls == [('pane.send_input', {'pane_id':'w4:p2', 'text':text, 'keys':['enter']})]
+    assert 'pane.send_input' not in hc.READ_ONLY_METHODS
+    assert cli_args('pane.send_input', {'pane_id':'w4:p2', 'text':text, 'keys':['enter']}) == ['pane','run','w4:p2',text]
+    with pytest.raises(ValueError):
+        cli_args('pane.send_input', {'pane_id':'w4:p2', 'text':text, 'keys':['enter','enter']})

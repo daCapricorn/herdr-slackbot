@@ -76,7 +76,7 @@ READ_ONLY_METHODS = frozenset({
 
 # Requests whose CLI prints nothing on success (`herdr pane send-text`; verified live on 0.8.2,
 # while `agent send-keys` prints the usual {"result": {"type": "ok"}} envelope).
-SILENT_CLI_METHODS = frozenset({"pane.send_text"})
+SILENT_CLI_METHODS = frozenset({"pane.send_text", "pane.send_input"})
 
 
 def pipe_path(socket_path: str) -> str:
@@ -338,6 +338,10 @@ def cli_args(method: str, params: dict) -> list[str]:
         return args
     if method == "agent.send_keys":
         return ["agent", "send-keys", p["target"], *p["keys"]]
+    if method == "pane.send_input":
+        if p.get("keys") != ["enter"]:
+            raise ValueError("CLI pane submission supports text followed by one Enter only")
+        return ["pane", "run", p["pane_id"], p["text"]]
     if method == "pane.send_text":
         # Positional on purpose: the CLI types a `--` separator literally, and text starting with
         # `-` is typed correctly without one (both verified live on 0.8.2).
@@ -539,6 +543,10 @@ class HerdrClient:
     def send_text(self, pane_id: str, text: str) -> dict:
         """Type literal text into a pane (no Enter)."""
         return self.request("pane.send_text", {"pane_id": pane_id, "text": text})
+
+    def submit_pane(self, pane_id: str, text: str) -> dict:
+        """One encoded paste plus Enter; caller must validate the exact input UI."""
+        return self.request("pane.send_input", {"pane_id": pane_id, "text": text, "keys": ["enter"]})
 
     # --- events ------------------------------------------------------------
     def subscribe(self, subscriptions: list[dict]) -> EventStream:

@@ -123,7 +123,7 @@ async function runningBridge(t, initial = {}) {
   const id = "a".repeat(32), attempt = "b".repeat(32);
   const binding = {channel:"slack",accountId:"default",conversationId:"D123",messageTs:"123.456"};
   const registrations = {}, calls = [], edits = [];
-  let result = {request_id:id,outcome:"unconfirmed",attempt_id:attempt,retry_token:attempt,option:"Yes"};
+  let result = {request_id:id,outcome:"unconfirmed",attempt_id:attempt,retry_token:attempt,option:"Yes",...initial.result};
   const worker = {child:{exitCode:null},start(){},async stop(){}, async call(method,params) {
     calls.push({method,params});
     if (initial.call) return initial.call(method,params,result);
@@ -275,4 +275,55 @@ test("a failed background edit does not block unrelated queued notifications", a
   for(let i=0;i<20 && !bridge.calls.some(c=>c.method === "ack");i++)
     await new Promise(resolve=>setImmediate(resolve));
   assert.deepEqual(bridge.calls.filter(c=>c.method === "ack").map(c=>c.params.event_id),["good"]);
+});
+
+test("async question cards retain the full title/options and offer exact choices plus a freeform command", () => {
+  const id = "c".repeat(32), full = "Long question option ".repeat(30);
+  const payload = eventPayload({type:"question.requested",agent:{name:"pane",model:"codex",cwd:"/project"},
+    summary:"Which label?",text:"• Working\n? 1 question",request:{id,expires_at:100,
+      question:{title:"Which label?"},options:[{index:0,label:full},{index:1,label:"Green"}]}});
+  assert.equal(payload.presentation.blocks[0].text,"`Which label?`");
+  assert.equal(payload.presentation.blocks[1].text,"Which label?");
+  assert.ok(payload.presentation.blocks[2].text.includes(full));
+  assert.ok(payload.presentation.blocks.some(b=>b.text?.includes(`/herdr reply ${id}`)));
+  assert.equal(payload.presentation.blocks.at(-1).buttons[1].action.value,`herdr-bridge:${id}:1`);
+  const free = eventPayload({type:"question.requested",agent:{},text:"",request:{id,
+    question:{title:"Your answer?"},options:[]}});
+  assert.ok(!free.presentation.blocks.some(b=>b.type === "buttons"));
+  assert.ok(free.presentation.blocks.some(b=>b.text?.includes(`/herdr reply ${id}`)));
+});
+
+test("question success requires recorded answer, not approval closure or a dispatch receipt", () => {
+  assert.match(answerText({kind:"codex_question",option:"Purple",outcome:"confirmed"}),/Codex recorded the answer/);
+  for (const outcome of ["checking","unconfirmed","uncertain","dispatched"])
+    assert.ok(!answerText({kind:"codex_question",outcome}).includes("✅"));
+});
+
+test("owner freeform replies pass exact request/text and unauthorized commands never reach worker", async t => {
+  const bridge = await runningBridge(t);
+  await bridge.registrations.command.handler({...trusted,args:`reply ${bridge.id} custom\nanswer`});
+  assert.deepEqual(bridge.calls.find(c=>c.method === "answer"),{
+    method:"answer",params:{request_id:bridge.id,answer_text:"custom\nanswer"}});
+  const count = bridge.calls.length;
+  const denied = await bridge.registrations.command.handler({...trusted,senderId:"U2",args:`reply ${bridge.id} no`});
+  assert.match(denied.text,/not authorized/);
+  assert.equal(bridge.calls.length,count);
+});
+
+test("question choice shows checking before dispatch and confirms using question semantics", async t => {
+  const bridge = await runningBridge(t,{result:{kind:"codex_question",option:"Purple"},onEdit:(message,calls)=> {
+    if (!calls.some(c=>c.method === "dispatch_reserved")) assert.match(message.text,/checking question acceptance/);
+  }});
+  await bridge.click(`${bridge.id}:0`);
+  assert.match(bridge.edits.at(-1).text,/question is still pending/);
+  assert.equal(bridge.calls.filter(c=>c.method === "dispatch_reserved").length,1);
+});
+
+test("a text question reply without a bound interactive card still delivers its durable follow-up", async t => {
+  const bridge = await runningBridge(t,{cards:[],result:{kind:"codex_question",outcome:"confirmed"},
+    events:[{id:"text-answer",type:"approval.updated",result:{request_id:"a".repeat(32)}}]});
+  for(let i=0;i<20 && !bridge.calls.some(c=>c.method === "ack");i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(bridge.edits.length,1);
+  assert.match(bridge.edits[0].payload.text,/Codex recorded the answer/);
+  assert.equal(bridge.calls.at(-1).method,"ack");
 });

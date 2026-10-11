@@ -13,6 +13,7 @@ from pathlib import Path
 from .dialog import KIND_UNKNOWN, keys_for, parse_dialog
 from .events import session_of
 from .metadata import session_model
+from .questions import CodexQuestionSource, QuestionUnavailable, fingerprint as question_fingerprint, input_plan
 
 log = logging.getLogger(__name__)
 CONSUMED_STATES = {"reserved", "dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
@@ -52,12 +53,14 @@ def current_dialog(screen, kind):
 class Bridge:
     def __init__(self, client, state_path, *, clock=time.time, approval_ttl=900,
                  monotonic=time.monotonic, sleep=time.sleep,
-                 confirmation_timeout=5.0, confirmation_interval=0.2, followup_timeout=120):
+                 confirmation_timeout=5.0, confirmation_interval=0.2, followup_timeout=120,
+                 question_source=None):
         self.client, self.clock, self.approval_ttl = client, clock, approval_ttl
         self.monotonic, self.sleep = monotonic, sleep
         self.confirmation_timeout = confirmation_timeout
         self.confirmation_interval = confirmation_interval
         self.followup_timeout = followup_timeout
+        self.question_source = question_source or CodexQuestionSource()
         self.active = set()
         self.sending = {}  # pane -> request, only terminal writes/initial confirmation
         Path(state_path).parent.mkdir(parents=True, exist_ok=True)
@@ -122,6 +125,7 @@ class Bridge:
 
     def discover(self, info):
         """Recover already-blocked agents; repeat scans also catch a redrawn dialog."""
+        questions = self.discover_questions(info)
         if info.get("agent_status") != "blocked":
             return
         pane = info["pane_id"]
@@ -132,11 +136,21 @@ class Bridge:
             return
         kind = info.get("agent")
         dialog = current_dialog(screen, kind)
+        if questions and dialog is None:
+            for question in questions.values():
+                try:
+                    input_plan(screen, question, 0 if question["options"] else None,
+                               question["options"][0] if question["options"] else "", list(questions))
+                except QuestionUnavailable:
+                    continue
+                return  # A verified expanded/collapsed async input already has its own card.
         fingerprint = dialog.fingerprint if dialog else None
         with self.lock, self.db:
             rows = self.db.execute("SELECT id, record, state FROM approvals").fetchall()
             for request_id, raw, state in rows:
                 rec = json.loads(raw)
+                if rec.get("kind") == "codex_question":
+                    continue
                 if rec["pane_id"] != pane:
                     continue
                 same_generation = (tuple(rec["identity"]) == identity(info)
@@ -163,6 +177,42 @@ class Bridge:
             self._queue("approval.requested" if options else "agent.blocked", info,
                         request=rec, text=screen)
 
+    def _question_snapshot(self, info, agents=None):
+        agents = self.client.list_agents() if agents is None else agents
+        unique = sum(a.get("agent") == "codex" and a.get("cwd") == info.get("cwd") for a in agents) == 1
+        return self.question_source.snapshot(info, unique_workspace=unique)
+
+    def discover_questions(self, info):
+        if info.get("agent") != "codex":
+            return {}
+        try:
+            snapshot = self._question_snapshot(info)
+        except QuestionUnavailable:
+            return {}
+        if not snapshot["pending"]:
+            return {}
+        screen = self.client.read_agent_once(info["pane_id"], 160, source="visible")
+        fresh = self._agent(info["pane_id"])
+        if identity(fresh) != identity(info):
+            return {}
+        with self.lock, self.db:
+            for question in snapshot["pending"].values():
+                fp = question_fingerprint(question)
+                rows = self.db.execute("SELECT record,state FROM approvals").fetchall()
+                if any(json.loads(raw).get("kind") == "codex_question"
+                       and tuple(json.loads(raw)["identity"]) == identity(info)
+                       and json.loads(raw)["pane_id"] == info["pane_id"]
+                       and json.loads(raw)["fingerprint"] == fp and state != "superseded" for raw, state in rows):
+                    continue
+                rec = {"id": uuid.uuid4().hex, "kind": "codex_question", "question": question,
+                       "pane_id": info["pane_id"], "identity": identity(info),
+                       "sequence": info.get("state_change_seq"), "fingerprint": fp,
+                       "created_at": self.clock(), "expires_at": self.clock() + self.approval_ttl,
+                       "options": [{"index": i, "label": o} for i, o in enumerate(question["options"])]}
+                self.db.execute("INSERT INTO approvals VALUES (?, ?, 'pending')", (rec["id"], json.dumps(rec)))
+                self._queue("question.requested", info, request=rec, text=screen, summary=question["title"])
+        return snapshot["pending"]
+
     def transition(self, transition):
         if transition.ended or not transition.info:
             return
@@ -182,6 +232,15 @@ class Bridge:
             for request_id, raw in self.db.execute("SELECT id, record FROM approvals WHERE state='pending'").fetchall():
                 rec = json.loads(raw)
                 info = live.get(rec["pane_id"])
+                if rec.get("kind") == "codex_question" and info and identity(info) == tuple(rec["identity"]):
+                    try:
+                        question = self._question_snapshot(info, list(live.values()))["pending"].get(rec["question"]["id"])
+                    except QuestionUnavailable:
+                        continue  # A failed read is not proof of expiry; dispatch still fails closed.
+                    if question and question_fingerprint(question) == rec["fingerprint"]:
+                        continue
+                    self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request_id,))
+                    continue
                 if (not info or identity(info) != tuple(rec["identity"])
                         or info.get("agent_status") != "blocked"
                         or info.get("state_change_seq") != rec.get("sequence")):
@@ -207,15 +266,15 @@ class Bridge:
             self.db.execute("DELETE FROM outbox WHERE id=?", (event_id,))
         return {"acknowledged": event_id}
 
-    def answer(self, request_id, option):
-        prepared = self.prepare_answer(request_id, option=option)
+    def answer(self, request_id, option=None, answer_text=None):
+        prepared = self.prepare_answer(request_id, option=option, answer_text=answer_text)
         if prepared.pop("ready_to_dispatch"):
             return self.dispatch_reserved(request_id, prepared["attempt_id"])
         if prepared["outcome"] in ("checking", "confirmed"):
             return prepared
         return self.check(request_id)
 
-    def prepare_answer(self, request_id, option=None, retry_from=None):
+    def prepare_answer(self, request_id, option=None, retry_from=None, answer_text=None):
         """Reserve a human choice without writing, so OpenClaw can show progress first."""
         with self.lock:
             rec, state = self._record(request_id)
@@ -230,19 +289,25 @@ class Bridge:
                         return {**self._result(rec, state), "outcome": "checking", "ready_to_dispatch": True}
                     raise BridgeError("Retry is stale or acceptance is unknown; check status first. Nothing was sent")
                 option = rec["dispatch"]["option"]
-                self._reserve(rec, option)
+                self._reserve(rec, option, rec["dispatch"].get("answer") if option is None else None)
             else:
-                if type(option) is not int or option not in {o["index"] for o in rec["options"]}:
+                custom = rec.get("kind") == "codex_question" and answer_text is not None and option is None
+                if custom:
+                    if not isinstance(answer_text, str) or not answer_text.strip() or len(answer_text) > 8000:
+                        raise BridgeError("Question answer must contain 1–8000 characters; nothing was sent")
+                    answer_text = answer_text.strip()
+                elif answer_text is not None or type(option) is not int or option not in {o["index"] for o in rec["options"]}:
                     raise BridgeError("Unsupported option; nothing was sent")
                 if state in CONSUMED_STATES:
-                    if option != rec.get("dispatch", {}).get("option"):
+                    if (option != rec.get("dispatch", {}).get("option")
+                            or custom and answer_text != rec["dispatch"].get("answer")):
                         raise BridgeError("A different option was already submitted; nothing was sent")
                     return {**self._result(rec, state),
                             "outcome": "checking" if state == "reserved" else self._result(rec, state)["outcome"],
                             "ready_to_dispatch": state == "reserved"}
                 if state != "pending":
                     raise BridgeError("Request was superseded; nothing was sent")
-                self._reserve(rec, option)
+                self._reserve(rec, option, answer_text)
             return {**self._result(rec, "reserved"), "outcome": "checking", "ready_to_dispatch": True}
 
     def dispatch_reserved(self, request_id, attempt_id):
@@ -252,7 +317,11 @@ class Bridge:
                 raise BridgeError("Submission is stale; nothing was sent")
             if state != "reserved":
                 return self._result(rec, state)  # A duplicate commit never writes again.
-            _, fresh = self._live_dialog(rec)  # The Slack edit may have taken seconds.
+            if rec.get("kind") == "codex_question":
+                plan, fresh = self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
+                rec["dispatch"].update(plan)
+            else:
+                _, fresh = self._live_dialog(rec)  # The Slack edit may have taken seconds.
             if rec["pane_id"] in self.sending:
                 raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
             rec["dispatch"].update(started_at=self.clock(), focused=fresh.get("focused"), revision=fresh.get("revision"))
@@ -295,14 +364,50 @@ class Bridge:
             raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
         self.sending[rec["pane_id"]] = rec["id"]
 
-    def _reserve(self, rec, option):
-        dialog, fresh = self._live_dialog(rec)
+    def _live_question(self, rec, option, answer):
+        if self.clock() >= rec["expires_at"]:
+            raise BridgeError("Request expired; nothing was sent")
+        info = self._agent(rec["pane_id"])
+        if identity(info) != tuple(rec["identity"]):
+            raise BridgeError("Agent changed; nothing was sent")
+        try:
+            snapshot = self._question_snapshot(info)
+            question = snapshot["pending"].get(rec["question"]["id"])
+            if not question or question_fingerprint(question) != rec["fingerprint"]:
+                raise BridgeError("Question was answered, expired or changed; nothing was sent")
+            screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
+            plan = input_plan(screen, question, option, answer, list(snapshot["pending"]))
+            fresh = self._agent(rec["pane_id"])
+            if (identity(fresh) != identity(info) or fresh.get("state_change_seq") != info.get("state_change_seq")
+                    or plan["mode"] == "prompt" and fresh.get("agent_status") not in ("working", "idle", "done", "blocked")):
+                raise BridgeError("Question input changed or an approval is open; nothing was sent")
+            if plan["mode"] == "prompt":
+                # Herdr can classify the collapsed async summary as blocked even
+                # though the main composer is visible and empty. agent.prompt
+                # rejects all blocked input; use one encoded pane submission only
+                # after the same exact question/composer checks, never as a retry.
+                plan["transport"] = "pane" if fresh.get("agent_status") == "blocked" else "agent"
+            # Recheck structured evidence after reading the terminal.
+            current = self._question_snapshot(fresh)["pending"].get(question["id"])
+            if not current or question_fingerprint(current) != rec["fingerprint"]:
+                raise BridgeError("Question changed before dispatch; nothing was sent")
+            return plan, fresh
+        except QuestionUnavailable as exc:
+            raise BridgeError(str(exc)) from exc
+
+    def _reserve(self, rec, option, answer_text=None):
+        if rec.get("kind") == "codex_question":
+            answer = answer_text if option is None else rec["question"]["options"][option]
+            plan, fresh = self._live_question(rec, option, answer)
+        else:
+            dialog, fresh = self._live_dialog(rec)
+            plan = {"keys": keys_for(dialog, option)}
         if rec["pane_id"] in self.sending:
             raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
         if rec.get("dispatch"):
             rec.setdefault("attempts", []).append(rec["dispatch"])
         rec["dispatch"] = {"attempt_id": uuid.uuid4().hex, "option": option,
-                           "keys": keys_for(dialog, option), "started_at": self.clock(),
+                           **plan, "started_at": self.clock(),
                            "focused": fresh.get("focused"), "revision": fresh.get("revision")}
         rec.pop("verification", None)
         rec.pop("watch_expired", None)
@@ -312,7 +417,13 @@ class Bridge:
     def _finish_dispatch(self, rec):
         try:
             try:
-                self.client.send_keys(rec["pane_id"], rec["dispatch"]["keys"])
+                if rec["dispatch"].get("mode") == "prompt":
+                    if rec["dispatch"].get("transport") == "pane":
+                        self.client.submit_pane(rec["pane_id"], rec["dispatch"]["text"])
+                    else:
+                        self.client.prompt_agent(rec["pane_id"], rec["dispatch"]["text"])
+                else:
+                    self.client.send_keys(rec["pane_id"], rec["dispatch"]["keys"])
                 rec["dispatch"]["acknowledged_at"] = self.clock()
             except Exception as exc:
                 # An ambiguous receipt is still consumed; observe, never auto-retry.
@@ -334,10 +445,13 @@ class Bridge:
     def _result(self, rec, state):
         selected = rec.get("dispatch", {}).get("option")
         label = next((o["label"] for o in rec["options"] if o["index"] == selected), "Selected option")
+        if rec.get("kind") == "codex_question":
+            label = rec.get("dispatch", {}).get("answer", label)
         verification = rec.get("verification", {})
         retryable = (state in ("unconfirmed", "reserved") and verification.get("retryable") is True
                      and rec["id"] not in self.active and self.clock() < rec["expires_at"])
-        return {"request_id": rec["id"], "outcome": "checking" if rec["id"] in self.active else ("not_sent" if state == "reserved" else state),
+        return {"request_id": rec["id"], "kind": rec.get("kind", "approval"),
+                "outcome": "checking" if rec["id"] in self.active else ("not_sent" if state == "reserved" else state),
                 "option": label, "option_index": selected, "verification": verification,
                 "attempt_id": rec.get("dispatch", {}).get("attempt_id"),
                 "retry_token": rec.get("dispatch", {}).get("attempt_id") if retryable else None,
@@ -374,7 +488,10 @@ class Bridge:
                 return self._result(rec, state)
             if state == "reserved":
                 try:
-                    self._live_dialog(rec)
+                    if rec.get("kind") == "codex_question":
+                        self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
+                    else:
+                        self._live_dialog(rec)
                     retryable = True
                 except Exception:
                     retryable = False
@@ -442,6 +559,8 @@ class Bridge:
         Require two consistent observations that the original approval is gone.
         Never send more keys, even if the original dialog remains unchanged.
         """
+        if rec.get("kind") == "codex_question":
+            return self._confirm_question(rec, timeout=timeout)
         start = self.monotonic()
         deadline = start + (self.confirmation_timeout if timeout is None else timeout)
         candidate = None
@@ -490,6 +609,51 @@ class Bridge:
                 "observation": observation,
                 "retryable": (reason == "dialog_still_open" and stable and status == "blocked"
                               and seq == rec.get("sequence"))}
+
+    def _confirm_question(self, rec, *, timeout=None):
+        start = self.monotonic()
+        deadline = start + (self.confirmation_timeout if timeout is None else timeout)
+        reason, retryable, seen = "not_observed", False, False
+        while True:
+            try:
+                info = self._agent(rec["pane_id"])
+                if identity(info) != tuple(rec["identity"]):
+                    reason = "agent_replaced"
+                    break
+                snapshot = self._question_snapshot(info)
+                if snapshot["thread_id"] != rec["question"]["thread_id"]:
+                    reason = "agent_replaced"
+                    break
+                answer = snapshot["answers"].get(rec["question"]["id"])
+                if answer is not None:
+                    if answer != rec["dispatch"]["answer"]:
+                        reason = "answered_differently"
+                        break
+                    if seen:
+                        return {"outcome": "confirmed", "reason": "question_answered", "retryable": False,
+                                "elapsed_ms": round((self.monotonic() - start) * 1000)}
+                    seen, reason = True, "answer_observed_once"
+                else:
+                    seen = False
+                    question = snapshot["pending"].get(rec["question"]["id"])
+                    if not question or question_fingerprint(question) != rec["fingerprint"]:
+                        reason = "question_expired"
+                        break
+                    reason = "question_still_pending"
+                    try:
+                        self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"]["answer"])
+                        retryable = True
+                    except Exception:
+                        retryable = False
+            except Exception:
+                reason, retryable, seen = "read_failed", False, False
+            remaining = deadline - self.monotonic()
+            if remaining <= 0:
+                break
+            self.sleep(min(self.confirmation_interval, remaining))
+        return {"outcome": "unconfirmed" if reason == "question_still_pending" else "uncertain",
+                "reason": reason, "retryable": retryable if reason == "question_still_pending" else False,
+                "elapsed_ms": round((self.monotonic() - start) * 1000)}
 
     def send(self, pane, text):
         with self.lock:

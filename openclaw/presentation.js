@@ -45,6 +45,11 @@ export function eventPayload(event) {
     { type: "text", text: "`" + summary.replaceAll("`", "'") + "`" },
     { type: "text", text: code(event.text) },
   ];
+  if (event.type === "question.requested") {
+    blocks.splice(1,0,{type:"text",text:request.question.title});
+    if (request.options.length) blocks.splice(2,0,{type:"text",text:request.options.map(o=>`${o.index + 1}. ${o.label}`).join("\n")});
+    blocks.push({type:"context",text:`可点选项，或发送 /herdr reply ${request.id} <你的回答>。问题会在当前 Codex 回合结束时失效。`});
+  }
   if (request?.options?.length) {
     blocks.push({ type: "context", text: `Request ${request.id} · expires ${new Date(request.expires_at * 1000).toISOString()}` });
     blocks.push({ type: "buttons", buttons: request.options.map((o) => ({
@@ -81,6 +86,13 @@ export async function deliver(api, route, payload, signal) {
 }
 export function answerText(result) {
   const option = String(result.option ?? "Selected option");
+  if (result.kind === "codex_question") {
+    if (result.outcome === "confirmed") return `✅ Herdr: ${option} — confirmed. Codex recorded the answer to this question.`;
+    if (["checking","dispatching"].includes(result.outcome)) return `⏳ Herdr: ${option} — checking question acceptance. Repeated clicks do not resend the answer.`;
+    if (result.outcome === "not_sent") return `⚠️ Herdr: ${option} — this attempt has not submitted an answer. Use Check status before submitting again.`;
+    if (result.outcome === "unconfirmed") return `⚠️ Herdr: ${option} — unconfirmed. The question is still pending. No answer was retried automatically.${result.watching ? " Background checks continue." : " Use Check status to inspect again."}`;
+    return `⚠️ Herdr: ${option} — question acceptance is unknown (${result.verification?.reason ?? "not_observed"}). No answer was retried automatically.`;
+  }
   if (result.outcome === "confirmed")
     return `✅ Herdr: ${option} — confirmed. The original approval has closed; command completion is not verified.`;
   if (["checking", "dispatching"].includes(result.outcome))
@@ -98,7 +110,9 @@ export function answerPayload(result) {
   if (result.outcome !== "confirmed") {
     const buttons = [{label:"检查状态",action:{type:"callback",value:`herdr-bridge:check:${result.request_id}`}}];
     if (result.retry_token) {
-      blocks.push({type:"context",text:"重新提交会再次发送同一选项；之前的按键仍可能延迟生效。"});
+      blocks.push({type:"context",text:result.kind === "codex_question"
+        ? "重新提交会再次发送同一回答；之前的输入仍可能延迟生效。"
+        : "重新提交会再次发送同一选项；之前的按键仍可能延迟生效。"});
       buttons.push({label:"重新提交",action:{type:"callback",value:`herdr-bridge:retry:${result.request_id}:${result.retry_token}`}});
     }
     blocks.push({type:"buttons",buttons});
