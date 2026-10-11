@@ -9,6 +9,7 @@
           "socketPath": "/Users/you/.config/herdr/herdr.sock",
           "herdrBin": "/absolute/path/to/herdr",
           "ownerIds": ["YOUR_SLACK_MEMBER_ID"],
+          "paneChannels": {"enabled": true, "prefix": "herdr"},
           "route": {"channel": "slack", "accountId": "default", "to": "user:YOUR_SLACK_MEMBER_ID"}
         }
       }

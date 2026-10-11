@@ -2,6 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Worker } from "./worker.js";
 import { answerText, answerPayload, answerEdit, updateAnswerCard, code, deliver, eventPayload, statusPayload } from "./presentation.js";
+import { SlackPaneChannels } from "./channels.js";
 
 export function authorized(config, ctx) {
   return (ctx.isAuthorizedSender ?? ctx.auth?.isAuthorizedSender) === true
@@ -10,9 +11,9 @@ export function authorized(config, ctx) {
     && config.ownerIds.includes(ctx.senderId);
 }
 
-export function registerBridge(api, workerFactory = (...args)=>new Worker(...args)) {
+export function registerBridge(api, workerFactory = (...args)=>new Worker(...args), channelFactory = (...args)=>new SlackPaneChannels(...args)) {
     let config = api.pluginConfig;
-    let worker, timer, busy = false, stopping = true, controller, pumping;
+    let worker, timer, busy = false, stopping = true, controller, pumping, paneChannels, synchronizing;
     const call = (method, params) => {
       if (!worker || stopping) throw new Error("Herdr bridge service is not running");
       return worker.call(method, params);
@@ -21,6 +22,16 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
       if (!authorized(config, ctx)) throw new Error("This channel/account/sender is not authorized for Herdr");
       ctx.assertOwnerCurrent?.();
     };
+    const sourceRoute = (ctx) => ({...config.route,to:ctx.conversationId?.startsWith("D")
+      ? config.route.to : `channel:${ctx.conversationId}`});
+    const contextPane = async (ctx) => {
+      if (!ctx.conversationId || ctx.conversationId.startsWith("D")) return null;
+      const binding = await call("pane_for_channel",{account_id:ctx.accountId,conversation_id:ctx.conversationId});
+      if (!binding) throw new Error("This Slack channel is not bound to a Herdr pane");
+      return binding;
+    };
+    const requestAllowed = (ctx, requestId) => call("authorize_request",{
+      request_id:requestId,account_id:ctx.accountId,conversation_id:ctx.conversationId});
     const edits = new Map();
     // Authenticated callback editors stay in memory; never persist response URLs.
     const cardEditors = new Map();
@@ -36,7 +47,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
     const editCurrentCard = (ctx, requestId) => serializeEdit({accountId:ctx.accountId,
       conversationId:ctx.conversationId,messageTs:ctx.interaction.messageTs}, async()=> {
       const {result} = await call("result_cards",{request_id:requestId});
-      await ctx.respond.editMessage(await answerEdit(api,config.route,result));
+      await ctx.respond.editMessage(await answerEdit(api,sourceRoute(ctx),result));
     });
     api.registerService({
       id: "herdr-bridge",
@@ -47,6 +58,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
         await mkdir(stateDir, { recursive: true, mode: 0o700 });
         stopping = false;
         controller = new AbortController();
+        paneChannels = config.paneChannels?.enabled ? channelFactory(api,config,call) : null;
         const startWorker = () => {
           worker = workerFactory(config, join(stateDir, "bridge.sqlite"), api.logger);
           worker.start();
@@ -61,7 +73,13 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
               if (stopping) return;
               startWorker();
             }
-            const events = await call("events");
+            if (paneChannels && !synchronizing) {
+              // Provisioning a new pane must not delay existing channels' events.
+              synchronizing = paneChannels.sync(controller.signal)
+                .catch(error => { if (!stopping) api.logger.warn(`Herdr pane discovery deferred: ${error.message}`); })
+                .finally(() => { synchronizing = undefined; });
+            }
+            const events = await call("events",paneChannels ? {account_id:config.route.accountId} : undefined);
             let deferred;
             for (let event of events) {
               if (stopping) break;
@@ -70,13 +88,22 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
                   event = await call("event_for_delivery",{event_id:event.id});
                   if (!event) continue; // Handled locally or deferred: do not deliver/ack.
                 }
+                let route = config.route;
+                if (paneChannels) {
+                  const destination = await call("route_event",{event_id:event.id,account_id:config.route.accountId});
+                  if (destination) {
+                    if (destination.accountId !== config.route.accountId || destination.team_id !== (await paneChannels.identity(controller.signal)).team_id)
+                      throw new Error("Event belongs to a different Slack account/workspace");
+                    route = destination;
+                  } else if (event.type !== "approval.updated") continue;
+                }
                 if (event.type === "approval.updated") {
                   const requestId = event.result.request_id;
                   const {cards,result} = await call("result_cards", {request_id:requestId});
                   // A text reply has no interactive editor. Its durable follow-up
                   // still needs a portable status message before outbox acknowledgement.
                   if (!cards.length && result.kind === "codex_question")
-                    await deliver(api,config.route,answerPayload(result),controller.signal);
+                    await deliver(api,route,answerPayload(result),controller.signal);
                   let recoverySent = false;
                   for (const binding of cards) {
                     if (stopping) break;
@@ -84,13 +111,24 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
                       const {result} = await call("result_cards",{request_id:requestId});
                       const edit = cardEditors.get(cardKey(binding));
                       if (!edit && recoverySent) return;
-                      await updateAnswerCard(api, config.route, binding, result, edit, controller.signal);
+                      await updateAnswerCard(api, route, binding, result, edit, controller.signal);
                       if (!edit) recoverySent = true;
                     });
                   }
                   if (stopping) break;
                 } else {
-                  await deliver(api, config.route, eventPayload(event), controller.signal);
+                  // Channel creation can take time. Recheck attention after it, too.
+                  if (paneChannels && event.request) {
+                    event = await call("event_for_delivery",{event_id:event.id});
+                    if (!event) continue;
+                  }
+                  const payload = eventPayload(event);
+                  if (paneChannels) {
+                    const mention = config.ownerIds.map(id=>`<@${id}>`).join(" ");
+                    payload.text = `${mention}\n${payload.text}`;
+                    payload.presentation.blocks.unshift({type:"text",text:mention});
+                  }
+                  await deliver(api, route, payload, controller.signal);
                 }
                 await call("ack", { event_id: event.id });
                 api.logger.info(`Herdr event delivered: ${event.type} ${event.id}`);
@@ -116,6 +154,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
         clearInterval(timer);
         controller?.abort();
         await pumping;
+        await synchronizing;
         await Promise.allSettled([...edits.values()]);
         cardEditors.clear();
         await worker?.stop();
@@ -130,30 +169,44 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
           allowed(ctx);
           const args = (ctx.args ?? "").trim();
           const [verb = "status", target, option] = args.split(/\s+/);
-          if (verb === "status") return statusPayload(await call("status"));
-          if (verb === "read" && target) {
-            const result = await call("read", { pane: target });
-            return { text: `**${target}**\n${code(result.text)}` };
+          const binding = await contextPane(ctx);
+          if (verb === "archive" && binding && paneChannels) {
+            await paneChannels.archive(binding,controller.signal);
+            return {text:"Herdr pane channel archived. History retained."};
           }
-          if (verb === "pending") return { text: code(JSON.stringify(await call("pending"), null, 2)) };
+          if (binding?.closed) throw new Error("This Herdr pane has closed; its channel is retained as history");
+          const pane = (target?.match(/^w\d+:p\d+$/) ? target : null) ?? binding?.pane_id;
+          if (binding && pane !== binding.pane_id) throw new Error("Command targets a different pane channel");
+          if (verb === "status") return statusPayload((await call("status")).filter(a=>!binding || a.pane_id === binding.pane_id));
+          if (verb === "channels") return {text:code(JSON.stringify(await call("pane_channels",{account_id:ctx.accountId}),null,2))};
+          if (verb === "read" && pane) {
+            const result = await call("read", { pane });
+            return { text: `**${pane}**\n${code(result.text)}` };
+          }
+          if (verb === "pending") return { text: code(JSON.stringify((await call("pending")).filter(r=>!binding || r.pane_id === binding.pane_id), null, 2)) };
           if (verb === "answer" && /^[a-f0-9]{32}$/.test(target ?? "") && /^\d+$/.test(option ?? "")) {
             allowed(ctx);
+            await requestAllowed(ctx,target);
             return { text: answerText(await call("answer", { request_id: target, option: Number(option) })) };
           }
-          if (verb === "check" && /^[a-f0-9]{32}$/.test(target ?? ""))
+          if (verb === "check" && /^[a-f0-9]{32}$/.test(target ?? "")) {
+            await requestAllowed(ctx,target);
             return {text:answerText(await call("check",{request_id:target}))};
+          }
           if (verb === "reply" && /^[a-f0-9]{32}$/.test(target ?? "")) {
             const text = args.replace(/^reply\s+\S+\s*/, "");
             allowed(ctx);
+            await requestAllowed(ctx,target);
             return {text:answerText(await call("answer",{request_id:target,answer_text:text}))};
           }
-          if (verb === "send" && target) {
-            const text = args.replace(/^send\s+\S+\s*/, "");
+          if (verb === "send" && pane) {
+            const text = args.replace(target === pane ? /^send\s+\S+\s*/ : /^send\s*/, "");
+            if (!text.trim()) throw new Error("Prompt text is required");
             allowed(ctx);
-            await call("send", { pane: target, text });
-            return { text: `Prompt dispatched to ${target}.` };
+            await call("send", { pane, text });
+            return { text: `Prompt dispatched to ${pane}.` };
           }
-          return { text: "Use /herdr status | read w4:p2 | pending | send w4:p2 <prompt> | answer <request-id> <zero-based-option> | reply <request-id> <text> | check <request-id>" };
+          return { text: "Use /herdr status | channels | read [pane] | pending | send [pane] <prompt> | answer <request-id> <zero-based-option> | reply <request-id> <text> | check <request-id> | archive (closed pane channel)" };
         } catch (error) { return { text: error.message }; }
       },
     });
@@ -190,7 +243,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
                 const {result:latest} = await call("result_cards",{request_id:requestId});
                 const progress = latest.outcome === "not_sent" && latest.attempt_id === prepared.attempt_id
                   ? {...latest,outcome:"checking",retry_token:null} : latest;
-                await ctx.respond.editMessage(await answerEdit(api,config.route,progress));
+                await ctx.respond.editMessage(await answerEdit(api,sourceRoute(ctx),progress));
               });
               allowed(ctx);
               result = await call("dispatch_reserved",{request_id:requestId,attempt_id:prepared.attempt_id});

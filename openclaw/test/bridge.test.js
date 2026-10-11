@@ -144,7 +144,7 @@ async function runningBridge(t, initial = {}) {
     return {};
   }};
   const context = {send:initial.update ?? (async(message)=>edits.push(message))};
-  const api = {pluginConfig:config,logger:{info(){},warn(){}},
+  const api = {pluginConfig:initial.config ?? config,logger:{info(){},warn(){}},
     registerService:s=>registrations.service=s,registerCommand:c=>registrations.command=c,
     registerInteractiveHandler:h=>registrations.interactive=h,registerTool(){},
     runtime:{config:{current:()=>({})},channel:{
@@ -153,7 +153,7 @@ async function runningBridge(t, initial = {}) {
       }}})})}
     }}
   };
-  registerBridge(api,()=>worker);
+  registerBridge(api,()=>worker,initial.channelFactory);
   await registrations.service.start({stateDir:dir,config:{}});
   t.after(async()=> {await registrations.service.stop();await rm(dir,{recursive:true,force:true});});
   const click = async(payload)=>registrations.interactive.handler({...trusted,conversationId:binding.conversationId,
@@ -353,4 +353,80 @@ test("completion bypasses attention recheck while ready questions use the refres
   assert.ok(bridge.edits[0].payload.presentation.blocks.some(b=>b.text?.includes("fresh evidence")));
   assert.deepEqual(bridge.calls.filter(c=>c.method === "event_for_delivery").map(c=>c.params.event_id),["question"]);
   assert.deepEqual(bridge.calls.filter(c=>c.method === "ack").map(c=>c.params.event_id),["question","completion"]);
+});
+
+const channelConfig = {...config,paneChannels:{enabled:true,prefix:"herdr"}};
+const channelFactory = ()=>({sync:async()=>{},identity:async()=>({team_id:"T1"})});
+
+test("slow channel provisioning does not delay an existing channel's completion",async t=> {
+  let release;
+  const pending=new Promise(resolve=> {release=resolve;});
+  const bridge=await runningBridge(t,{config:channelConfig,
+    channelFactory:()=>({sync:()=>pending,identity:async()=>({team_id:"T1"})}),
+    call:async(method)=> {
+      if(method === "events") return [{id:"ready",type:"agent.done",agent:{pane_id:"w4:p2"},text:"done"}];
+      if(method === "route_event") return {channel:"slack",accountId:"default",team_id:"T1",to:"channel:C2"};
+      return {};
+    }});
+  try {
+    for(let i=0;i<20 && !bridge.edits.length;i++) await new Promise(resolve=>setImmediate(resolve));
+    assert.deepEqual(bridge.edits.map(e=>e.to),["channel:C2"]);
+    assert.deepEqual(bridge.calls.filter(c=>c.method === "ack").map(c=>c.params.event_id),["ready"]);
+  } finally {release();}
+});
+
+test("two pane events use their own persisted channels and mention only the configured owners",async t=> {
+  const events=[{id:"one",type:"agent.done",agent:{pane_id:"w4:p1"},text:"first"},
+    {id:"two",type:"agent.done",agent:{pane_id:"w4:p2"},text:"second"}];
+  const bridge=await runningBridge(t,{config:channelConfig,channelFactory,call:async(method,params)=> {
+    if(method === "events") return events;
+    if(method === "route_event") return {channel:"slack",accountId:"default",team_id:"T1",to:params.event_id === "one" ? "channel:C1" : "channel:C2"};
+    return {};
+  }});
+  for(let i=0;i<20 && bridge.edits.length<2;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(bridge.edits.map(e=>e.to),["channel:C1","channel:C2"]);
+  assert.ok(bridge.edits.every(e=>e.payload.text.startsWith("<@U1>\n")));
+  assert.equal(bridge.calls.filter(c=>c.method === "ack").length,2);
+});
+
+test("unprovisioned pane events stay queued while other ready panes deliver",async t=> {
+  const events=[{id:"waiting",type:"agent.done",agent:{pane_id:"w4:p1"},text:"waiting"},
+    {id:"ready",type:"agent.done",agent:{pane_id:"w4:p2"},text:"ready"}];
+  const bridge=await runningBridge(t,{config:channelConfig,channelFactory,call:async(method,params)=> {
+    if(method === "events") return events;
+    if(method === "route_event") return params.event_id === "waiting" ? null : {channel:"slack",accountId:"default",team_id:"T1",to:"channel:C2"};
+    return {};
+  }});
+  for(let i=0;i<20 && !bridge.edits.length;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.deepEqual(bridge.edits.map(e=>e.to),["channel:C2"]);
+  assert.deepEqual(bridge.calls.filter(c=>c.method === "ack").map(c=>c.params.event_id),["ready"]);
+});
+
+test("channel commands infer their own pane and reject cross-pane or cross-request writes",async t=> {
+  const bridge=await runningBridge(t,{config:channelConfig,channelFactory,call:async(method,params)=> {
+    if(method === "events") return [];
+    if(method === "pane_for_channel") return {pane_id:"w4:p2",channel_id:"C2",closed:false};
+    if(method === "read") return {text:"pane two transcript"};
+    if(method === "authorize_request") throw new Error("Request belongs to a different pane channel");
+    return {};
+  }});
+  const handler=bridge.registrations.command.handler,ctx={...trusted,conversationId:"C2"};
+  assert.match((await handler({...ctx,args:"read"})).text,/pane two transcript/);
+  assert.equal(bridge.calls.find(c=>c.method === "read").params.pane,"w4:p2");
+  const cross=await handler({...ctx,args:"send w4:p1 unsafe"});
+  assert.match(cross.text,/different pane/);
+  const reply=await handler({...ctx,args:`reply ${bridge.id} Purple`});
+  assert.match(reply.text,/different pane channel/);
+  assert.ok(!bridge.calls.some(c=>["send","answer","dispatch_reserved"].includes(c.method)));
+});
+
+test("channel recovery uses persisted source and account changes cannot deliver old events",async t=> {
+  const events=[{id:"wrong-team",type:"agent.done",agent:{pane_id:"w4:p1"},text:"old"}];
+  const bridge=await runningBridge(t,{config:channelConfig,channelFactory,call:async(method)=> {
+    if(method === "events") return events;
+    if(method === "route_event") return {channel:"slack",accountId:"default",team_id:"TOTHER",to:"channel:C1"};
+    return {};
+  }});
+  for(let i=0;i<20;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(bridge.edits.length,0);assert.ok(!bridge.calls.some(c=>c.method === "ack"));
 });

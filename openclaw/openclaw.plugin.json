@@ -12,6 +12,13 @@
       "socketPath": {"type": "string"},
       "herdrBin": {"type": "string"},
       "ownerIds": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+      "paneChannels": {
+        "type": "object", "additionalProperties": false,
+        "properties": {
+          "enabled": {"type": "boolean"},
+          "prefix": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,15}$"}
+        }
+      },
       "route": {
         "type": "object", "additionalProperties": false,
         "properties": {
