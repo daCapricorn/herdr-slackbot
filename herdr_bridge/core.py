@@ -15,6 +15,7 @@ from .events import session_of
 from .metadata import session_model
 from .questions import CodexQuestionSource, QuestionUnavailable, fingerprint as question_fingerprint, input_plan
 from .channels import PaneChannels
+from .codex_sync import CodexRolloutSync
 
 log = logging.getLogger(__name__)
 CONSUMED_STATES = {"reserved", "dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
@@ -81,6 +82,7 @@ class Bridge:
                PRIMARY KEY(request_id, binding));
         """)
         self.lock = threading.RLock()
+        self.codex_sync = CodexRolloutSync(self.db)
         self.channels = PaneChannels(self.db)
         self.db.commit()
 
@@ -219,8 +221,29 @@ class Bridge:
         self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event["id"], json.dumps(event)))
         return event
 
+    def _queue_conversation(self, event_id, info, message):
+        event = {"id": event_id, "type": "conversation.message", "at": self.clock(),
+                 "agent": self._public_agent(info), **message}
+        self.db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)",
+                        (event["id"], json.dumps(event, ensure_ascii=False)))
+
+    def sync_conversation(self, info):
+        """Persist new Codex conversation events and their source cursor atomically."""
+        if info.get("agent") != "codex":
+            return 0
+        try:
+            with self.lock, self.db:
+                live = self._agent(info["pane_id"])
+                if identity(live) != identity(info):
+                    return 0
+                return self.codex_sync.sync(info, self._queue_conversation)
+        except Exception:
+            log.exception("Codex transcript sync failed for %s", info.get("pane_id"))
+            return 0
+
     def discover(self, info):
         """Recover already-blocked agents; repeat scans also catch a redrawn dialog."""
+        self.sync_conversation(info)
         questions = self.discover_questions(info)
         if info.get("agent_status") != "blocked":
             return
@@ -313,6 +336,7 @@ class Bridge:
         if transition.ended or not transition.info:
             return
         info = transition.info
+        self.sync_conversation(info)
         if transition.status == "blocked":
             self.discover(info)
         elif transition.status in ("done", "idle") and transition.prev_status in ("working", "blocked"):
