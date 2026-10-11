@@ -53,11 +53,11 @@ def current_dialog(screen, kind):
 
 
 class Bridge:
-    def __init__(self, client, state_path, *, clock=time.time, approval_ttl=900,
+    def __init__(self, client, state_path, *, clock=time.time,
                  monotonic=time.monotonic, sleep=time.sleep,
                  confirmation_timeout=5.0, confirmation_interval=0.2, followup_timeout=120,
                  question_source=None, notification_delay=10.0):
-        self.client, self.clock, self.approval_ttl = client, clock, approval_ttl
+        self.client, self.clock = client, clock
         self.monotonic, self.sleep = monotonic, sleep
         self.confirmation_timeout = confirmation_timeout
         self.confirmation_interval = confirmation_interval
@@ -213,7 +213,7 @@ class Bridge:
             # Keep display evidence after the delivery event is acknowledged.
             rec = fields["request"]
             context = {k: event[k] for k in ("type", "agent", "text", "summary") if k in event}
-            context["request"] = {k: rec[k] for k in ("id", "options", "expires_at", "question") if k in rec}
+            context["request"] = {k: rec[k] for k in ("id", "options", "question") if k in rec}
             rec["card_context"] = context
             self.db.execute("UPDATE approvals SET record=? WHERE id=?", (json.dumps(rec), rec["id"]))
         self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event["id"], json.dumps(event)))
@@ -267,7 +267,7 @@ class Bridge:
             rec = {"id": request_id, "pane_id": pane, "identity": identity(info),
                    "sequence": info.get("state_change_seq"),
                    "fingerprint": fingerprint, "evidence_version": 1,
-                   "created_at": self.clock(), "expires_at": self.clock() + self.approval_ttl,
+                   "created_at": self.clock(),
                    "options": options}
             self.db.execute("INSERT INTO approvals VALUES (?, ?, 'pending')", (request_id, json.dumps(rec)))
             self._queue("approval.requested" if options else "agent.blocked", info,
@@ -303,7 +303,7 @@ class Bridge:
                 rec = {"id": uuid.uuid4().hex, "kind": "codex_question", "question": question,
                        "pane_id": info["pane_id"], "identity": identity(info),
                        "sequence": info.get("state_change_seq"), "fingerprint": fp,
-                       "created_at": self.clock(), "expires_at": self.clock() + self.approval_ttl,
+                       "created_at": self.clock(),
                        "options": [{"index": i, "label": o} for i, o in enumerate(question["options"])]}
                 self.db.execute("INSERT INTO approvals VALUES (?, ?, 'pending')", (rec["id"], json.dumps(rec)))
                 self._queue("question.requested", info, request=rec, text=screen, summary=question["title"])
@@ -342,8 +342,7 @@ class Bridge:
                         or info.get("state_change_seq") != rec.get("sequence")):
                     self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request_id,))
             return [json.loads(r[0]) for r in self.db.execute(
-                "SELECT record FROM approvals WHERE state='pending'")
-                    if json.loads(r[0])["expires_at"] > self.clock()]
+                "SELECT record FROM approvals WHERE state='pending'")]
 
     def events(self, account_id=None):
         self.pending()  # Retire cards whose pane has already advanced.
@@ -373,7 +372,7 @@ class Bridge:
         if not request:
             return event
         row = self.db.execute("SELECT state FROM approvals WHERE id=?", (request["id"],)).fetchone()
-        if not row or row[0] != "pending" or request["expires_at"] <= self.clock():
+        if not row or row[0] != "pending":
             self.db.execute("DELETE FROM outbox WHERE id=?", (event["id"],))
             return None
         if event["type"] not in ATTENTION_EVENTS:
@@ -475,7 +474,7 @@ class Bridge:
             if rec["pane_id"] in self.sending:
                 raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
             rec["dispatch"].update(started_at=self.clock(), focused=fresh.get("focused"), revision=fresh.get("revision"))
-            rec["followup_deadline"] = min(rec["expires_at"], self.clock() + self.followup_timeout)
+            rec["followup_deadline"] = self.clock() + self.followup_timeout
             self._save(rec, "dispatching")
             self._claim_pane(rec)
             self.active.add(request_id)
@@ -493,8 +492,6 @@ class Bridge:
                             (json.dumps(rec), state, rec["id"]))
 
     def _live_dialog(self, rec):
-        if self.clock() >= rec["expires_at"]:
-            raise BridgeError("Request expired; nothing was sent")
         info = self._agent(rec["pane_id"])
         if (tuple(rec["identity"]) != identity(info) or info.get("agent_status") != "blocked"
                 or rec.get("sequence") != info.get("state_change_seq")):
@@ -515,8 +512,6 @@ class Bridge:
         self.sending[rec["pane_id"]] = rec["id"]
 
     def _live_question(self, rec, option, answer):
-        if self.clock() >= rec["expires_at"]:
-            raise BridgeError("Request expired; nothing was sent")
         info = self._agent(rec["pane_id"])
         if identity(info) != tuple(rec["identity"]):
             raise BridgeError("Agent changed; nothing was sent")
@@ -561,7 +556,7 @@ class Bridge:
                            "focused": fresh.get("focused"), "revision": fresh.get("revision")}
         rec.pop("verification", None)
         rec.pop("watch_expired", None)
-        rec["followup_deadline"] = min(rec["expires_at"], self.clock() + self.followup_timeout)
+        rec["followup_deadline"] = self.clock() + self.followup_timeout
         self._save(rec, "reserved")
 
     def _finish_dispatch(self, rec):
@@ -599,7 +594,7 @@ class Bridge:
             label = rec.get("dispatch", {}).get("answer", label)
         verification = rec.get("verification", {})
         retryable = (state in ("unconfirmed", "reserved") and verification.get("retryable") is True
-                     and rec["id"] not in self.active and self.clock() < rec["expires_at"])
+                     and rec["id"] not in self.active)
         return {"request_id": rec["id"], "kind": rec.get("kind", "approval"),
                 "card_context": rec.get("card_context"),
                 "outcome": "checking" if rec["id"] in self.active else ("not_sent" if state == "reserved" else state),

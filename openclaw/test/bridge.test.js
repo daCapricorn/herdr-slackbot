@@ -20,6 +20,7 @@ test("portable approval actions carry exact request and option, never raw keys",
     { type: "callback", value: `herdr-bridge:${"a".repeat(32)}:0` });
   assert.ok(!payload.presentation.blocks[1].text.includes("```malicious"));
   assert.ok(!payload.channelData);
+  assert.ok(!JSON.stringify(payload.presentation).includes("expires"));
   assert.ok(Array.from(buttonLabel({index:1,label:"very long approval ".repeat(20)})).length <= 60);
 });
 test("delivery uses live OpenClaw config, native normalization/rendering and sends once", async () => {

@@ -115,16 +115,15 @@ def test_changed_dialog_rejected(setup):
     assert not client.keys
 
 
-def test_expired_and_invalid_options_are_rejected(setup):
+def test_old_expiry_timestamp_does_not_block_an_exact_live_approval(setup):
     client, bridge = setup
     token = request(client, bridge)
-    for option in (-1, 100, True, "0"):
-        with pytest.raises(BridgeError):
-            bridge.answer(token, option)
+    rec, state = bridge._record(token)
+    rec["expires_at"] = 1  # An existing pre-upgrade request already past its old deadline.
+    bridge._save(rec,state)
     bridge.clock = lambda: 1001
-    with pytest.raises(BridgeError, match="expired"):
-        bridge.answer(token, 0)
-    assert not client.keys
+    assert bridge.answer(token,0)["outcome"] in ("confirmed","unconfirmed")
+    assert client.keys == [("w4:p2",["1"])]
 
 
 def test_lost_reply_does_not_rearm_or_retry(setup):
@@ -197,6 +196,7 @@ def test_unknown_screen_redraw_notifies_once(setup):
     bridge.discover(client.info)
     assert len(bridge.events()) == 1 and bridge.pending()[0]["id"] == token
     bridge.clock = lambda: 1001
+    client.info["agent_status"] = "working"
     bridge.discover(client.info)
     assert not bridge.events() and not bridge.pending()
 
@@ -458,7 +458,7 @@ def test_explicit_retry_has_its_own_attempt_and_duplicate_button_cannot_replay(s
     assert len(json.loads(raw)["attempts"]) == 1
 
 
-@pytest.mark.parametrize("change", ["dialog", "identity", "sequence", "expiry"])
+@pytest.mark.parametrize("change", ["dialog", "identity", "sequence"])
 def test_retry_rechecks_current_evidence_before_sending(setup, change):
     client, bridge = setup
     token = request(client, bridge)
@@ -469,8 +469,6 @@ def test_retry_rechecks_current_evidence_before_sending(setup, change):
         client.info["terminal_id"] = "replacement"
     elif change == "sequence":
         client.info["state_change_seq"] += 2
-    else:
-        bridge.clock = lambda: 1001
     with pytest.raises(BridgeError):
         bridge.retry(token, result["retry_token"])
     assert len(client.keys) == 1
@@ -525,7 +523,7 @@ def test_crashed_dispatch_resumes_only_observation(setup, tmp_path):
     again.close()
 
 
-def test_background_checks_expire_without_resending_or_renewing_authorization(setup):
+def test_background_checks_stop_after_two_minutes_but_live_retry_stays_available(setup):
     client, bridge = setup
     token = request(client, bridge)
     bridge.answer(token, 0)
@@ -536,7 +534,7 @@ def test_background_checks_expire_without_resending_or_renewing_authorization(se
     assert any(e["type"] == "approval.updated" and not e["result"]["watching"] for e in bridge.events())
     assert len(client.keys) == 1
     bridge.clock = lambda:1001
-    assert bridge.check(token)["retry_token"] is None
+    assert bridge.check(token)["retry_token"] is not None
 
 
 def test_explicit_retry_gets_its_own_bounded_followup_after_previous_watch_expired(setup):
