@@ -22,6 +22,7 @@ The current integration supports **Slack DMs through OpenClaw**. The core and me
 - Show recognized Codex command approvals and Claude single-choice dialogs with native buttons, then revalidate the exact request before sending keys.
 - Forward Codex CLI async questions from Queued follow-up inputs, including while the agent is working. Answer a suggested choice in Slack or use `/herdr reply` for free text.
 - Keep pending approvals/questions and outbound messages across Gateway/worker restarts.
+- Optionally stream new Codex conversation messages into each pane's private Slack channel; tool activity is summarized without tool output.
 
 Messages show **Herdr name · current model · directory path**, followed by an inline-code highlighted summary and the captured terminal conversation. The name uses Herdr's agent name or tab label. The model comes from reported metadata or the actual Codex/Claude session; an ambiguous match shows `模型未知`. Summaries extract the pending command or latest assistant paragraph using rules, without an LLM call.
 
@@ -89,7 +90,7 @@ Approval cards, unsupported blocked-dialog notices and Codex async question card
 
 ## Pane channels
 
-With `paneChannels.enabled: true`, Bridge creates one private Slack channel for every Herdr pane, including ordinary shell panes, and invites the configured owners. Pane events and approval results use that channel instead of the aggregate DM. Names follow the pane/tab display name; renaming updates the channel while preserving its ID. A terminal moved across workspaces retains its channel under the new pane ID. Closed panes retain their channel as history; `/herdr archive` in that channel explicitly archives it. Full conversation streaming is deferred.
+With `paneChannels.enabled: true`, Bridge creates one private Slack channel for every Herdr pane, including ordinary shell panes, and invites the configured owners. Pane events and approval results use that channel instead of the aggregate DM. Names follow the pane/tab display name; renaming updates the channel while preserving its ID. A terminal moved across workspaces retains its channel under the new pane ID. Closed panes retain their channel as history; `/herdr archive` in that channel explicitly archives it. For Codex panes, new user inputs and completed assistant answers are also streamed into the channel; tool calls appear as short summaries without tool output. On first attachment, a working or blocked pane starts from the latest active turn; a settled pane starts at the current end of its rollout. Older session history is not imported. Claude and other agents keep their current notification-only behavior.
 
 OpenClaw still sends messages and handles authenticated interactions. Its 2026.9.9 SDK does not expose Slack channel creation/rename/invitation, so a narrow management adapter calls the Slack Conversations API using the current OpenClaw bot credential in memory. No separate token is configured or persisted by Bridge. Add `groups:write` and `groups:write.invites` alongside the existing `groups:read` scope, then reinstall the Slack App. The selected account must use bot identity and a resolved bot token. Without the opt-in setting, existing DM routing continues.
 

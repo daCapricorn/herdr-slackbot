@@ -38,6 +38,22 @@ export function messageSummary(event) {
 }
 export function eventPayload(event) {
   const a = event.agent;
+  if (event.type === "conversation.message") {
+    const label = event.role === "user" ? "👤 You"
+      : event.role === "assistant" ? `🤖 ${a.name || "Codex"}` : "⚙️ Tool summary";
+    const body = String(event.text ?? "");
+    const bounded = Array.from(body).length > 35000 ? Array.from(body).slice(0, 34980).join("") + "\n… message truncated for Slack" : body;
+    // Keep normal Slack Markdown in the message body, while preventing authored text
+    // from being interpreted as a Slack user/channel/broadcast mention.
+    const safeBody = bounded.replace(/<!(?:here|channel|everyone)>/gi, "&lt;$&")
+      .replace(/<@[A-Z0-9]+>/g, "&lt;$&");
+    return { text: `${label}\n${safeBody}`, presentationTextMode: "fallback", presentation: {
+      title: label, tone: "neutral", blocks: [
+        { type: "text", text: label },
+        { type: "text", text: safeBody },
+      ],
+    } };
+  }
   const title = `${a.name || a.pane_id} · ${a.model || "模型未知"} · ${a.cwd || "目录未知"}`;
   const summary = messageSummary(event);
   const request = event.request;

@@ -23,6 +23,15 @@ test("portable approval actions carry exact request and option, never raw keys",
   assert.ok(!JSON.stringify(payload.presentation).includes("expires"));
   assert.ok(Array.from(buttonLabel({index:1,label:"very long approval ".repeat(20)})).length <= 60);
 });
+test("pane conversation events keep authored Markdown and do not ping Slack users", () => {
+  const payload = eventPayload({type:"conversation.message",role:"assistant",text:"Ran: `pytest -q`\n\nUse **bold** <@U123> <!here>",
+    agent:{pane_id:"w4:p2",name:"codex-slackbot"}});
+  assert.equal(payload.presentation.blocks[0].text,"🤖 codex-slackbot");
+  assert.match(payload.presentation.blocks[1].text,/\*\*bold\*\*/);
+  assert.doesNotMatch(payload.presentation.blocks[1].text,/(?<!&lt;)<@U123>/);
+  assert.doesNotMatch(payload.presentation.blocks[1].text,/(?<!&lt;)<!here>/);
+  assert.match(payload.text,/Ran: `pytest -q`/);
+});
 test("delivery uses live OpenClaw config, native normalization/rendering and sends once", async () => {
   const calls = [];
   const cfg = { live: true };
