@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .codex_session import resolve_session, validate_rollout, SessionUnavailable
 from .events import session_of
-from .session_observation import load_observation
+from .transcript_sync import TranscriptSync
 
 
 def _latest_turn_offset(path: Path, limit: int = 16 * 1024 * 1024) -> int:
@@ -135,38 +135,15 @@ def _stable_id(source_key, row, offset, role, text):
     return hashlib.sha256(f"{source_key}|{role}|{row_key}".encode()).hexdigest()
 
 
-class CodexRolloutSync:
+class CodexRolloutSync(TranscriptSync):
+    agent_kind = "codex"
+    namespace = "codex"
+
     def __init__(self, db, *, home=None):
-        self.db = db
-        self.home = Path(home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS codex_sync_cursors
-            (source_key TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, device INTEGER NOT NULL,
-             inode INTEGER NOT NULL, offset INTEGER NOT NULL)""")
-        self.db.execute("CREATE TABLE IF NOT EXISTS codex_sync_seen (event_id TEXT PRIMARY KEY)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS codex_session_bindings (terminal_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, cwd TEXT NOT NULL)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS codex_sync_status (terminal_id TEXT PRIMARY KEY, record TEXT NOT NULL)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS codex_sync_final (source_key TEXT PRIMARY KEY, event_id TEXT NOT NULL)")
-        self.db.execute("CREATE TABLE IF NOT EXISTS codex_completion_seen (event_id TEXT PRIMARY KEY)")
+        super().__init__(db, home=home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 
-    def diagnostic(self, info):
-        key = info.get("terminal_id") or info.get("pane_id", "")
-        row = self.db.execute("SELECT record FROM codex_sync_status WHERE terminal_id=?", (key,)).fetchone()
-        return json.loads(row[0]) if row else {"state": "pending", "reason": "Not scanned yet"}
-
-    def _status(self, info, state, **fields):
-        key = info.get("terminal_id") or info.get("pane_id", "")
-        self.db.execute("INSERT OR REPLACE INTO codex_sync_status VALUES (?, ?)",
-                        (key, json.dumps({"state": state, **fields})))
-
-    def claim_completion(self, info):
-        if info.get("agent") != "codex" or self.diagnostic(info).get("state") != "syncing":
-            return True  # Preserve notification-only agents/unavailable sources.
-        tid, _, _ = self._resolve(info)
-        key = f"{info.get('terminal_id') or info.get('pane_id', '')}:{tid}"
-        row = self.db.execute("SELECT event_id FROM codex_sync_final WHERE source_key=?", (key,)).fetchone()
-        if not row:
-            return False  # Resume/startup without a new answer is not a new completion.
-        return bool(self.db.execute("INSERT OR IGNORE INTO codex_completion_seen VALUES (?)", (row[0],)).rowcount)
+    def latest_turn_offset(self, path):
+        return _latest_turn_offset(path)
 
     def _resolve(self, info, unique_workspace=False):
         # An exact live Herdr identity supersedes a saved manual association.
@@ -197,99 +174,25 @@ class CodexRolloutSync:
         self._status(info, "ready", thread_id=tid, source="explicit", reason="Bound; waiting for next scan")
         return self.diagnostic(info)
 
-    def sync(self, info, enqueue, *, unique_workspace=False):
-        self.db.execute("SAVEPOINT codex_sync_read")
-        try:
-            result = self._sync(info, enqueue, unique_workspace=unique_workspace)
-            self.db.execute("RELEASE codex_sync_read")
-            return result
-        except Exception as exc:
-            self.db.execute("ROLLBACK TO codex_sync_read")
-            self.db.execute("RELEASE codex_sync_read")
-            if isinstance(exc, (OSError, sqlite3.Error)):
-                self._status(info, "unavailable", reason=f"Rollout read failed: {type(exc).__name__}")
-                return 0
-            raise
-
-    def _sync(self, info, enqueue, *, unique_workspace=False):
-        try:
-            session = self._resolve(info, unique_workspace)
-            thread_id, path, _ = session
-        except SessionUnavailable as exc:
-            self._status(info, "unavailable", reason=str(exc))
-            return 0
-        try:
-            stat = path.stat()
-            terminal = info.get("terminal_id") or info.get("pane_id", "")
-            source_key = f"{terminal}:{thread_id}"
-            if session_of(info) and info.get("terminal_id"):
-                self.db.execute("INSERT OR REPLACE INTO codex_session_bindings VALUES (?, ?, ?)",
-                                (terminal, thread_id, info["cwd"]))
-            row = self.db.execute("SELECT rollout_path,device,inode,offset FROM codex_sync_cursors WHERE source_key=?",
-                                  (source_key,)).fetchone()
-            same_file = row and row[0] == str(path) and row[1] == stat.st_dev and row[2] == stat.st_ino
-            if same_file and stat.st_size >= row[3]:
-                offset = row[3]
-            elif not row and (observation := load_observation(self.home, info, session)):
-                offset = observation["offset"]
-            elif info.get("agent_status") in ("working", "blocked"):
-                offset = _latest_turn_offset(path)
-            else:
-                offset = stat.st_size
-            cursor = offset
-            with path.open("rb") as stream:
-                stream.seek(offset)
-                while line := stream.readline():
-                    if not line.endswith(b"\n"):
-                        break
-                    next_cursor = stream.tell()
-                    try:
-                        raw = json.loads(line)
-                        if not isinstance(raw, dict):
-                            raise ValueError("invalid rollout row")
-                    except (ValueError, UnicodeDecodeError):
-                        cursor = next_cursor
-                        continue
-                    payload = raw.get("payload", {})
-                    event = None
-                    if raw.get("type") == "event_msg" and isinstance(payload, dict):
-                        if payload.get("type") == "user_message":
-                            text = _clean_user_text(str(payload.get("message") or ""))
-                            if text:
-                                event = {"role": "user", "text": text}
-                        elif payload.get("type") == "item_completed":
-                            item = payload.get("item", {})
-                            if isinstance(item, dict):
-                                text = _user_item(item)
-                                if text:
-                                    event = {"role": "user", "text": text}
-                                text = _completed_agent_message(item)
-                                if text:
-                                    event = {"role": "assistant", "text": text}
-                                elif not event:
-                                    summary = _tool_summary(item)
-                                    if summary:
-                                        event = {"role": "tool", "text": summary}
-                    if event:
-                        event_id = _stable_id(source_key, raw, cursor, event["role"], event["text"])
-                        inserted = self.db.execute("INSERT OR IGNORE INTO codex_sync_seen VALUES (?)",
-                                                   (event_id,)).rowcount
-                        if inserted:
-                            enqueue(event_id, info, event)
-                            if event["role"] == "assistant":
-                                self.db.execute("INSERT OR REPLACE INTO codex_sync_final VALUES (?, ?)",
-                                                (source_key, event_id))
-                    cursor = next_cursor
-                    self.db.execute("""INSERT INTO codex_sync_cursors
-                        (source_key,rollout_path,device,inode,offset) VALUES (?,?,?,?,?)
-                        ON CONFLICT(source_key) DO UPDATE SET rollout_path=excluded.rollout_path,
-                        device=excluded.device,inode=excluded.inode,offset=excluded.offset""",
-                        (source_key, str(path), stat.st_dev, stat.st_ino, cursor))
-            # Empty/settled rollouts also need a baseline cursor before the next turn.
-            self.db.execute("""INSERT OR REPLACE INTO codex_sync_cursors
-                (source_key,rollout_path,device,inode,offset) VALUES (?,?,?,?,?)""",
-                (source_key, str(path), stat.st_dev, stat.st_ino, cursor))
-            self._status(info, "syncing", thread_id=thread_id, offset=cursor)
-            return cursor - offset
-        except (OSError, sqlite3.Error):
-            raise  # The enclosing savepoint also rolls back seen IDs and outbox writes.
+    def row_events(self, source_key, raw, cursor):
+        payload = raw.get("payload", {})
+        event = None
+        if raw.get("type") == "event_msg" and isinstance(payload, dict):
+            if payload.get("type") == "user_message":
+                text = _clean_user_text(str(payload.get("message") or ""))
+                if text:
+                    event = {"role": "user", "text": text}
+            elif payload.get("type") == "item_completed":
+                item = payload.get("item", {})
+                if isinstance(item, dict):
+                    text = _user_item(item)
+                    if text:
+                        event = {"role": "user", "text": text}
+                    text = _completed_agent_message(item)
+                    if text:
+                        event = {"role": "assistant", "text": text}
+                    elif not event:
+                        summary = _tool_summary(item)
+                        if summary:
+                            event = {"role": "tool", "text": summary}
+        return [(_stable_id(source_key, raw, cursor, event["role"], event["text"]), event)] if event else []

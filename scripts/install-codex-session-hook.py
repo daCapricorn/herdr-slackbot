@@ -41,8 +41,43 @@ def install(home, python=sys.executable, project=None):
             "next": "Review and trust the two Bridge hooks with /hooks in Codex. No trust settings were changed."}
 
 
+def remove(home):
+    """Retire only this installer's legacy handlers after trusting the plugin."""
+    path = Path(home) / "hooks.json"
+    if not path.exists():
+        return {"changed": False}
+    original = path.read_bytes()
+    config = json.loads(original)
+    changed = False
+    for event in ("SessionStart", "UserPromptSubmit"):
+        groups = config.get("hooks", {}).get(event, [])
+        kept = []
+        for group in groups:
+            handlers = group.get("hooks", [])
+            remaining = [h for h in handlers if not h.get("command", "").endswith("-m herdr_bridge.session_hook")]
+            if len(remaining) != len(handlers):
+                changed = True
+                if remaining:
+                    kept.append({**group, "hooks": remaining})
+            else:
+                kept.append(group)
+        if changed:
+            config["hooks"][event] = kept
+    if changed:
+        backup = path.with_name("hooks.json.herdr-bridge-plugin-migration-backup")
+        if not backup.exists():
+            backup.write_bytes(original)
+            backup.chmod(0o600)
+        temporary = path.with_name("hooks.json.herdr-bridge-tmp")
+        temporary.write_text(json.dumps(config, indent=2) + "\n")
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    return {"path": str(path), "changed": changed}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path.home() / ".codex")
+    parser.add_argument("--remove", action="store_true", help="Retire only legacy Bridge hooks after trusting the agent plugin")
     args = parser.parse_args()
-    print(json.dumps(install(args.home), indent=2))
+    print(json.dumps(remove(args.home) if args.remove else install(args.home), indent=2))

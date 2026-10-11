@@ -40,7 +40,7 @@ export function eventPayload(event) {
   const a = event.agent;
   if (event.type === "conversation.message") {
     const label = event.role === "user" ? "👤 You"
-      : event.role === "assistant" ? `🤖 ${a.name || "Codex"}` : "⚙️ Tool summary";
+      : event.role === "assistant" ? `🤖 ${a.name || (a.kind === "claude" ? "Claude" : "Codex")}` : "⚙️ Tool summary";
     const body = String(event.text ?? "");
     const bounded = Array.from(body).length > 35000 ? Array.from(body).slice(0, 34980).join("") + "\n… message truncated for Slack" : body;
     // Keep normal Slack Markdown in the message body, while preventing authored text

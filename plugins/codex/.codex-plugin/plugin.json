@@ -1,0 +1,8 @@
+{
+  "name": "herdr-bridge-codex",
+  "version": "0.1.1",
+  "description": "Herdr Bridge codex session registration through the shared agent adapter protocol.",
+  "author": {
+    "name": "Herdr Bridge"
+  }
+}

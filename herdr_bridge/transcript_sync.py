@@ -1,0 +1,135 @@
+"""Shared durable transcript contract: atomic cursor, dedupe, outbox and completion."""
+import json
+import sqlite3
+from pathlib import Path
+from .events import session_of
+from .codex_session import SessionUnavailable
+from .session_observation import load_observation
+
+class TranscriptSync:
+    agent_kind = ""
+    namespace = ""
+
+    def __init__(self, db, *, home=None):
+        self.db = db
+        self.home = Path(home or Path.home() / ("." + self.agent_kind))
+        if self.namespace not in ("codex", "claude"):
+            raise ValueError("Unsupported transcript namespace")
+        self.db.execute(f"""CREATE TABLE IF NOT EXISTS {self.namespace}_sync_cursors
+            (source_key TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, device INTEGER NOT NULL,
+             inode INTEGER NOT NULL, offset INTEGER NOT NULL)""")
+        self.db.execute(f"CREATE TABLE IF NOT EXISTS {self.namespace}_sync_seen (event_id TEXT PRIMARY KEY)")
+        self.db.execute(f"CREATE TABLE IF NOT EXISTS {self.namespace}_session_bindings (terminal_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, cwd TEXT NOT NULL)")
+        self.db.execute(f"CREATE TABLE IF NOT EXISTS {self.namespace}_sync_status (terminal_id TEXT PRIMARY KEY, record TEXT NOT NULL)")
+        self.db.execute(f"CREATE TABLE IF NOT EXISTS {self.namespace}_sync_final (source_key TEXT PRIMARY KEY, event_id TEXT NOT NULL)")
+        self.db.execute(f"CREATE TABLE IF NOT EXISTS {self.namespace}_completion_seen (event_id TEXT PRIMARY KEY)")
+
+    def diagnostic(self, info):
+        key = info.get("terminal_id") or info.get("pane_id", "")
+        row = self.db.execute(f"SELECT record FROM {self.namespace}_sync_status WHERE terminal_id=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else {"state": "pending", "reason": "Not scanned yet"}
+
+    def _status(self, info, state, **fields):
+        key = info.get("terminal_id") or info.get("pane_id", "")
+        self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_sync_status VALUES (?, ?)",
+                        (key, json.dumps({"state": state, **fields})))
+
+    def claim_completion(self, info):
+        if info.get("agent") != self.agent_kind or self.diagnostic(info).get("state") != "syncing":
+            return True  # Preserve notification-only agents/unavailable sources.
+        tid, _, _ = self._resolve(info)
+        key = f"{info.get('terminal_id') or info.get('pane_id', '')}:{tid}"
+        row = self.db.execute(f"SELECT event_id FROM {self.namespace}_sync_final WHERE source_key=?", (key,)).fetchone()
+        if not row:
+            return False  # Resume/startup without a new answer is not a new completion.
+        return bool(self.db.execute(f"INSERT OR IGNORE INTO {self.namespace}_completion_seen VALUES (?)", (row[0],)).rowcount)
+
+    def sync(self, info, enqueue, *, unique_workspace=False):
+        self.db.execute(f"SAVEPOINT {self.namespace}_sync_read")
+        try:
+            result = self._sync(info, enqueue, unique_workspace=unique_workspace)
+            self.db.execute(f"RELEASE {self.namespace}_sync_read")
+            return result
+        except Exception as exc:
+            self.db.execute(f"ROLLBACK TO {self.namespace}_sync_read")
+            self.db.execute(f"RELEASE {self.namespace}_sync_read")
+            if isinstance(exc, (OSError, sqlite3.Error, SessionUnavailable)):
+                self._status(info, "unavailable", reason=f"Transcript read failed: {type(exc).__name__}")
+                return 0
+            raise
+
+    def _sync(self, info, enqueue, *, unique_workspace=False):
+        try:
+            session = self._resolve(info, unique_workspace)
+            thread_id, path, _ = session
+        except SessionUnavailable as exc:
+            self._status(info, "unavailable", reason=str(exc))
+            return 0
+        try:
+            stat = path.stat()
+            terminal = info.get("terminal_id") or info.get("pane_id", "")
+            source_key = f"{terminal}:{thread_id}"
+            if session_of(info) and info.get("terminal_id"):
+                self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_session_bindings VALUES (?, ?, ?)",
+                                (terminal, thread_id, info["cwd"]))
+            row = self.db.execute(f"SELECT rollout_path,device,inode,offset FROM {self.namespace}_sync_cursors WHERE source_key=?",
+                                  (source_key,)).fetchone()
+            same_file = row and row[0] == str(path) and row[1] == stat.st_dev and row[2] == stat.st_ino
+            if same_file and stat.st_size >= row[3]:
+                offset = row[3]
+            elif not row and (observation := load_observation(self.home, info, session)):
+                offset = observation["offset"]
+            elif info.get("agent_status") in ("working", "blocked"):
+                offset = self.latest_turn_offset(path)
+            else:
+                offset = stat.st_size
+            if row and (not same_file or stat.st_size < row[3]):
+                self.reset_source(source_key)
+            cursor = offset
+            with path.open("rb") as stream:
+                stream.seek(offset)
+                while line := stream.readline():
+                    if not line.endswith(b"\n"):
+                        break
+                    next_cursor = stream.tell()
+                    try:
+                        raw = json.loads(line)
+                        if not isinstance(raw, dict):
+                            raise ValueError("invalid rollout row")
+                    except (ValueError, UnicodeDecodeError):
+                        cursor = next_cursor
+                        continue
+                    for event_id, event in self.row_events(source_key, raw, cursor):
+                        self.emit(event_id, info, event, source_key, enqueue)
+                    cursor = next_cursor
+                    self.db.execute(f"""INSERT INTO {self.namespace}_sync_cursors
+                        (source_key,rollout_path,device,inode,offset) VALUES (?,?,?,?,?)
+                        ON CONFLICT(source_key) DO UPDATE SET rollout_path=excluded.rollout_path,
+                        device=excluded.device,inode=excluded.inode,offset=excluded.offset""",
+                        (source_key, str(path), stat.st_dev, stat.st_ino, cursor))
+            # Never flush a final message while its transcript has an incomplete tail.
+            for event_id, event in self.finish_events(source_key, info, cursor == stat.st_size):
+                self.emit(event_id, info, event, source_key, enqueue)
+            # Empty/settled rollouts also need a baseline cursor before the next turn.
+            self.db.execute(f"""INSERT OR REPLACE INTO {self.namespace}_sync_cursors
+                (source_key,rollout_path,device,inode,offset) VALUES (?,?,?,?,?)""",
+                (source_key, str(path), stat.st_dev, stat.st_ino, cursor))
+            self._status(info, "syncing", thread_id=thread_id, offset=cursor)
+            return cursor - offset
+        except (OSError, sqlite3.Error):
+            raise  # The enclosing savepoint also rolls back seen IDs and outbox writes.
+
+    def emit(self, event_id, info, event, source_key, enqueue):
+        inserted = self.db.execute(f"INSERT OR IGNORE INTO {self.namespace}_sync_seen VALUES (?)",
+                                   (event_id,)).rowcount
+        if inserted:
+            enqueue(event_id, info, event)
+            if event["role"] == "assistant":
+                self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_sync_final VALUES (?, ?)",
+                                (source_key, event_id))
+
+    def finish_events(self, source_key, info, complete):
+        return []
+
+    def reset_source(self, source_key):
+        pass

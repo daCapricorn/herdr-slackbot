@@ -20,7 +20,8 @@ def load_observation(home, info, session):
         stat = path.stat()
         if (record.get("terminal_id") == info["terminal_id"] and record.get("thread_id") == tid
                 and record.get("cwd") == cwd and record.get("path") == str(path)
-                and record.get("device") == stat.st_dev and record.get("inode") == stat.st_ino
+                and (record.get("pending_file") is True or
+                     (record.get("device") == stat.st_dev and record.get("inode") == stat.st_ino))
                 and type(record.get("offset")) is int and 0 <= record["offset"] <= stat.st_size):
             return record
     except (OSError, ValueError, TypeError, KeyError):
@@ -28,7 +29,7 @@ def load_observation(home, info, session):
     return None
 
 
-def save_observation(home, info, session, seq, offset):
+def save_observation(home, info, session, seq, offset, *, allow_missing=False):
     # Hooks can overlap; compare invocation sequence under a nonblocking lock.
     import fcntl
     target = observation_path(home, info["terminal_id"])
@@ -45,11 +46,17 @@ def save_observation(home, info, session, seq, offset):
         if type(current.get("seq")) is int and current["seq"] >= seq:
             return False
         tid, path, cwd = session
-        stat = path.stat()
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            if not allow_missing or offset != 0:
+                raise
+            stat = None
         # Repeated prompts/compaction in the same session retain its first cutoff.
         matching = load_observation(home, info, session)
         record = {"terminal_id": info["terminal_id"], "thread_id": tid, "cwd": cwd,
-                  "path": str(path), "device": stat.st_dev, "inode": stat.st_ino,
+                  "path": str(path), "device": stat.st_dev if stat else None, "inode": stat.st_ino if stat else None,
+                  "pending_file": stat is None,
                   "offset": matching["offset"] if matching else offset, "seq": seq}
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps(record) + "\n")
