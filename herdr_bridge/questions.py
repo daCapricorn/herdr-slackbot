@@ -11,10 +11,10 @@ import os
 import re
 import sqlite3
 import threading
-from contextlib import closing
 from pathlib import Path
 
 from .events import session_of
+from .codex_session import resolve_session, SessionUnavailable
 
 
 class QuestionUnavailable(RuntimeError):
@@ -148,28 +148,17 @@ class CodexQuestionSource:
     def _snapshot(self, info, *, unique_workspace=False):
         if info.get("agent") != "codex" or not info.get("cwd"):
             raise QuestionUnavailable("An exact Codex workspace is required")
-        databases = sorted(self.home.glob("state_*.sqlite"), key=lambda p: int(p.stem.split("_")[-1]))
-        if not databases:
-            raise QuestionUnavailable("Codex session database is unavailable")
         try:
-            with closing(sqlite3.connect(databases[-1].resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
-                if session_of(info):
-                    rows = db.execute("SELECT id,rollout_path,cwd FROM threads WHERE id=? AND archived=0 AND agent_path IS NULL",
-                                      (session_of(info),)).fetchall()
-                elif unique_workspace:
-                    rows = db.execute("SELECT id,rollout_path,cwd FROM threads WHERE cwd=? AND archived=0 AND agent_path IS NULL",
-                                      (info["cwd"],)).fetchall()
-                else:
-                    rows = []
-            if len(rows) != 1 or rows[0][2] != info["cwd"]:
-                raise QuestionUnavailable("Codex session match is ambiguous or changed")
-            tid, path, cwd = rows[0]
+            tid, rollout, cwd = resolve_session(info, home=self.home, unique_workspace=unique_workspace)
+            path = str(rollout)
             key = (tid, path, cwd)
             if key not in self.cache:
                 if len(self.cache) >= 64:
                     self.cache.pop(next(iter(self.cache)))
                 self.cache[key] = _Rollout(Path(path), tid, cwd)
             return self.cache[key].read()
+        except SessionUnavailable as exc:
+            raise QuestionUnavailable(str(exc)) from exc
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
             raise QuestionUnavailable("Cannot read Codex question evidence") from exc
 

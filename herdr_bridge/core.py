@@ -183,7 +183,9 @@ class Bridge:
         try:
             agents = self.client.list_agents() if agents is None else agents
             unique = sum(a.get("agent") == info.get("agent") and a.get("cwd") == info.get("cwd") for a in agents) == 1
-            result["model"] = session_model(info, unique_workspace=unique)
+            with self.lock:
+                metadata_info = self.codex_sync.bound_info(info) if info.get("agent") == "codex" else info
+            result["model"] = session_model(metadata_info, unique_workspace=unique)
         except Exception:
             result["model"] = None
         return result
@@ -227,6 +229,18 @@ class Bridge:
         self.db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)",
                         (event["id"], json.dumps(event, ensure_ascii=False)))
 
+    def sync_status(self, pane):
+        info = self._agent(pane)
+        with self.lock:
+            return self.codex_sync.diagnostic(info)
+
+    def bind_session(self, pane, thread_id):
+        info = self._agent(pane)
+        with self.lock, self.db:
+            self.codex_sync.bind(info, thread_id)
+        self.sync_conversation(info)
+        return self.sync_status(pane)
+
     def sync_conversation(self, info):
         """Persist new Codex conversation events and their source cursor atomically."""
         if info.get("agent") != "codex":
@@ -236,7 +250,9 @@ class Bridge:
                 live = self._agent(info["pane_id"])
                 if identity(live) != identity(info):
                     return 0
-                return self.codex_sync.sync(info, self._queue_conversation)
+                agents = self.client.list_agents()
+                unique = sum(a.get("agent") == "codex" and a.get("cwd") == info.get("cwd") for a in agents) == 1
+                return self.codex_sync.sync(info, self._queue_conversation, unique_workspace=unique)
         except Exception:
             log.exception("Codex transcript sync failed for %s", info.get("pane_id"))
             return 0
@@ -299,7 +315,12 @@ class Bridge:
     def _question_snapshot(self, info, agents=None):
         agents = self.client.list_agents() if agents is None else agents
         unique = sum(a.get("agent") == "codex" and a.get("cwd") == info.get("cwd") for a in agents) == 1
-        return self.question_source.snapshot(info, unique_workspace=unique)
+        try:
+            with self.lock:
+                question_info = self.codex_sync.bound_info(info)
+        except Exception as exc:
+            raise QuestionUnavailable(str(exc)) from exc
+        return self.question_source.snapshot(question_info, unique_workspace=unique)
 
     def discover_questions(self, info):
         if info.get("agent") != "codex":

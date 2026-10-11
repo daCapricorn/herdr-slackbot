@@ -57,7 +57,7 @@ openclaw config set plugins.entries.herdr-bridge.config.paneChannels '{"enabled"
 openclaw gateway restart
 ```
 
-Every pane, including shells, gets a private channel. Configured owners are invited before it becomes a delivery destination. Names follow pane/tab labels and retain an identity suffix. Renames and terminal moves preserve channel IDs. `/herdr channels` in the DM shows bindings. `/herdr read`, `/herdr pending` and `/herdr send <prompt>` in a pane channel infer that pane; explicit cross-pane targets are rejected. Questions still use their exact request ID with `/herdr reply`. Closing a pane retains history; `/herdr archive` in its channel explicitly archives it. Ordinary channel prose is not automatically submitted to the terminal. For Codex, new user inputs and completed answers appear in the pane channel, with tool activity reduced to short summaries and no tool output. The sync starts from the latest active turn on first attachment, or from the current end of the rollout when the pane is settled; it does not import old conversation history. Other agents remain notification-only.
+Every pane, including shells, gets a private channel. Configured owners are invited before it becomes a delivery destination. Names follow pane/tab labels and retain an identity suffix. Renames and terminal moves preserve channel IDs. `/openclaw /herdr channels` in the DM shows bindings. `/openclaw /herdr read`, `/openclaw /herdr pending` and `/openclaw /herdr send <prompt>` in a pane channel infer that pane; explicit cross-pane targets are rejected. Questions still use their exact request ID with `/openclaw /herdr reply`. Closing a pane retains history; `/openclaw /herdr archive` in its channel explicitly archives it. Ordinary channel prose is not automatically submitted to the terminal. For Codex, new user inputs and completed answers appear in the pane channel, with tool activity reduced to short summaries and no tool output. The sync starts from the latest active turn on first attachment, or from the current end of the rollout when the pane is settled; it does not import old conversation history. Other agents remain notification-only.
 
 OpenClaw sends all messages and handles interactions. A narrow Slack management adapter uses the current resolved OpenClaw bot token in memory for creation, invitation, naming and topic metadata. There is no separate Bridge credential. The selected account must use bot identity. Owner mentions accompany approval, blocked-dialog and question notifications; completion messages contain no owner mention. Actual mobile push remains subject to your Slack settings. The 10-second grace period applies to pending attention events, not completion or answer-result updates.
 
@@ -65,15 +65,21 @@ OpenClaw sends all messages and handles interactions. A narrow Slack management 
 
 | Text command | Behavior |
 |---|---|
-| `/herdr status` | List agents; select the exact pane ID |
-| `/herdr read w4:p2` | Read the visible terminal without scrolling a working TUI |
-| `/herdr pending` | List pending request IDs and their zero-based options |
-| `/herdr send w4:p2 <prompt>` | Send text to an idle/done agent |
-| `/herdr answer <request-id> 0` | Answer option index 0 for that request |
-| `/herdr reply <request-id> <text>` | Send a free-text answer to one Codex async question |
-| `/herdr check <request-id>` | Check a previous attempt; sends no keys |
+| `/openclaw /herdr status` | List agents; select the exact pane ID |
+| `/openclaw /herdr read w4:p2` | Read the visible terminal without scrolling a working TUI |
+| `/openclaw /herdr pending` | List pending request IDs and their zero-based options |
+| `/openclaw /herdr send w4:p2 <prompt>` | Send text to an idle/done agent |
+| `/openclaw /herdr answer <request-id> 0` | Answer option index 0 for that request |
+| `/openclaw /herdr reply <request-id> <text>` | Send a free-text answer to one Codex async question |
+| `/openclaw /herdr check <request-id>` | Check a previous attempt; sends no keys |
 
-`herdr` is an OpenClaw text command, not a newly registered native Slack slash command. If Slack's composer rejects an unregistered slash, use your OpenClaw installation's configured native command entry point to pass the `herdr` command. Creating another Slack app is unnecessary.
+`herdr` is an internal OpenClaw command. Slack does not automatically register `/herdr` when the plugin loads. Use the existing OpenClaw Slack App's `/openclaw` command to forward it:
+
+```bash
+openclaw config set channels.slack.slashCommand '{"enabled":true,"name":"openclaw"}'
+```
+
+Then use `/openclaw /herdr status` or `/openclaw /herdr sync` in the pane channel. The Slack App must define `/openclaw` in its Slash Commands and retain the `commands` scope. If absent, add it to that same App (Socket Mode does not require a public Request URL), rather than creating another App. A custom configured entry name replaces `/openclaw` in these examples. Native `/herdr` is optional and requires separate Slack App registration and native-command configuration.
 
 Top-level notifications contain one bold header (Herdr name, current model, cwd), an inline-code summary, terminal conversation and, for recognized approvals, native buttons. The summary is a bounded rule-based extraction, not an LLM-generated semantic summary. The visible terminal capture remains the evidence and may not include older off-screen history. Models are resolved from actual session metadata; unavailable or ambiguous matches are shown as unknown.
 
@@ -91,11 +97,11 @@ Unknown dialogs, multi-select, typed approval inputs and file-backed plans need 
 
 ## Codex Queued follow-up inputs
 
-Codex CLI async questions can remain queued while the agent works, without a Herdr `blocked` transition. Bridge scans structured session evidence every five seconds and forwards each question independently to its pane channel, or the configured DM when pane channels are disabled. The card keeps the full question, full suggestion labels and terminal capture. Click a suggestion, or send `/herdr reply <request-id> <your answer>` for free text. Neither discovery nor delivery opens the local menu or answers automatically.
+Codex CLI async questions can remain queued while the agent works, without a Herdr `blocked` transition. Bridge scans structured session evidence every five seconds and forwards each question independently to its pane channel, or the configured DM when pane channels are disabled. The card keeps the full question, full suggestion labels and terminal capture. Click a suggestion, or send `/openclaw /herdr reply <request-id> <your answer>` for free text. Neither discovery nor delivery opens the local menu or answers automatically.
 
 The adapter has been checked against Codex CLI **0.162.1**. The Gateway worker needs read access to the same user's `CODEX_HOME` (default `~/.codex`), including its state database and rollout files. An exact Herdr session ID takes precedence. Otherwise there must be only one live Codex pane and one unarchived non-subagent Codex session for that directory; session ambiguity disables discovery/dispatch.
 
-Leave the main composer empty when answering remotely. A collapsed question uses Codex's native question-reply envelope through Herdr's prompt API (or one encoded pane submission when Herdr labels the verified collapsed UI blocked); this special path can answer while Codex works, unlike ordinary `/herdr send`. If the exact question menu is already expanded, a single-digit suggestion may be selected there. Free text, larger option indices, unknown layouts, local drafts or a different open approval require returning to the empty main composer first. No automatic menu navigation is performed.
+Leave the main composer empty when answering remotely. A collapsed question uses Codex's native question-reply envelope through Herdr's prompt API (or one encoded pane submission when Herdr labels the verified collapsed UI blocked); this special path can answer while Codex works, unlike ordinary `/openclaw /herdr send`. If the exact question menu is already expanded, a single-digit suggestion may be selected there. Free text, larger option indices, unknown layouts, local drafts or a different open approval require returning to the empty main composer first. No automatic menu navigation is performed.
 
 The card first shows checking. `confirmed` means the matching question ID and exact answer were recorded in the Codex session, even if Herdr remains `working`. A question disappearing, a turn ending or a different local answer cannot confirm your Slack selection. Repeated clicks and restart recovery never replay input. Read-only checks and eligible explicit retries reuse the approval recovery infrastructure. A free-text command has no callback editor, so background results arrive in a new status message. Old question cards may remain visible but cannot answer an expired request.
 
@@ -132,3 +138,11 @@ Old `.env` tokens, pairing codes, bot DMs and thread associations are not import
 | Approval still open | Use 检查状态; submit again only if the attempt-bound 重新提交 button appears |
 
 Check delivery, callback, terminal dispatch and phone push independently. A successful provider receipt alone verifies none of the other three.
+
+### Codex sync session resolution
+
+`/openclaw /herdr sync` in a pane channel shows `syncing`, `pending`, or `unavailable`, with the reason and resolved thread ID. In the DM, use `/openclaw /herdr sync <pane>`.
+
+When Herdr omits `agent_session`, automatic discovery requires exactly one Codex pane in the directory and exactly one non-archived, non-subagent Codex thread there. The rollout's `session_meta` must match its database ID and cwd. Neither modification time nor the newest thread is used to guess a session.
+
+For ambiguous directories, use `/openclaw /herdr bind <thread-id>` in the pane channel, or `/openclaw /herdr bind <pane> <thread-id>` in the DM. Obtain the exact ID from the intended Codex conversation. Binding is a Bridge-only association; it does not send terminal input or modify Codex state. It persists across Gateway restart, follows terminal movement, and does not transfer to a recreated terminal. A conflicting Herdr session ID or changed directory stops sync. If Codex resumes a different conversation in the same terminal while Herdr still omits its session ID, explicitly bind the new thread; that switch cannot be proven from pane identity alone.

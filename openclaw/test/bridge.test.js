@@ -470,3 +470,21 @@ test("channel recovery uses persisted source and account changes cannot deliver 
   for(let i=0;i<20;i++) await new Promise(resolve=>setImmediate(resolve));
   assert.equal(bridge.edits.length,0);assert.ok(!bridge.calls.some(c=>c.method === "ack"));
 });
+
+test("session binding and sync diagnostics are owner-only and scoped to the pane channel", async t => {
+  const bridge = await runningBridge(t, {config:channelConfig,channelFactory,call:async(method)=> {
+    if (method === "events") return [];
+    if (method === "pane_for_channel") return {pane_id:"w4:p2",closed:false};
+    return {state:"syncing",thread_id:"thread-a"};
+  }});
+  const handler = bridge.registrations.command.handler;
+  const ctx = {...trusted,conversationId:"C2"};
+  assert.match((await handler({...ctx,args:"bind thread-a"})).text,/syncing/);
+  assert.deepEqual(bridge.calls.find(c=>c.method === "bind_session").params,{pane:"w4:p2",thread_id:"thread-a"});
+  await handler({...ctx,args:"sync"});
+  assert.deepEqual(bridge.calls.find(c=>c.method === "sync_status").params,{pane:"w4:p2"});
+  const before = bridge.calls.filter(c=>c.method === "bind_session").length;
+  assert.match((await handler({...ctx,args:"bind w4:p1 thread-b"})).text,/different pane/);
+  assert.match((await handler({...ctx,senderId:"U2",args:"bind thread-b"})).text,/not authorized/);
+  assert.equal(bridge.calls.filter(c=>c.method === "bind_session").length,before);
+});

@@ -8,6 +8,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .events import session_of
+from .codex_session import resolve_session, SessionUnavailable
 
 
 def _last_model(path, kind):
@@ -37,23 +38,16 @@ def session_model(info, *, unique_workspace=False, codex_home=None, claude_home=
     kind, session = info.get("agent"), session_of(info)
     if kind == "codex":
         home = Path(codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-        databases = sorted(home.glob("state_*.sqlite"), key=lambda p: int(p.stem.split("_")[-1]))
-        if not databases:
-            return None
         try:
+            tid, rollout, _ = resolve_session(info, home=home, unique_workspace=unique_workspace, require_rollout=False)
+            actual = _last_model(rollout, kind)
+            if actual:
+                return actual
+            databases = sorted(home.glob("state_*.sqlite"), key=lambda p: int(p.stem.split("_")[-1]))
             with closing(sqlite3.connect(databases[-1].resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
-                if session:
-                    rows = db.execute("SELECT model, rollout_path FROM threads WHERE id=?", (session,)).fetchall()
-                elif unique_workspace and info.get("cwd"):
-                    # Only one non-subagent session AND one live pane in this cwd.
-                    # Ambiguous matches stay unknown instead of using newest/default.
-                    rows = db.execute("SELECT model, rollout_path FROM threads WHERE cwd=? AND archived=0 AND agent_path IS NULL",
-                                      (info["cwd"],)).fetchall()
-                else:
-                    return None
-                if len(rows) == 1:
-                    return _last_model(rows[0][1], kind) or rows[0][0]
-        except (sqlite3.Error, OSError, ValueError):
+                row = db.execute("SELECT model FROM threads WHERE id=?", (tid,)).fetchone()
+                return row[0] if row else None
+        except (sqlite3.Error, OSError, ValueError, SessionUnavailable):
             pass
     elif kind == "claude" and session and info.get("cwd"):
         home = Path(claude_home or Path.home() / ".claude")
