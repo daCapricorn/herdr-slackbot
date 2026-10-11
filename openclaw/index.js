@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Worker } from "./worker.js";
-import { answerText, answerEdit, updateAnswerCard, code, deliver, eventPayload, statusPayload } from "./presentation.js";
+import { answerText, answerPayload, answerEdit, updateAnswerCard, code, deliver, eventPayload, statusPayload } from "./presentation.js";
 
 export function authorized(config, ctx) {
   return (ctx.isAuthorizedSender ?? ctx.auth?.isAuthorizedSender) === true
@@ -68,7 +68,11 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
               try {
                 if (event.type === "approval.updated") {
                   const requestId = event.result.request_id;
-                  const {cards} = await call("result_cards", {request_id:requestId});
+                  const {cards,result} = await call("result_cards", {request_id:requestId});
+                  // A text reply has no interactive editor. Its durable follow-up
+                  // still needs a portable status message before outbox acknowledgement.
+                  if (!cards.length && result.kind === "codex_question")
+                    await deliver(api,config.route,answerPayload(result),controller.signal);
                   let recoverySent = false;
                   for (const binding of cards) {
                     if (stopping) break;
@@ -115,7 +119,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
       },
     });
     api.registerCommand({
-      name: "herdr", description: "Herdr status, read, pending, send, and exact approvals",
+      name: "herdr", description: "Herdr status, read, pending, send, approvals, and question replies",
       acceptsArgs: true, requireAuth: true, channels: ["slack"],
       async handler(ctx) {
         try {
@@ -134,13 +138,18 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
           }
           if (verb === "check" && /^[a-f0-9]{32}$/.test(target ?? ""))
             return {text:answerText(await call("check",{request_id:target}))};
+          if (verb === "reply" && /^[a-f0-9]{32}$/.test(target ?? "")) {
+            const text = args.replace(/^reply\s+\S+\s*/, "");
+            allowed(ctx);
+            return {text:answerText(await call("answer",{request_id:target,answer_text:text}))};
+          }
           if (verb === "send" && target) {
             const text = args.replace(/^send\s+\S+\s*/, "");
             allowed(ctx);
             await call("send", { pane: target, text });
             return { text: `Prompt dispatched to ${target}.` };
           }
-          return { text: "Use /herdr status | read w4:p2 | pending | send w4:p2 <prompt> | answer <request-id> <zero-based-option> | check <request-id>" };
+          return { text: "Use /herdr status | read w4:p2 | pending | send w4:p2 <prompt> | answer <request-id> <zero-based-option> | reply <request-id> <text> | check <request-id>" };
         } catch (error) { return { text: error.message }; }
       },
     });

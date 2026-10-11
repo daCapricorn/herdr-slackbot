@@ -37,6 +37,12 @@ Put Slack in the background and lock the phone before triggering a fresh approva
 
 With a pending request, restart Gateway and confirm it remains available. With an unresolved consumed/reserved attempt, restart and confirm observation resumes without any key write. Results update the original card while its authenticated callback editor remains available; after restart they arrive in a replacement recovery card with the same request ID. An unsupported dialog should notify for local handling and expose no remote options. At-least-once provider delivery may duplicate messages.
 
+## 6. Codex async questions
+
+In Codex CLI 0.162.1, ask the agent to call `request_user_input_async` with a harmless label question and two suggestions. Keep the turn active until answering. Without opening the local menu, verify a top-level question card arrives while Herdr is working, with the full title/options, terminal capture and `/herdr reply` guidance. Click only in Slack. Confirm checking precedes the one input submission, then the exact native question ID and answer appear in Codex's durable user record and the card shows confirmed. Herdr need not leave working.
+
+For free text, leave the main composer empty and use `/herdr reply <request-id> <text>`. Confirm the recorded answer matches exactly. Repeated same-answer clicks/commands must not submit again. Answer locally or end the turn before clicking a different question card: the old request must fail without input. Leave a local draft: a remote submission must fail without appending to it. Discovery/restart alone must never open a menu or send an answer. Compare ordinary approval tests separately.
+
 ## Recorded result, 2026-10-10
 
 On the tested macOS installation, actual runtime registration, native card delivery, the no-op callback and a real `/usr/bin/uname -s` approval were verified. The command returned `Darwin`; durable state and logs recorded one dispatch. The recipient separately confirmed push with Slack backgrounded and the phone locked, and the card showed `dispatched`. A subsequent real DM preview confirmed the single header and highlighted summary layout. This is evidence for the tested configuration, not every Slack device policy.
@@ -44,3 +50,11 @@ On the tested macOS installation, actual runtime registration, native card deliv
 After terminal-confirmation checks were added, a second real Slack approval for `/usr/bin/uname -m` returned `arm64`. The worker sent one digit, observed the original approval closed after about 630 ms, and recorded `confirmed`. Simulated dropped-input cases report `unconfirmed` without retry; the intermittent live failure itself has not yet been reproduced.
 
 After recovery was added, a real `/usr/bin/uname -s` approval at 22:57 Dubai time returned `Darwin`. The authenticated Slack callback reserved and dispatched attempt `38af9b333a794b4bb87be03c311ebf06` for request `c2e5ffe54096436397386da9aaacdec6`; one digit was sent, and stable terminal progression confirmed closure after 644 ms. Slack readback verified `confirmed` on the original card. A Gateway restart subsequently delivered the persisted recovery result and cleared the outbox without replaying input. Explicit retry and the reported intermittent input loss remain simulated coverage rather than live failure reproduction.
+
+## Codex async question verification, 2026-10-11
+
+- Full regression after the final input-state fix: **940 Python tests passed**, 5 opt-in live tests skipped; **25 JavaScript tests passed**.
+- The first live color question exposed Herdr reporting a collapsed queued question as `blocked` while the TUI displayed `Working`. The Slack choice was rejected before input. The final adapter distinguishes that verified empty-composer UI from unrelated approvals and chooses one encoded pane submission before dispatch.
+- At 10:19 Dubai time, the owner answered the second color question only through Slack. Request `c8fcfee6f9bb4803a3a84199794c8e94`, attempt `e74ae554e90b442bbd2f2fe40dd4358b`, submitted the native answer envelope once. Codex recorded `紫色标签` for exact question ID `["request_user_input_async","call_ae330806efd14d2cb0f7444c6210f004",0]`; two observations produced `confirmed` after 649 ms. No terminal command was executed by this test.
+- Independent Slack readback of original card `1791699571.404789` confirmed “Codex recorded the answer to this question” and no remaining choice buttons. The durable result update was delivered and its outbox event cleared.
+- This live result covers collapsed async questions on Codex CLI 0.162.1, Herdr 0.9.3 and OpenClaw 2026.9.9. Expanded-menu selection, free-text commands, drafts, explicit retries and restart no-replay have deterministic test coverage; they were not all exercised live in this run. A separate locked-phone push test was not repeated for question cards.

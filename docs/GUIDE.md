@@ -57,6 +57,7 @@ The Gateway supervises the Python worker and stores the SQLite request/outbox da
 | `/herdr pending` | List pending request IDs and their zero-based options |
 | `/herdr send w4:p2 <prompt>` | Send text to an idle/done agent |
 | `/herdr answer <request-id> 0` | Answer option index 0 for that request |
+| `/herdr reply <request-id> <text>` | Send a free-text answer to one Codex async question |
 | `/herdr check <request-id>` | Check a previous attempt; sends no keys |
 
 `herdr` is an OpenClaw text command, not a newly registered native Slack slash command. If Slack's composer rejects an unregistered slash, use your OpenClaw installation's configured native command entry point to pass the `herdr` command. Creating another Slack app is unnecessary.
@@ -69,7 +70,19 @@ After five seconds without confirmation, the card reports `unconfirmed` or unkno
 
 Gateway restarts never automatically resend terminal input. While the process remains active, background results update the original card. After restart, a new recovery card carries the same request ID and applicable controls; the previous card may retain its earlier display. The durable record/logs retain each attempt, timing and observed evidence. Existing `dispatched` records describe a legacy send acknowledgement, not terminal acceptance.
 
-Unknown dialogs, multi-select, typed inputs and file-backed plans need local handling. Inspecting an agent such as Pi does not imply remote approval support for that agent's dialogs.
+Unknown dialogs, multi-select, typed approval inputs and file-backed plans need local handling. Inspecting an agent such as Pi does not imply remote approval support for that agent's dialogs.
+
+## Codex Queued follow-up inputs
+
+Codex CLI async questions can remain queued while the agent works, without a Herdr `blocked` transition. Bridge scans structured session evidence every five seconds and forwards each question independently to the configured DM. The card keeps the full question, full suggestion labels and terminal capture. Click a suggestion, or send `/herdr reply <request-id> <your answer>` for free text. Neither discovery nor delivery opens the local menu or answers automatically.
+
+The adapter has been checked against Codex CLI **0.162.1**. The Gateway worker needs read access to the same user's `CODEX_HOME` (default `~/.codex`), including its state database and rollout files. An exact Herdr session ID takes precedence. Otherwise there must be only one live Codex pane and one unarchived non-subagent Codex session for that directory; session ambiguity disables discovery/dispatch.
+
+Leave the main composer empty when answering remotely. A collapsed question uses Codex's native question-reply envelope through Herdr's prompt API (or one encoded pane submission when Herdr labels the verified collapsed UI blocked); this special path can answer while Codex works, unlike ordinary `/herdr send`. If the exact question menu is already expanded, a single-digit suggestion may be selected there. Free text, larger option indices, unknown layouts, local drafts or a different open approval require returning to the empty main composer first. No automatic menu navigation is performed.
+
+The card first shows checking. `confirmed` means the matching question ID and exact answer were recorded in the Codex session, even if Herdr remains `working`. A question disappearing, a turn ending or a different local answer cannot confirm your Slack selection. Repeated clicks and restart recovery never replay input. Read-only checks and eligible explicit retries reuse the approval recovery infrastructure. A free-text command has no callback editor, so background results arrive in a new status message. Old question cards may remain visible but cannot answer an expired request.
+
+Unanswered questions are invalidated at the end of their originating turn and after 15 minutes. Locally skipping a question has no durable answer record; the visible question count/menu prevents writing to mismatched input, but the old card can remain until turn expiry. Herdr cannot atomically verify and submit against simultaneous local typing, so keep the composer untouched during a remote answer. Ordinary queued message editing and non-async question tools are outside this adapter's scope.
 
 ## Migrating from herdr-slackbot
 
@@ -95,6 +108,8 @@ Old `.env` tokens, pairing codes, bot DMs and thread associations are not import
 | Commands rejected | OpenClaw ingress allowlist, owner ID, channel and account match |
 | Cards arrive but buttons fail | Runtime interactive registration, sender authorization, callback logs |
 | Approval rejected as stale | Read the current terminal; use the current pending request |
+| Queued Codex question missing | Same-user Codex state access, exact/unambiguous session match, active turn |
+| Question answer rejected | Empty main composer or exact visible question menu; active question/expiry |
 | No phone push | Slack/device notification policy, availability, background/lock-screen behavior |
 | Duplicate card | Shared request ID returns the current attempt; only the separate retry button permits another submission |
 | Approval still open | Use 检查状态; submit again only if the attempt-bound 重新提交 button appears |

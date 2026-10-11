@@ -20,11 +20,12 @@ The current integration supports **Slack DMs through OpenClaw**. The core and me
 - List agents and read an exact pane's visible terminal conversation, including command output.
 - Send a prompt to an idle or completed agent.
 - Show recognized Codex command approvals and Claude single-choice dialogs with native buttons, then revalidate the exact request before sending keys.
-- Keep pending approvals and outbound messages across Gateway/worker restarts.
+- Forward Codex CLI async questions from Queued follow-up inputs, including while the agent is working. Answer a suggested choice in Slack or use `/herdr reply` for free text.
+- Keep pending approvals/questions and outbound messages across Gateway/worker restarts.
 
 Messages show **Herdr name · current model · directory path**, followed by an inline-code highlighted summary and the captured terminal conversation. The name uses Herdr's agent name or tab label. The model comes from reported metadata or the actual Codex/Claude session; an ambiguous match shows `模型未知`. Summaries extract the pending command or latest assistant paragraph using rules, without an LLM call.
 
-Bridge can list and read agents reported by Herdr, including Pi. Unrecognized dialogs, multi-select, typed inputs and file-backed plans need local handling. Agent creation, Home-tab controls and implicit Slack thread-to-pane routing remain features of the archived standalone bot.
+Bridge can list and read agents reported by Herdr, including Pi. Unrecognized dialogs, multi-select, typed approval inputs and file-backed plans need local handling. Agent creation, Home-tab controls and implicit Slack thread-to-pane routing remain features of the archived standalone bot.
 
 ## Setup
 
@@ -73,9 +74,16 @@ Send `/herdr status` as a text command in the OpenClaw bot DM. See the [guide](d
 | `/herdr pending` | Request IDs and zero-based options |
 | `/herdr send w4:p2 inspect the project` | Prompt an idle/done agent |
 | `/herdr answer <request-id> 0` | Answer one exact request after live checks |
+| `/herdr reply <request-id> <text>` | Answer an exact Codex async question with free text |
 | `/herdr check <request-id>` | Inspect a previous attempt without sending keys |
 
 Clicks and write commands require an authenticated configured owner on the configured channel/account. Optional `herdr_status` and `herdr_read` tools give OpenClaw's model read access; the model receives no approval or terminal-write tool.
+
+## Codex queued questions
+
+The async question adapter has been checked against **Codex CLI 0.162.1**. It reads structured local session records from `CODEX_HOME` (default `~/.codex`); the Gateway must run as the same user with access to those records. Without a reported session ID, matching requires one live Codex pane and one unarchived non-subagent session in that directory. Ambiguous sessions are not guessed. Other agents retain their existing dialog handling.
+
+Each question card contains its full title and suggestions, alongside the terminal capture. Discovery never opens the local question menu or sends input. A click uses an exact expanded menu, or the known empty main composer to submit Codex’s native question reply. When Herdr misclassifies that collapsed summary as blocked, the guarded path uses one encoded pane submission instead of `agent.prompt`. Free text requires the empty main composer. Drafts, other approvals and unknown layouts prevent submission. Confirmation requires the exact question ID and answer in a durable Codex user-message record; a state change alone is insufficient. Unanswered questions expire when their originating turn ends, or after the Bridge request’s 15-minute lifetime. This supports async questions, not ordinary queued message editing.
 
 ## Reliability
 
