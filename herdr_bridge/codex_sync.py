@@ -100,7 +100,7 @@ def _completed_agent_message(item):
         return None
     text = item.get("text", item.get("message"))
     if text is None:
-        text = _text_from_content(item.get("content"), accepted=("output_text", "text"))
+        text = _text_from_content(item.get("content"), accepted=("output_text", "text", "Text"))
     if not isinstance(text, str) or not text.strip():
         return None
     return text.strip()
