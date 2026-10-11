@@ -54,7 +54,7 @@ Result changes queue unique `approval.updated` events and persist authenticated 
 
 Herdr 0.9.3's [send-keys handler](https://github.com/herdrdev/herdr/blob/v0.9.3/src/app/api/agents.rs) returns `ok` after `runtime.try_send_bytes` accepts the encoded bytes. It does not wait for the agent TUI to process them. This is why Bridge must observe terminal acceptance separately.
 
-Codex approval evidence begins at its current command question; transcript updates above it cannot change the request fingerprint. Unknown screen redraws notify only once per terminal/status generation. Replaced requests become superseded, and queued cards are discarded when the agent advances or the request expires. Dispatch rechecks the status sequence after reading the dialog as well as before it.
+Codex approval evidence begins at its current command question; transcript updates above it cannot change the request fingerprint. Unknown screen redraws notify only once per terminal/status generation. Replaced requests become superseded, and queued cards are discarded when the agent advances. There is no fixed request TTL; every click rechecks pane identity, status sequence and dialog fingerprint. Dispatch rechecks the status sequence after reading the dialog as well as before it.
 
 ## Codex async question adapter
 

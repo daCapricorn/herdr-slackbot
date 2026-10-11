@@ -51,7 +51,7 @@ export function eventPayload(event) {
     blocks.push({type:"context",text:`可点选项，或发送 /herdr reply ${request.id} <你的回答>。问题会在当前 Codex 回合结束时失效。`});
   }
   if (request?.options?.length) {
-    blocks.push({ type: "context", text: `Request ${request.id} · expires ${new Date(request.expires_at * 1000).toISOString()}` });
+    blocks.push({ type: "context", text: `Request ${request.id}` });
     blocks.push({ type: "buttons", buttons: request.options.map((o) => ({
       label: buttonLabel(o),
       action: { type: "callback", value: `herdr-bridge:${request.id}:${o.index}` },

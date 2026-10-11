@@ -156,11 +156,11 @@ def test_immediate_pre_handoff_check_cancels_a_card_answered_after_batch_read(tm
         core.close()
 
 
-def test_expiry_before_deadline_does_not_produce_a_notification(tmp_path):
-    core, clock, _, _ = create(tmp_path, approval_ttl=5)
+def test_request_remains_pending_beyond_old_expiry_and_obeys_attention_delay(tmp_path):
+    core, clock, _, _ = create(tmp_path)
     try:
         clock.now = 110
-        assert core.events() == [] and core.pending() == []
+        assert len(core.events()) == 1 and len(core.pending()) == 1
     finally:
         core.close()
 

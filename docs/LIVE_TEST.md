@@ -90,3 +90,9 @@ Enable `paneChannels` after adding `groups:write` and `groups:write.invites` to 
 - All **44 JavaScript tests passed** after this correction. The preceding durable-context worker change passed **966 Python tests**, with 5 opt-in live tests skipped; the correction changes only JavaScript rendering/callback presentation.
 - A real Slack-only retest, request `b23e6465ed464b9b84ec7d1b079188d4`, attempt `48b523d7008541e99a8a09e2466dd02f`, reached `confirmed` after **1869 ms** with reason `question_answered`. Independent readback of original card `1791704538.173749` verified the native header, highlighted summary, confirmed status, retained code-block transcript and zero action blocks. No terminal command was executed by the question test.
 - Previously delivered cards without saved context cannot reconstruct their original capture. This live check covers the shared question/result rendering path; a separate command approval and locked-phone push were not repeated for this layout change.
+
+## Request lifetime, 2026-10-11
+
+- Removed the Bridge's fixed 900-second TTL from approval and async-question requests. Old persisted records with `expires_at` are accepted under the same live pane, approval fingerprint/sequence and native-question checks. Exact duplicate clicks remain idempotent; explicit retry still requires fresh live evidence.
+- Removed the generated UTC expiry timestamp from new Slack cards. The previous timestamp came from `Date.toISOString()` and displayed UTC (`Z`), not the user's local timezone.
+- Full regression: **965 Python tests passed**, 5 opt-in live tests skipped; **44 JavaScript tests passed**. `tests/test_openclaw_bridge.py` verifies that an old request whose stored deadline has passed can still dispatch when its exact live approval matches. Slack UI removal of the timestamp was verified by the presentation test; no new live card was sent solely for this copy change.
