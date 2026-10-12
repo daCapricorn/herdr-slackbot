@@ -147,6 +147,8 @@ When Herdr omits `agent_session`, automatic discovery requires exactly one Codex
 
 For ambiguous directories, use `/openclaw /herdr bind <thread-id>` in the pane channel, or `/openclaw /herdr bind <pane> <thread-id>` in the DM. Obtain the exact ID from the intended Codex conversation. Binding is a Bridge-only association; it does not send terminal input or modify Codex state. It persists across Gateway restart, follows terminal movement, and does not transfer to a recreated terminal. A validated live Herdr session ID supersedes an old saved binding automatically. Manual binding to a different live Herdr session is rejected. Without a native identity, a changed directory stops sync and a conversation switch still requires an explicit bind.
 
+These directory and binding rules apply only while the Codex title export is off. With the export enabled, the title is the only identity source and its failure is never replaced by them (see [Codex](#codex)).
+
 ### Agent plugins and session association
 
 Codex and Claude have independent plugins/readers behind the same Bridge contract. Plugins report the exact agent/session through `pane.report_agent_session`; Bridge owns durable synchronization, terminal validation, channel routing, approvals and delivery through OpenClaw. Plugins never send Slack messages or terminal input.
@@ -175,9 +177,40 @@ This preserves the managed Herdr hook, other handlers and Codex trust configurat
 
 #### Codex
 
-Normal `codex` and `bash scripts/codex-herdr.sh` keep the default runtime. Shared-daemon sessions support sync with an exact native/manual binding. With Codex CLI 0.162.1, command hooks can inherit the daemon's original pane environment and do not receive a TUI/client ID. The plugin refuses to invent a mapping in that mode. After `/new` or switching sessions without a trustworthy native identity, use `/openclaw /herdr bind <thread-id>` in that pane's channel.
+Normal `codex`, `codex resume` and `bash scripts/codex-herdr.sh` keep the default shared-daemon runtime. In that runtime, with Codex CLI 0.162.1, command hooks run in the daemon with its original pane environment and receive no TUI/client ID. A `resume <id>` argv also goes stale after `/new`. Neither identifies the thread a pane is showing, and the plugin refuses to invent a mapping from them.
 
-An optional `codex --no-daemon` runtime allows automatic hook registration by proving that a foreground process in exactly one pane is the hook's ancestor. Exact root database/rollout identity, terminal and process are revalidated; null `transcript_path` is accepted. Nested agents and stale overlapping hooks cannot replace the association. This compatibility path is not a Bridge-wide startup requirement.
+Codex's native terminal-title export does identify it. Each TUI client renders the `session-id` title item from its current thread (the full ID, or its first 29 characters followed by `...`). `/new` clears it, and resuming or selecting another thread updates it. Enable it once for regular `codex`:
+
+```bash
+.venv/bin/python scripts/configure-codex-identity.py        # --home <dir> for another CODEX_HOME
+```
+
+The helper:
+
+- Puts `session-id` first in `[tui].terminal_title` and keeps your other title items in order (when unset, Codex's default non-activity items `thread-name` and `project-name`).
+- Removes `activity`/`spinner`/`status`: they can prefix the title, and `activity`/`spinner` anywhere add an "Action Required" prefix while Codex is blocked.
+- Leaves all other config bytes, hooks, trust, auth, model and permission settings unchanged.
+- Keeps a one-time `config.toml.herdr-bridge-backup` (mode 0600) and replaces the file atomically.
+- Refuses malformed or unsupported layouts and edits made concurrently by something else.
+
+**Restart existing Codex clients after changing title settings; running clients keep their startup settings.** A per-launch override such as `codex -c 'tui.terminal_title=["session-id","thread","current-dir"]' resume <id>` also works within the supported config bounds below. Direct foreground `-c`/`--config` overrides of `tui.terminal_title` take precedence over `$CODEX_HOME/config.toml` in command-line order.
+
+Bridge supports this user config and direct CLI title override, with a readable matching foreground Codex process. It refuses profile selection (`--profile`/`-p`, or config profile selectors), top-level CLI `tui=...` overrides, and ancestor `.codex/config.toml` files that set `tui.terminal_title`. The ancestor scan excludes `$CODEX_HOME` and conservatively checks every parent rather than reproducing Codex's project trust/root discovery. Unrelated ancestor `tui` settings are allowed. Invalid or unreadable user, ancestor or system configs, system title/profile settings, `/etc/codex/managed_config.toml`, forced macOS Codex preferences, and an inability to check those preferences make identity unavailable. These checks read config and preference metadata; they do not modify either. Package defaults and enterprise/cloud title layers are outside this bounded adapter's support.
+
+While the export is enabled (the first effective title item is `session-id`/`thread-id`), Bridge reads each Codex pane's title on every scan:
+
+- **Accepts:** only an exact ID or 29-character prefix as the first ` | `-separated item, or as the whole title when it is the only item. While Codex generates a thread name it appends a space and one Braille spinner frame (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) to that item; only that suffix is tolerated. Leading text, other items and trailing IDs are never searched.
+- **Resolves:** exactly one active root thread in the pane's directory, whose full ID must be a well-formed thread ID. Another thread sharing the prefix, in any directory, makes the title ambiguous. The rollout header is checked too.
+- **Re-checks:** the pane, terminal, directory, parsed session prefix and foreground Codex process afterwards. Spinner frames and thread-name changes are cosmetic and do not invalidate an unchanged prefix.
+- **Keeps the result** for that scan only. It is never saved as a binding.
+
+If config cannot be established within these bounds, or the enabled title has no ID (for example, after `/new` until the new thread exists), is invalid, ambiguous or changes its session prefix during the read, `/openclaw /herdr sync` reports the pane `unavailable` with the reason. Conversation sync, model display and question cards then stop. Bridge does not fall back to Herdr's earlier native session, a saved binding or a directory match. Pane and channel names still come from the pane/tab label, never from the title. This path has deterministic test coverage; live verification is pending.
+
+The export also lets the plugin's `SessionStart`/`UserPromptSubmit` hooks register a shared-daemon pane. Bridge scans every 5 seconds and an idle pane's first scan starts at the end of the rollout, so without a hook a quick first prompt after `/new` or a resume could finish before that scan and be skipped. The hook selects the one Codex pane in the payload's directory whose title currently resolves, as above, to the payload's exact root thread ID. After validating the rollout and calculating its start offset, it rechecks the pane's terminal, directory, foreground process and title immediately before saving the offset and reporting the session to Herdr. Two panes showing the same thread, a title that has not yet changed after `/new`, a child thread or a nested agent's mismatched `CODEX_THREAD_ID` register nothing; the next prompt's hook or the scan then applies. The inherited `HERDR_PANE_ID`, Herdr's native session, the resume argv and the directory are never used to pick the pane, and the hook never saves a binding. Existing Codex clients must be restarted once after enabling the export.
+
+When a matching foreground process and supported config establish that export is off, the previous native/manual contract applies. After `/new` or switching sessions, use `/openclaw /herdr bind <thread-id>` in that pane's channel. Unknown or unsupported config never permits this fallback.
+
+An optional `codex --no-daemon` runtime allows automatic hook registration by proving that a foreground process in exactly one pane is the hook's ancestor; that proof takes precedence over the title. Exact root database/rollout identity, terminal and process are revalidated; null `transcript_path` is accepted. Nested agents and stale overlapping hooks cannot replace the association. This compatibility path is not a Bridge-wide startup requirement.
 
 #### Claude
 

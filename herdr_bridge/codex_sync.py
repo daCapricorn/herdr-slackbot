@@ -8,7 +8,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .codex_session import resolve_session, validate_rollout, SessionUnavailable
+from .codex_session import AUTHORITY_ERROR, resolve_session, validate_rollout, SessionUnavailable
 from .events import session_of
 from .transcript_sync import TranscriptSync
 
@@ -61,8 +61,16 @@ def _text_from_content(content, accepted=("input_text", "text")):
 
 
 def _redact(text: str) -> str:
-    text = re.sub(r"(?i)(\b[A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|API[_-]?KEY)\b\s*[=:]\s*)([^\s,;]+)", r"\1[redacted]", text)
-    text = re.sub(r"(?i)(\b(?:authorization\s*[:=]\s*(?:bearer|basic)|--(?:token|password|secret|api-key)(?:=|\s+)))([^\s,;]+)", r"\1[redacted]", text)
+    value = r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;"']+)'''
+
+    def credential(match):
+        secret = match[2]
+        replacement = secret[0] + "[redacted]" + secret[-1] if secret[0] in "\"'" else "[redacted]"
+        return match[1] + replacement
+
+    text = re.sub(r"(?i)(\b[A-Z0-9_]*(?:TOKEN|PASSWORD|PASSWD|SECRET|API[_-]?KEY)\b\s*[=:]\s*)" + value, credential, text)
+    text = re.sub(r"(?i)(\bauthorization\s*[:=]\s*(?:bearer|basic)\s+)" + value, credential, text)
+    text = re.sub(r"(?i)(--(?:token|password|secret|api-key)(?:=|\s+))" + value, credential, text)
     text = re.sub(r"\b(?:xox[baprs]-|sk-[A-Za-z0-9_-]{12,})[A-Za-z0-9_-]*", "[redacted]", text)
     text = re.sub(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b", "[redacted]", text)
     return text
@@ -146,6 +154,8 @@ class CodexRolloutSync(TranscriptSync):
         return _latest_turn_offset(path)
 
     def _resolve(self, info, unique_workspace=False):
+        if info.get(AUTHORITY_ERROR):
+            raise SessionUnavailable(info[AUTHORITY_ERROR])
         # An exact live Herdr identity supersedes a saved manual association.
         # Validate it before changing any binding; never choose a newer cwd match.
         if session_of(info):

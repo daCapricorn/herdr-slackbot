@@ -7,10 +7,14 @@ import re
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
-from .codex_session import resolve_session, validate_rollout, SessionUnavailable
+from .agent_adapters import CodexAdapter
+from .codex_session import TITLE_SOURCE, resolve_session, validate_rollout, SessionUnavailable
 from .herdr_client import HerdrClient, UnixSocketTransport
 from .session_observation import save_observation
+
+IDENTITY = ("pane_id", "terminal_id", "agent", "cwd")
 
 
 def caller_pids():
@@ -18,19 +22,40 @@ def caller_pids():
     return {p.pid for p in psutil.Process().parents()}
 
 
-def caller_agent(client, cwd, pids):
-    candidates = []
+def foreground_ancestor(process, pids):
+    return any(p.get("pid") in pids and "--no-daemon" in p.get("argv", [])
+               for p in process.get("foreground_processes", []))
+
+
+def title_witness(client, info, tid, home):
+    """Process snapshot when the configured native title proves this root thread."""
+    process = client.process_info(info["pane_id"])
+    adapter = CodexAdapter(SimpleNamespace(home=home))
+    session = adapter.enrich({**info, "agent_session": None}, client).get("agent_session")
+    if (isinstance(session, dict) and session.get("source") == TITLE_SOURCE and session.get("value") == tid
+            and client.process_info(info["pane_id"]) == process):
+        return process
+    return None
+
+
+def caller_agent(client, cwd, pids, *, tid=None, home=None):
+    panes = []
     for info in client.list_agents():
         if info.get("agent") != "codex" or info.get("cwd") != cwd:
             continue
         process = client.process_info(info["pane_id"])
-        if process.get("pane_id") != info["pane_id"]:
-            continue
-        if any(p.get("pid") in pids and "--no-daemon" in p.get("argv", [])
-               for p in process.get("foreground_processes", [])):
-            candidates.append(info)
+        if process.get("pane_id") == info["pane_id"]:
+            panes.append((info, process))
+    candidates = [(info, process) for info, process in panes if foreground_ancestor(process, pids)]
+    if not candidates and tid and home:
+        for listed, _ in panes:
+            info = client.get_agent(listed["pane_id"])
+            if (all(info.get(k) == listed.get(k) for k in IDENTITY)
+                    and (process := title_witness(client, info, tid, home))):
+                candidates.append((info, process))
     if len(candidates) != 1:
-        raise SessionUnavailable("Hook has no unique foreground ancestor; use Codex --no-daemon")
+        raise SessionUnavailable("Hook has no unique foreground ancestor or exact Codex title; "
+                                 "use Codex --no-daemon or configure-codex-identity.py")
     return candidates[0]
 
 
@@ -55,26 +80,18 @@ def report_session(payload, env, client, *, home=None, seq=None, pids=None):
     if env.get("CODEX_THREAD_ID") and env["CODEX_THREAD_ID"] != tid:
         return False
     pids = caller_pids() if pids is None else pids
-    # Daemon hooks inherit the daemon's original pane environment, not the TUI
-    # that selected the thread. Only a foreground ancestor proves this binding.
-    info = caller_agent(client, cwd, pids)
+    root = Path(home or env.get("CODEX_HOME") or Path.home() / ".codex")
+    info, witnessed = caller_agent(client, cwd, pids, tid=tid, home=root)
     pane = info["pane_id"]
     fresh = client.get_agent(pane)
-    if any(fresh.get(k) != info.get(k) for k in ("pane_id", "terminal_id", "agent", "cwd")):
+    if any(fresh.get(k) != info.get(k) for k in IDENTITY):
         return False
     info = fresh
     if info.get("agent") != "codex" or info.get("cwd") != cwd or not info.get("terminal_id"):
         return False
     # Root-only database lookup and header check exclude subagent sessions even
     # when a nested runtime does not preserve CODEX_THREAD_ID.
-    session = validate_rollout(resolve_session({**info, "agent_session": None}, home=home, thread_id=tid))
-    live = client.get_agent(pane)
-    if any(live.get(k) != info.get(k) for k in ("pane_id", "terminal_id", "agent", "cwd")):
-        return False
-    process = client.process_info(pane)
-    if not any(p.get("pid") in pids and "--no-daemon" in p.get("argv", [])
-               for p in process.get("foreground_processes", [])):
-        return False
+    session = validate_rollout(resolve_session({**info, "agent_session": None}, home=root, thread_id=tid))
     seq = seq if seq is not None else time.time_ns()
     params = {"pane_id": pane, "source": "herdr:codex", "agent": "codex",
               "seq": seq, "agent_session_id": tid}
@@ -104,7 +121,15 @@ def report_session(payload, env, client, *, home=None, seq=None, pids=None):
                         break
                 except (ValueError, AttributeError, TypeError):
                     pass
-    root = Path(home or env.get("CODEX_HOME") or Path.home() / ".codex")
+    live = client.get_agent(pane)
+    if any(live.get(k) != info.get(k) for k in IDENTITY):
+        return False
+    try:
+        selected, process = caller_agent(client, cwd, pids, tid=tid, home=root)
+    except SessionUnavailable:
+        return False
+    if any(selected.get(k) != info.get(k) for k in IDENTITY) or process != witnessed:
+        return False
     if not save_observation(root, info, session, seq, offset):
         return False
     # transcript_path may legitimately be null for paginated Codex histories.

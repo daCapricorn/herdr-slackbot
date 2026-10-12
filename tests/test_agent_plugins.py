@@ -147,6 +147,7 @@ def test_both_agents_use_one_shot_approval_contract_with_retained_context(tmp_pa
         keys = []
         def get_agent(self,pane): return self.info.copy()
         def list_agents(self): return [self.info.copy()]
+        def process_info(self,pane): return {'pane_id':pane,'foreground_processes':[{'pid':100,'argv':[agent]}]}
         def read_agent_once(self,*args,**kwargs): return self.screen
         def send_keys(self,pane,keys): self.keys.append((pane,keys))
     client = Client(); bridge = Bridge(client,tmp_path/'db',notification_delay=0,confirmation_timeout=0)

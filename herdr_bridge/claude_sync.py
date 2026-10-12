@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from .events import session_of
+from .claude_records import turn_start
 from .codex_session import SessionUnavailable
 from .codex_sync import _redact
 from .transcript_sync import TranscriptSync
@@ -15,28 +16,6 @@ SESSION_ID = re.compile(r"^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$
 
 def claude_home():
     return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
-
-
-def prompt_text(row):
-    if row.get("type") != "user" or row.get("isMeta") or row.get("isSidechain"):
-        return None
-    message = row.get("message")
-    if not isinstance(message, dict):
-        return None
-    content = message.get("content")
-    if isinstance(content, str):
-        text = content.strip()
-    elif isinstance(content, list):
-        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-            return None
-        text = "\n".join(b.get("text", "") if b.get("type") == "text" else "[image]"
-                         for b in content if isinstance(b, dict) and b.get("type") in ("text", "image")).strip()
-    else:
-        return None
-    text = re.sub(r"<system-reminder>[\s\S]*?</system-reminder>", "", text).strip()
-    if not text or text.startswith(("[Request interrupted", "<command-", "<local-command", "<send_user_message_question_reply>")):
-        return None
-    return text
 
 
 def resolve_claude(info, *, home=None, thread_id=None, require_rollout=True):
@@ -121,16 +100,28 @@ class ClaudeTranscriptSync(TranscriptSync):
             if start:
                 stream.readline()
             latest = size
+            typed = None
+            settled = False
             while line := stream.readline():
                 if not line.endswith(b"\n"):
                     break
                 try:
                     row = json.loads(line)
-                    if isinstance(row, dict) and prompt_text(row):
-                        latest = stream.tell() - len(line)
-                except (ValueError, AttributeError, TypeError):
+                except ValueError:
                     continue
-        return latest
+                if not isinstance(row, dict) or row.get("isSidechain") or row.get("isMeta"):
+                    continue
+                if row.get("type") == "system" and row.get("subtype") == "turn_duration":
+                    settled = True
+                    continue
+                if boundary := turn_start(row):
+                    if settled:
+                        typed = None
+                    settled = False
+                    latest = stream.tell() - len(line)
+                    if row.get("type") == "user" and boundary[0] == "user":
+                        typed = latest
+        return typed if typed is not None else latest
 
     @staticmethod
     def event_id(source_key, item_id, role):
@@ -154,11 +145,13 @@ class ClaudeTranscriptSync(TranscriptSync):
         if row.get("sessionId") and row["sessionId"] != tid:
             raise SessionUnavailable("Claude transcript changed session while reading")
         events = []
-        prompt = prompt_text(row)
-        if prompt:
+        start = turn_start(row)
+        if start:
             events.extend(self._flush(source_key))
-            events.append((self.event_id(source_key, row.get("uuid") or str(offset), "user"),
-                           {"role": "user", "text": prompt}))
+            role, text = start
+            if role == "user":
+                events.append((self.event_id(source_key, row.get("uuid") or str(offset), "user"),
+                               {"role": "user", "text": text}))
         elif row.get("type") == "system" and row.get("subtype") == "turn_duration":
             events.extend(self._flush(source_key))
         elif row.get("type") == "assistant":
@@ -171,7 +164,7 @@ class ClaudeTranscriptSync(TranscriptSync):
             old = self.db.execute("SELECT record FROM claude_sync_pending WHERE source_key=?", (source_key,)).fetchone()
             pending = json.loads(old[0]) if old else {"id": mid, "texts": {}}
             if pending["id"] != mid:
-                # A different API message supersedes commentary from the previous one.
+                events.extend(self._flush(source_key))
                 pending = {"id": mid, "texts": {}}
             pending["stop_reason"] = message.get("stop_reason") or pending.get("stop_reason")
             content = message.get("content", [])

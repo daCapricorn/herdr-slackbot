@@ -3,7 +3,7 @@ import json
 import sqlite3
 from pathlib import Path
 from .events import session_of
-from .codex_session import SessionUnavailable
+from .codex_session import AUTHORITY_ERROR, TITLE_SOURCE, SessionUnavailable
 from .session_observation import load_observation
 
 class TranscriptSync:
@@ -35,14 +35,31 @@ class TranscriptSync:
                         (key, json.dumps({"state": state, **fields})))
 
     def claim_completion(self, info):
-        if info.get("agent") != self.agent_kind or self.diagnostic(info).get("state") != "syncing":
-            return True  # Preserve notification-only agents/unavailable sources.
-        tid, _, _ = self._resolve(info)
+        if info.get(AUTHORITY_ERROR):
+            return False
+        if info.get("agent") != self.agent_kind:
+            return True
+        if self.diagnostic(info).get("state") != "syncing":
+            return not self._has_tracked_source(info)
+        try:
+            tid, _, _ = self._resolve(info)
+        except (SessionUnavailable, OSError):
+            return False
         key = f"{info.get('terminal_id') or info.get('pane_id', '')}:{tid}"
         row = self.db.execute(f"SELECT event_id FROM {self.namespace}_sync_final WHERE source_key=?", (key,)).fetchone()
         if not row:
             return False  # Resume/startup without a new answer is not a new completion.
         return bool(self.db.execute(f"INSERT OR IGNORE INTO {self.namespace}_completion_seen VALUES (?)", (row[0],)).rowcount)
+
+    def _has_tracked_source(self, info):
+        terminal = info.get("terminal_id") or info.get("pane_id", "")
+        if self.db.execute(f"SELECT 1 FROM {self.namespace}_session_bindings WHERE terminal_id=?",
+                           (terminal,)).fetchone():
+            return True
+        prefix = terminal + ":"
+        rows = self.db.execute(f"SELECT source_key FROM {self.namespace}_sync_cursors WHERE substr(source_key, 1, ?) = ?",
+                               (len(prefix), prefix))
+        return any(row[0].rsplit(":", 1)[0] == terminal for row in rows)
 
     def sync(self, info, enqueue, *, unique_workspace=False):
         self.db.execute(f"SAVEPOINT {self.namespace}_sync_read")
@@ -69,7 +86,7 @@ class TranscriptSync:
             stat = path.stat()
             terminal = info.get("terminal_id") or info.get("pane_id", "")
             source_key = f"{terminal}:{thread_id}"
-            if session_of(info) and info.get("terminal_id"):
+            if session_of(info) and info.get("terminal_id") and info["agent_session"].get("source") != TITLE_SOURCE:
                 self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_session_bindings VALUES (?, ?, ?)",
                                 (terminal, thread_id, info["cwd"]))
             row = self.db.execute(f"SELECT rollout_path,device,inode,offset FROM {self.namespace}_sync_cursors WHERE source_key=?",

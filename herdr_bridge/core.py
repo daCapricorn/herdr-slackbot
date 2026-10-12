@@ -16,6 +16,7 @@ from .metadata import session_model
 from .questions import CodexQuestionSource, QuestionUnavailable, fingerprint as question_fingerprint, input_plan
 from .channels import PaneChannels
 from .agent_adapters import adapters
+from .codex_session import AUTHORITY_ERROR
 
 log = logging.getLogger(__name__)
 CONSUMED_STATES = {"reserved", "dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
@@ -24,6 +25,11 @@ ATTENTION_EVENTS = {"approval.requested", "agent.blocked", "question.requested"}
 
 class BridgeError(ValueError):
     pass
+
+
+def require_session_authority(info):
+    if info.get(AUTHORITY_ERROR):
+        raise BridgeError("Agent session identity unavailable; nothing was sent")
 
 
 def identity(info):
@@ -83,7 +89,6 @@ class Bridge:
         """)
         self.lock = threading.RLock()
         self.adapters = adapters(self.db)
-        self.codex_sync = self.adapters["codex"].source  # Backward-compatible read API.
         self.channels = PaneChannels(self.db)
         self.db.commit()
 
@@ -177,8 +182,9 @@ class Bridge:
         adapter = self.adapters.get(info.get("agent"))
         return adapter.enrich(info, self.client) if adapter else info
 
-    def _public_agent(self, info, agents=None):
-        info = self._enrich_agent(info)
+    def _public_agent(self, info, agents=None, *, enrich=True):
+        if enrich:
+            info = self._enrich_agent(info)
         result = public_agent(info)
         try:
             tabs = self.client.list_tabs(info.get("workspace_id"))
@@ -191,7 +197,7 @@ class Bridge:
             unique = sum(a.get("agent") == info.get("agent") and a.get("cwd") == info.get("cwd") for a in agents) == 1
             with self.lock:
                 adapter = self.adapters.get(info.get("agent"))
-                metadata_info = adapter.source.bound_info(info) if adapter else info
+                metadata_info = adapter.source.bound_info(info) if enrich and adapter else info
             result["model"] = session_model(metadata_info, unique_workspace=unique)
         except Exception:
             result["model"] = None
@@ -230,9 +236,9 @@ class Bridge:
         self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event["id"], json.dumps(event)))
         return event
 
-    def _queue_conversation(self, event_id, info, message):
+    def _queue_conversation(self, event_id, info, message, agent=None):
         event = {"id": event_id, "type": "conversation.message", "at": self.clock(),
-                 "agent": self._public_agent(info), **message}
+                 "agent": agent or self._public_agent(info, enrich=False), **message}
         self.db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)",
                         (event["id"], json.dumps(event, ensure_ascii=False)))
 
@@ -265,7 +271,15 @@ class Bridge:
                     return 0
                 agents = self.client.list_agents()
                 unique = sum(a.get("agent") == info.get("agent") and a.get("cwd") == info.get("cwd") for a in agents) == 1
-                return adapter.source.sync(info, self._queue_conversation, unique_workspace=unique)
+                public = None
+
+                def enqueue(event_id, queued, message):
+                    nonlocal public
+                    if public is None:
+                        public = self._public_agent(info, agents, enrich=False)
+                    self._queue_conversation(event_id, queued, message, public)
+
+                return adapter.source.sync(info, enqueue, unique_workspace=unique)
         except Exception:
             log.exception("%s transcript sync failed for %s", info.get("agent"), info.get("pane_id"))
             return 0
@@ -344,13 +358,13 @@ class Bridge:
         unique = sum(a.get("agent") == "codex" and a.get("cwd") == info.get("cwd") for a in agents) == 1
         try:
             with self.lock:
-                question_info = self.codex_sync.bound_info(info)
+                question_info = self.adapters["codex"].source.bound_info(info)
         except Exception as exc:
             raise QuestionUnavailable(str(exc)) from exc
         return self.question_source.snapshot(question_info, unique_workspace=unique)
 
     def discover_questions(self, info):
-        if info.get("agent") != "codex":
+        if info.get("agent") != "codex" or info.get(AUTHORITY_ERROR):
             return {}
         try:
             snapshot = self._question_snapshot(info)
@@ -360,7 +374,7 @@ class Bridge:
             return {}
         screen = self.client.read_agent_once(info["pane_id"], 160, source="visible")
         fresh = self._agent(info["pane_id"])
-        if identity(fresh) != identity(info):
+        if fresh.get(AUTHORITY_ERROR) or identity(fresh) != identity(info):
             return {}
         with self.lock, self.db:
             for question in snapshot["pending"].values():
@@ -403,6 +417,9 @@ class Bridge:
             for request_id, raw in self.db.execute("SELECT id, record FROM approvals WHERE state='pending'").fetchall():
                 rec = json.loads(raw)
                 info = live.get(rec["pane_id"])
+                if info and info.get(AUTHORITY_ERROR):
+                    self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request_id,))
+                    continue
                 if rec.get("kind") == "codex_question" and info and identity(info) == tuple(rec["identity"]):
                     try:
                         question = self._question_snapshot(info, list(live.values()))["pending"].get(rec["question"]["id"])
@@ -466,11 +483,15 @@ class Bridge:
         """True=still needs attention, False=obsolete, None=read unavailable."""
         try:
             info = self._agent(request["pane_id"])
+            if info.get(AUTHORITY_ERROR):
+                return None
             if identity(info) != tuple(request["identity"]):
                 return False
             if request.get("kind") == "codex_question":
                 question = self._question_snapshot(info)["pending"].get(request["question"]["id"])
                 fresh = self._agent(request["pane_id"])
+                if fresh.get(AUTHORITY_ERROR):
+                    return None
                 if identity(fresh) != identity(info):
                     return False
                 return bool(question and question_fingerprint(question) == request["fingerprint"])
@@ -479,6 +500,8 @@ class Bridge:
             screen = self.client.read_agent_once(request["pane_id"], 160, source="visible")
             dialog = current_dialog(screen, info.get("agent"))
             fresh = self._agent(request["pane_id"])
+            if fresh.get(AUTHORITY_ERROR):
+                return None
             return (identity(fresh) == tuple(request["identity"])
                     and fresh.get("agent_status") == "blocked" and fresh.get("state_change_seq") == request["sequence"]
                     and (dialog.fingerprint if dialog else None) == request["fingerprint"])
@@ -568,6 +591,7 @@ class Bridge:
 
     def _live_dialog(self, rec):
         info = self._agent(rec["pane_id"])
+        require_session_authority(info)
         if (tuple(rec["identity"]) != identity(info) or info.get("agent_status") != "blocked"
                 or rec.get("sequence") != info.get("state_change_seq")):
             raise BridgeError("Agent changed or is no longer blocked; nothing was sent")
@@ -576,6 +600,7 @@ class Bridge:
         if not dialog or dialog.fingerprint != rec["fingerprint"]:
             raise BridgeError("Dialog changed; nothing was sent")
         fresh = self._agent(rec["pane_id"])
+        require_session_authority(fresh)
         if (identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked"
                 or fresh.get("state_change_seq") != rec.get("sequence")):
             raise BridgeError("Agent changed before dispatch; nothing was sent")
@@ -588,6 +613,7 @@ class Bridge:
 
     def _live_question(self, rec, option, answer):
         info = self._agent(rec["pane_id"])
+        require_session_authority(info)
         if identity(info) != tuple(rec["identity"]):
             raise BridgeError("Agent changed; nothing was sent")
         try:
@@ -598,6 +624,7 @@ class Bridge:
             screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
             plan = input_plan(screen, question, option, answer, list(snapshot["pending"]))
             fresh = self._agent(rec["pane_id"])
+            require_session_authority(fresh)
             if (identity(fresh) != identity(info) or fresh.get("state_change_seq") != info.get("state_change_seq")
                     or plan["mode"] == "prompt" and fresh.get("agent_status") not in ("working", "idle", "done", "blocked")):
                 raise BridgeError("Question input changed or an approval is open; nothing was sent")
@@ -790,11 +817,17 @@ class Bridge:
         while True:
             try:
                 info = self._agent(rec["pane_id"])
+                if info.get(AUTHORITY_ERROR):
+                    reason, observation = "session_identity_unavailable", None
+                    break
                 if identity(info) != tuple(rec["identity"]):
                     reason = "agent_replaced"
                     break
                 screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
                 fresh = self._agent(rec["pane_id"])
+                if fresh.get(AUTHORITY_ERROR):
+                    reason, observation = "session_identity_unavailable", None
+                    break
                 if identity(fresh) != tuple(rec["identity"]):
                     reason = "agent_replaced"
                     break
@@ -838,10 +871,20 @@ class Bridge:
         while True:
             try:
                 info = self._agent(rec["pane_id"])
+                if info.get(AUTHORITY_ERROR):
+                    reason = "session_identity_unavailable"
+                    break
                 if identity(info) != tuple(rec["identity"]):
                     reason = "agent_replaced"
                     break
                 snapshot = self._question_snapshot(info)
+                fresh = self._agent(rec["pane_id"])
+                if fresh.get(AUTHORITY_ERROR):
+                    reason = "session_identity_unavailable"
+                    break
+                if identity(fresh) != tuple(rec["identity"]):
+                    reason = "agent_replaced"
+                    break
                 if snapshot["thread_id"] != rec["question"]["thread_id"]:
                     reason = "agent_replaced"
                     break
@@ -881,9 +924,11 @@ class Bridge:
             if not isinstance(text, str) or not text.strip() or len(text) > 16000:
                 raise BridgeError("Prompt must contain 1–16000 characters")
             info = self._agent(pane)
+            require_session_authority(info)
             if info.get("agent_status") not in ("idle", "done"):
                 raise BridgeError("Agent must be idle/done; use an exact approval request to answer a dialog")
             fresh = self._agent(pane)
+            require_session_authority(fresh)
             if identity(fresh) != identity(info) or fresh.get("agent_status") not in ("idle", "done"):
                 raise BridgeError("Agent changed before dispatch")
             self.client.prompt_agent(pane, text)
