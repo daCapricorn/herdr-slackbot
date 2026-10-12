@@ -1,0 +1,8 @@
+{
+  "name": "herdr-bridge-claude",
+  "version": "0.1.1",
+  "description": "Herdr Bridge claude session registration through the shared agent adapter protocol.",
+  "author": {
+    "name": "Herdr Bridge"
+  }
+}

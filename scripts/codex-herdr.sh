@@ -1,4 +1,4 @@
 #!/bin/sh
-# Keep hook ancestry bound to this TUI rather than a shared background daemon.
+# Use the normal Codex runtime; --no-daemon remains an explicit optional argument.
 set -eu
-exec codex --no-daemon "$@"
+exec codex "$@"

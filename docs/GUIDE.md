@@ -57,7 +57,7 @@ openclaw config set plugins.entries.herdr-bridge.config.paneChannels '{"enabled"
 openclaw gateway restart
 ```
 
-Every pane, including shells, gets a private channel. Configured owners are invited before it becomes a delivery destination. Names follow pane/tab labels and retain an identity suffix. Renames and terminal moves preserve channel IDs. `/openclaw /herdr channels` in the DM shows bindings. `/openclaw /herdr read`, `/openclaw /herdr pending` and `/openclaw /herdr send <prompt>` in a pane channel infer that pane; explicit cross-pane targets are rejected. Questions still use their exact request ID with `/openclaw /herdr reply`. Closing a pane retains history; `/openclaw /herdr archive` in its channel explicitly archives it. Ordinary channel prose is not automatically submitted to the terminal. For Codex, new user inputs and completed answers appear in the pane channel, with tool activity reduced to short summaries and no tool output. The sync starts from the latest active turn on first attachment, or from the current end of the rollout when the pane is settled; it does not import old conversation history. Other agents remain notification-only.
+Every pane, including shells, gets a private channel. Configured owners are invited before it becomes a delivery destination. Names follow pane/tab labels and retain an identity suffix. Renames and terminal moves preserve channel IDs. `/openclaw /herdr channels` in the DM shows bindings. `/openclaw /herdr read`, `/openclaw /herdr pending` and `/openclaw /herdr send <prompt>` in a pane channel infer that pane; explicit cross-pane targets are rejected. Questions still use their exact request ID with `/openclaw /herdr reply`. Closing a pane retains history; `/openclaw /herdr archive` in its channel explicitly archives it. Ordinary channel prose is not automatically submitted to the terminal. For Codex and Claude, new user inputs and completed answers appear in the pane channel, with tool activity reduced to short summaries and no tool output. The sync starts from the latest active turn on first attachment, or from the current end of the rollout when the pane is settled; it does not import old conversation history. Other agents remain notification-only.
 
 OpenClaw sends all messages and handles interactions. A narrow Slack management adapter uses the current resolved OpenClaw bot token in memory for creation, invitation, naming and topic metadata. There is no separate Bridge credential. The selected account must use bot identity. Owner mentions accompany approval, blocked-dialog and question notifications; completion messages contain no owner mention. Actual mobile push remains subject to your Slack settings. The 10-second grace period applies to pending attention events, not completion or answer-result updates.
 
@@ -147,30 +147,87 @@ When Herdr omits `agent_session`, automatic discovery requires exactly one Codex
 
 For ambiguous directories, use `/openclaw /herdr bind <thread-id>` in the pane channel, or `/openclaw /herdr bind <pane> <thread-id>` in the DM. Obtain the exact ID from the intended Codex conversation. Binding is a Bridge-only association; it does not send terminal input or modify Codex state. It persists across Gateway restart, follows terminal movement, and does not transfer to a recreated terminal. A validated live Herdr session ID supersedes an old saved binding automatically. Manual binding to a different live Herdr session is rejected. Without a native identity, a changed directory stops sync and a conversation switch still requires an explicit bind.
 
-### Codex session switching on macOS
+These directory and binding rules apply only while the Codex title export is off. With the export enabled, the title is the only identity source and its failure is never replaced by them (see [Codex](#codex)).
 
-Install the optional companion hooks alongside the existing Herdr integration:
+### Agent plugins and session association
 
-```bash
-.venv/bin/python scripts/install-codex-session-hook.py
-```
+Codex and Claude have independent plugins/readers behind the same Bridge contract. Plugins report the exact agent/session through `pane.report_agent_session`; Bridge owns durable synchronization, terminal validation, channel routing, approvals and delivery through OpenClaw. Plugins never send Slack messages or terminal input.
 
-The installer preserves other hooks, saves a one-time `hooks.json.herdr-bridge-backup`, and never changes Codex hook trust. Review the two `herdr_bridge.session_hook` entries in the Codex CLI `/hooks` menu: `SessionStart` and `UserPromptSubmit`. This is a Codex terminal command, not a Slack command. Codex skips new hooks until reviewed and trusted. The existing managed Herdr script is not modified. Restarting Gateway does not enable untrusted hooks.
-
-Start each pane that needs automatic association with a pane-local Codex runtime:
+Build local packages against this checkout's installed virtual environment:
 
 ```bash
-bash scripts/codex-herdr.sh
-bash scripts/codex-herdr.sh resume <thread-id>
-# Equivalent: codex --no-daemon [resume <thread-id>]
+.venv/bin/python scripts/build-agent-plugins.py
+codex plugin marketplace add "$PWD/.agent-plugins"
+codex plugin add herdr-bridge-codex@herdr-bridge-local
+claude plugin marketplace add "$PWD/.agent-plugins"
+claude plugin install herdr-bridge-claude@herdr-bridge-local --scope user
 ```
 
-Codex CLI 0.162.1's shared daemon can pass its original pane environment to a hook instead of the TUI's current pane. Its actual hook input has no client/pane identifier. The companion refuses shared-daemon association, even when the inherited pane happens to exist. It requires an ancestor PID matching exactly one live Herdr pane's foreground `codex --no-daemon` process, then rechecks that process and terminal before reporting. This also handles a stale inherited pane ID after movement. Other panes and the shared daemon are not restarted. Shared-daemon sessions retain manual `/openclaw /herdr bind` support.
+The generated `.agent-plugins` directory is ignored by Git and includes an absolute checkout/Python locator. Keep the virtual-environment path, including its symlink name: resolving it to the base interpreter loses the installed environment. Rebuild and update/reinstall the plugins after moving the checkout or virtual environment. This is a local development installation, not a portable published package.
 
-The hooks validate the exact root session against Codex's database and rollout header and report its session ID through `pane.report_agent_session`. They accept a null `transcript_path`, which can occur with paginated Codex histories. Nested agents, missing identities, changed terminals and stale overlapping hook invocations cannot replace the pane association. These are Codex adapters; Claude conversation sync is not provided by this installer. Private hook diagnostics under `CODEX_HOME/herdr-bridge/hooks` contain identity fields, outcome and error type, without prompt text or transcript contents.
+Review and trust the two Codex plugin handlers in its CLI `/hooks` menu: `SessionStart` and `UserPromptSubmit`. Installing/enabling the plugin does not grant hook trust. Claude loads its installed hooks at startup or `/reload-plugins`. Private plugin evidence under each agent's `herdr-bridge/hooks/<session-id>-plugin.json` records event, session, sequence, report outcome and error type; it excludes prompts and credentials.
 
-A small private identity/offset record under `CODEX_HOME/herdr-bridge/sessions` records the first streaming position. `/new` or resume changes the exact thread association while preserving the Slack channel. Each terminal/thread retains its own cursor. A newly attached resumed session skips earlier history; an already tracked session continues its saved cursor. Hook cutoff evidence also includes a new turn that finishes before the first Bridge scan. Repeated prompt/compaction hooks retain the cutoff. No hook sends prompts, keys, approvals or Slack messages.
+After trusting the Codex plugin, retire only the earlier companion handlers to avoid duplicate calls:
 
-Conversation cursor, seen IDs and outbox writes commit together, and a failed read/enqueue rolls them back together. Provider send failures leave messages queued. Later conversation messages from that pane wait behind the failed message; other panes and separate completion/result notifications can continue. Gateway restart preserves pending messages, bindings and acknowledged cursors. Delivery remains at least once: a provider accepting a message immediately before its acknowledgement is lost can still produce a duplicate on retry. Deterministic offline tests cover pre-handoff failure and recovery; they cannot prove exactly-once provider delivery.
+```bash
+.venv/bin/python scripts/install-codex-session-hook.py --remove
+```
 
-For a resolved Codex stream, completion notices require a newly synced completed answer. A durable completion-event claim suppresses repeated startup/resume status transitions that show an old answer. Final conversation messages and separate completion cards remain distinct; this does not remove the normal completion notification.
+This preserves the managed Herdr hook, other handlers and Codex trust configuration, and saves a one-time migration backup. The old installer remains available for existing deployments; new installations should use agent plugins.
+
+#### Codex
+
+Normal `codex`, `codex resume` and `bash scripts/codex-herdr.sh` keep the default shared-daemon runtime. In that runtime, with Codex CLI 0.162.1, command hooks run in the daemon with its original pane environment and receive no TUI/client ID. A `resume <id>` argv also goes stale after `/new`. Neither identifies the thread a pane is showing, and the plugin refuses to invent a mapping from them.
+
+Codex's native terminal-title export does identify it. Each TUI client renders the `session-id` title item from its current thread (the full ID, or its first 29 characters followed by `...`). `/new` clears it, and resuming or selecting another thread updates it. Enable it once for regular `codex`:
+
+```bash
+.venv/bin/python scripts/configure-codex-identity.py        # --home <dir> for another CODEX_HOME
+```
+
+The helper:
+
+- Puts `session-id` first in `[tui].terminal_title` and keeps your other title items in order (when unset, Codex's default non-activity items `thread-name` and `project-name`).
+- Removes `activity`/`spinner`/`status`: they can prefix the title, and `activity`/`spinner` anywhere add an "Action Required" prefix while Codex is blocked.
+- Leaves all other config bytes, hooks, trust, auth, model and permission settings unchanged.
+- Keeps a one-time `config.toml.herdr-bridge-backup` (mode 0600) and replaces the file atomically.
+- Refuses malformed or unsupported layouts and edits made concurrently by something else.
+
+**Restart existing Codex clients after changing title settings; running clients keep their startup settings.** A per-launch override such as `codex -c 'tui.terminal_title=["session-id","thread","current-dir"]' resume <id>` also works within the supported config bounds below. Direct foreground `-c`/`--config` overrides of `tui.terminal_title` take precedence over `$CODEX_HOME/config.toml` in command-line order.
+
+Bridge supports this user config and direct CLI title override, with a readable matching foreground Codex process. It refuses profile selection (`--profile`/`-p`, or config profile selectors), top-level CLI `tui=...` overrides, and ancestor `.codex/config.toml` files that set `tui.terminal_title`. The ancestor scan excludes `$CODEX_HOME` and conservatively checks every parent rather than reproducing Codex's project trust/root discovery. Unrelated ancestor `tui` settings are allowed. Invalid or unreadable user, ancestor or system configs, system title/profile settings, `/etc/codex/managed_config.toml`, forced macOS Codex preferences, and an inability to check those preferences make identity unavailable. These checks read config and preference metadata; they do not modify either. Package defaults and enterprise/cloud title layers are outside this bounded adapter's support.
+
+While the export is enabled (the first effective title item is `session-id`/`thread-id`), Bridge reads each Codex pane's title on every scan:
+
+- **Accepts:** only an exact ID or 29-character prefix as the first ` | `-separated item, or as the whole title when it is the only item. While Codex generates a thread name it appends a space and one Braille spinner frame (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`) to that item; only that suffix is tolerated. Leading text, other items and trailing IDs are never searched.
+- **Resolves:** exactly one active root thread in the pane's directory, whose full ID must be a well-formed thread ID. Another thread sharing the prefix, in any directory, makes the title ambiguous. The rollout header is checked too.
+- **Re-checks:** the pane, terminal, directory, parsed session prefix and foreground Codex process afterwards. Spinner frames and thread-name changes are cosmetic and do not invalidate an unchanged prefix.
+- **Keeps the result** for that scan only. It is never saved as a binding.
+
+If config cannot be established within these bounds, or the enabled title has no ID (for example, after `/new` until the new thread exists), is invalid, ambiguous or changes its session prefix during the read, `/openclaw /herdr sync` reports the pane `unavailable` with the reason. Conversation sync, model display and question cards then stop. Bridge does not fall back to Herdr's earlier native session, a saved binding or a directory match. Pane and channel names still come from the pane/tab label, never from the title. This path has deterministic test coverage; live verification is pending.
+
+The export also lets the plugin's `SessionStart`/`UserPromptSubmit` hooks register a shared-daemon pane. Bridge scans every 5 seconds and an idle pane's first scan starts at the end of the rollout, so without a hook a quick first prompt after `/new` or a resume could finish before that scan and be skipped. The hook selects the one Codex pane in the payload's directory whose title currently resolves, as above, to the payload's exact root thread ID. After validating the rollout and calculating its start offset, it rechecks the pane's terminal, directory, foreground process and title immediately before saving the offset and reporting the session to Herdr. Two panes showing the same thread, a title that has not yet changed after `/new`, a child thread or a nested agent's mismatched `CODEX_THREAD_ID` register nothing; the next prompt's hook or the scan then applies. The inherited `HERDR_PANE_ID`, Herdr's native session, the resume argv and the directory are never used to pick the pane, and the hook never saves a binding. Existing Codex clients must be restarted once after enabling the export.
+
+When a matching foreground process and supported config establish that export is off, the previous native/manual contract applies. After `/new` or switching sessions, use `/openclaw /herdr bind <thread-id>` in that pane's channel. Unknown or unsupported config never permits this fallback.
+
+An optional `codex --no-daemon` runtime allows automatic hook registration by proving that a foreground process in exactly one pane is the hook's ancestor; that proof takes precedence over the title. Exact root database/rollout identity, terminal and process are revalidated; null `transcript_path` is accepted. Nested agents and stale overlapping hooks cannot replace the association. This compatibility path is not a Bridge-wide startup requirement.
+
+#### Claude
+
+On macOS Claude Code 2.1.287 exposes `sessions/<foreground-pid>.json` under `CLAUDE_CONFIG_DIR` or `~/.claude`. The adapter checks PID, process creation time, interactive kind, cwd, exact session ID and the current Herdr foreground process/terminal. It never selects the newest file or guesses from a directory. Plugin hooks additionally prove Claude is their foreground ancestor and recheck the registry immediately before reporting. Sidechain/nested sessions cannot overwrite the root association. If the registry is unavailable, an exact Herdr session or explicit binding is required.
+
+Claude transcripts must contain a matching root `sessionId` and `cwd`. Stable transcript UUIDs, API message IDs and tool IDs drive deduplication. Assistant text blocks remain staged in SQLite across scans and restarts until `turn_duration` or the next genuine user prompt commits a terminal answer. Thinking, tool results, metadata and subagent rows are excluded; tool calls use short summaries with no output blobs. A partial trailing line is retried without consuming it. An idle screen alone does not commit a split answer.
+
+#### Common recovery
+
+A private terminal/session offset record captures the start of streaming; new Claude sessions may be registered before their JSONL exists. Existing cursors take precedence, so switching back continues the same stream. Cursor, seen IDs, staging and outbox writes commit together. Periodic checks recover a final answer written after the terminal's idle transition and claim its completion notification once. Directory/terminal replacement and invalid identity fail closed.
+
+Provider failures leave messages queued and preserve order within each pane. Gateway restart preserves pending messages, bindings and acknowledged cursors. Delivery remains at least once: acceptance immediately before a lost provider acknowledgement can still duplicate a retry. Existing 10-second attention delay and terminal-confirmation rules apply to both supported agents. Claude multiselect/plan/free-text dialogs retain their existing capability limits; this change does not claim equivalence to Codex async-question APIs.
+
+For read-only delivery evidence:
+
+```bash
+node scripts/verify-agent-sync.mjs ~/.openclaw/openclaw.json <channel-id> <unique-marker>
+```
+
+The verifier prints matching timestamps and roles without tokens or unrelated chat contents. It checks the latest 100 channel messages.

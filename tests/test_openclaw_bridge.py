@@ -12,6 +12,7 @@ class Client:
     def __init__(self):
         self.info = {"pane_id": "w4:p2", "terminal_id": "term-a", "agent": "codex",
                      "agent_status": "blocked", "state_change_seq": 7,
+                     "cwd": "/project",
                      "agent_session": {"value": "session-a"}}
         self.screen = (Path(__file__).parent / "fixtures/transcripts/dialog_codex_approval.txt").read_text()
         self.keys = []
@@ -23,6 +24,9 @@ class Client:
 
     def get_agent(self, pane):
         return copy.deepcopy(self.info)
+
+    def process_info(self, pane):
+        return {"pane_id": pane, "foreground_processes": [{"pid": 100, "argv": ["codex"]}]}
 
     def read_agent_once(self, *args, **kwargs):
         return self.screen

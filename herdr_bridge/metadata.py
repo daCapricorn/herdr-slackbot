@@ -50,7 +50,7 @@ def session_model(info, *, unique_workspace=False, codex_home=None, claude_home=
         except (sqlite3.Error, OSError, ValueError, SessionUnavailable):
             pass
     elif kind == "claude" and session and info.get("cwd"):
-        home = Path(claude_home or Path.home() / ".claude")
+        home = Path(claude_home or os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
         # Match the exact session filename rather than assuming a cwd slug scheme.
         paths = list((home / "projects").glob(f"*/{session}.jsonl"))
         if len(paths) == 1:
