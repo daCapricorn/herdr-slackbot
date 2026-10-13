@@ -230,6 +230,8 @@ Claude transcripts must contain a matching root `sessionId` and `cwd`. Stable tr
 
 A private terminal/session offset record captures the start of streaming; new Claude sessions may be registered before their JSONL exists. Existing cursors take precedence, so switching back continues the same stream. Cursor, seen IDs, staging and outbox writes commit together. Periodic checks recover a final answer written after the terminal's idle transition and claim its completion notification once. Directory/terminal replacement and invalid identity fail closed.
 
+Each completion carries the saved answer text and session information, so a new turn cannot replace the previous notification's content with partially streamed output. Codex requires a matching native closure; an explicit final body selects one matching answer. Older closures without final text require one unambiguous explicitly final candidate. Claude retains its native transcript boundary. A new installation does not replay legacy completion history. Transcript replacement preserves unresolved Codex registrations, but they must be revalidated within a 16 MiB suffix; missing or conflicting evidence leaves them pending.
+
 Provider failures leave messages queued and preserve order within each pane. Gateway restart preserves pending messages, bindings and acknowledged cursors. Delivery remains at least once: acceptance immediately before a lost provider acknowledgement can still duplicate a retry. Existing 10-second attention delay and terminal-confirmation rules apply to both supported agents. Claude multiselect/plan/free-text dialogs retain their existing capability limits; this change does not claim equivalence to Codex async-question APIs.
 
 For read-only delivery evidence:

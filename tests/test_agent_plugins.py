@@ -93,7 +93,7 @@ def test_bridge_claude_sync_and_bind_route_to_its_adapter(tmp_path):
     append(path, [user(), answer(), end()])
     bridge.sync_conversation(client.info)
     rows = [json.loads(r[0]) for r in bridge.db.execute('SELECT event FROM outbox ORDER BY rowid')]
-    assert [(r['role'],r['text'],r['agent']['kind']) for r in rows] == [('user','prompt','claude'),('assistant','answer','claude')]
+    assert [(r['role'],r['text'],r['agent']['kind']) for r in rows if r['type'] == 'conversation.message'] == [('user','prompt','claude'),('assistant','answer','claude')]
     assert bridge.sync_status('w1:p1')['thread_id'] == TID
     assert bridge.bind_session('w1:p1',TID)['state'] == 'syncing'
     assert not bridge.db.execute('SELECT * FROM codex_sync_cursors').fetchall()

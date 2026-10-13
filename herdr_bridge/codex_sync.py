@@ -151,6 +151,23 @@ class CodexRolloutSync(TranscriptSync):
     def __init__(self, db, *, home=None):
         super().__init__(db, home=home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         db.execute("CREATE TABLE IF NOT EXISTS codex_input_readiness (source_key TEXT PRIMARY KEY, record TEXT NOT NULL)")
+        db.execute("""CREATE TABLE IF NOT EXISTS codex_completion_pending
+            (event_id TEXT PRIMARY KEY, source_key TEXT NOT NULL, turn_id TEXT NOT NULL, record TEXT NOT NULL)""")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(codex_completion_pending)")}
+        for column in ("validated", "conflicted"):
+            if column not in columns:
+                default = 1 if column == "validated" else 0
+                db.execute(f"ALTER TABLE codex_completion_pending ADD COLUMN {column} INTEGER NOT NULL DEFAULT {default}")
+        db.execute("""CREATE TABLE IF NOT EXISTS codex_completion_turns
+            (source_key TEXT NOT NULL, turn_id TEXT NOT NULL, event_id TEXT NOT NULL,
+             PRIMARY KEY(source_key,turn_id))""")
+        # Modern closed ledger entries already prove their exact source/turn.
+        # Seed that certificate on upgrade without creating delivery events.
+        for (raw,) in db.execute("SELECT record FROM codex_completions ORDER BY rowid"):
+            record = json.loads(raw)
+            if record.get("turn_id"):
+                db.execute("INSERT OR IGNORE INTO codex_completion_turns VALUES (?,?,?)",
+                           (record["source_key"], record["turn_id"], record["event_id"]))
 
     def input_blocker(self, info, previous=None):
         """Read-only FIFO evidence, independent of direct-input/steering capacity."""
@@ -380,10 +397,109 @@ class CodexRolloutSync(TranscriptSync):
         self._status(info, "ready", thread_id=tid, source="explicit", reason="Bound; waiting for next scan")
         return self.diagnostic(info)
 
-    def row_events(self, source_key, raw, cursor):
+    def record_answer(self, record, *, new=True):
+        # Preserve immutable modern registration. Replayed IDs can revalidate
+        # that registration, but never synthesize a legacy missed completion.
+        if not record.get("turn_id"):
+            return
+        if self.db.execute("SELECT 1 FROM codex_completion_turns WHERE source_key=? AND turn_id=?",
+                           (record["source_key"], record["turn_id"])).fetchone():
+            return  # Changed native item IDs cannot recertify a closed turn.
+        old = self.db.execute("SELECT record FROM codex_completion_pending WHERE event_id=?",
+                              (record["event_id"],)).fetchone()
+        if old:
+            original = json.loads(old[0])
+            same = all(original.get(key) == record.get(key) for key in
+                       ("source_key", "turn_id", "text", "phase"))
+            if same:
+                self.db.execute("UPDATE codex_completion_pending SET validated=1 "
+                                "WHERE event_id=? AND conflicted=0", (record["event_id"],))
+            else:
+                self.db.execute("UPDATE codex_completion_pending SET validated=0,conflicted=1 WHERE event_id=?",
+                                (record["event_id"],))
+        elif new:
+            self.db.execute("""INSERT INTO codex_completion_pending
+                (event_id,source_key,turn_id,record) VALUES (?,?,?,?)""",
+                (record["event_id"], record["source_key"], record["turn_id"], json.dumps(record)))
+
+    def reset_source(self, source_key, path=None):
+        turns = {row[0] for row in self.db.execute(
+            "SELECT turn_id FROM codex_completion_pending WHERE source_key=?", (source_key,))}
+        if not turns:
+            return None
+        self.db.execute("UPDATE codex_completion_pending SET validated=0 WHERE source_key=?", (source_key,))
+        # Re-read only the bounded suffix needed by registered unresolved turns.
+        # Ordinary first-attach history remains skipped, including legacy IDs.
+        size = path.stat().st_size
+        start = max(0, size - 16 * 1024 * 1024)
+        with path.open("rb") as stream:
+            stream.seek(start)
+            if start:
+                stream.readline()
+            while line := stream.readline():
+                if not line.endswith(b"\n"):
+                    break
+                try:
+                    raw = json.loads(line)
+                    payload = raw.get("payload", {})
+                    if (raw.get("type") == "event_msg" and isinstance(payload, dict)
+                            and payload.get("turn_id") in turns):
+                        return stream.tell() - len(line)
+                except (ValueError, AttributeError, TypeError):
+                    continue
+        return None  # Missing evidence holds the registration without replay.
+
+    def _close_answer(self, source_key, turn, payload, cursor, timestamp):
+        if self.db.execute("SELECT 1 FROM codex_completion_turns WHERE source_key=? AND turn_id=?",
+                           (source_key, turn)).fetchone():
+            self.db.execute("DELETE FROM codex_completion_pending WHERE source_key=? AND turn_id=?",
+                            (source_key, turn))
+            return
+        rows = self.db.execute("SELECT record,validated,conflicted FROM codex_completion_pending "
+            "WHERE source_key=? AND turn_id=? ORDER BY rowid", (source_key, turn)).fetchall()
+        records = [json.loads(row[0]) for row in rows]
+        if not records or any(row[2] for row in rows):
+            return  # Conflicting immutable evidence cannot certify any answer.
+        if "last_agent_message" in payload:
+            canonical = payload["last_agent_message"]
+            if not isinstance(canonical, str) or not canonical.strip():
+                return
+            eligible = [record for record, row in zip(records, rows)
+                        if row[1] and record["text"] == canonical.strip()]
+            explicit = [record for record in eligible if record.get("phase") == "final_answer"]
+            # Native last_agent_message identifies the last matching final item.
+            selected = explicit[-1] if explicit else eligible[-1] if eligible else None
+        else:
+            # Older closure records lack canonical text. Only one explicitly
+            # final candidate is unambiguous; phase-absent/multiple items hold.
+            selected = records[0] if (len(records) == 1 and rows[0][1]
+                                      and records[0].get("phase") == "final_answer") else None
+        if selected is None:
+            return
+        selected["closure"] = {"kind": payload["type"], "turn_id": turn, "offset": cursor,
+                               "timestamp": timestamp}
+        # Both this certificate and the immutable ledger insert live in the
+        # transcript savepoint; neither can survive the other's failed write.
+        inserted = self.db.execute("INSERT OR IGNORE INTO codex_completion_turns VALUES (?,?,?)",
+                                   (source_key, turn, selected["event_id"])).rowcount
+        if inserted:
+            self.queue_completion(selected)
+        self.db.execute("DELETE FROM codex_completion_pending WHERE source_key=? AND turn_id=?",
+                        (source_key, turn))
+
+    def row_events(self, source_key, raw, cursor, *, info=None, agent=None):
         payload = raw.get("payload", {})
         event = None
         if raw.get("type") == "event_msg" and isinstance(payload, dict):
+            if payload.get("thread_id", source_key.rsplit(":", 1)[-1]) != source_key.rsplit(":", 1)[-1]:
+                raise SessionUnavailable("Codex transcript changed session while reading")
+            kind, turn = payload.get("type"), payload.get("turn_id")
+            if kind in ("task_complete", "turn_complete", "turn_aborted") and isinstance(turn, str) and turn:
+                if kind == "turn_aborted":
+                    self.db.execute("DELETE FROM codex_completion_pending WHERE source_key=? AND turn_id=?",
+                                    (source_key, turn))
+                else:
+                    self._close_answer(source_key, turn, payload, cursor, raw.get("timestamp"))
             if payload.get("type") == "user_message":
                 text = _clean_user_text(str(payload.get("message") or ""))
                 if text:
@@ -396,7 +512,9 @@ class CodexRolloutSync(TranscriptSync):
                         event = {"role": "user", "text": text}
                     text = _completed_agent_message(item)
                     if text:
-                        event = {"role": "assistant", "text": text}
+                        phase = item.get("phase")
+                        event = {"role": "assistant", "text": text, "_turn_id": payload.get("turn_id"),
+                                 "_phase": "final_answer" if phase in ("final_answer", "finalAnswer") else phase}
                     elif not event:
                         summary = _tool_summary(item)
                         if summary:

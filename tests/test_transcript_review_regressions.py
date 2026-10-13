@@ -79,7 +79,7 @@ def test_unavailable_transcript_defers_completion_until_durable_answer(tmp_path)
 
 
 @pytest.mark.parametrize("claimed", [False, True])
-def test_durable_completion_survives_outage_and_restart(tmp_path, claimed):
+def test_closed_completion_is_deliverable_during_outage_and_stays_seen_after_restart(tmp_path, claimed):
     path = tmp_path / "projects/-project" / f"{TID}.jsonl"
     path.parent.mkdir(parents=True)
     append(path, [user("old", "old")])
@@ -97,7 +97,7 @@ def test_durable_completion_survives_outage_and_restart(tmp_path, claimed):
     saved = path.with_suffix(".saved")
     path.rename(saved)
     source.sync(info, enqueue)
-    assert not source.claim_completion(info)
+    assert source.claim_completion(info) is (not claimed)
     db.commit()
     db.close()
     db = sqlite3.connect(state)
@@ -106,14 +106,13 @@ def test_durable_completion_survives_outage_and_restart(tmp_path, claimed):
         assert not source.claim_completion(info)
         saved.rename(path)
         source.sync(info, enqueue)
-        assert source.claim_completion(info) is (not claimed)
         assert not source.claim_completion(info)
         assert db.execute("SELECT count(*) FROM claude_completion_seen").fetchone()[0] == 1
     finally:
         db.close()
 
 
-def test_tracked_terminal_defers_new_session_until_its_answer(tmp_path):
+def test_tracked_terminal_defers_outage_then_drains_old_session_with_original_snapshot(tmp_path):
     path = tmp_path / "projects/-project" / f"{TID}.jsonl"
     path.parent.mkdir(parents=True)
     append(path, [user("old", "old")])
@@ -129,6 +128,10 @@ def test_tracked_terminal_defers_new_session_until_its_answer(tmp_path):
         new_tid = "c6565ec4-87cd-4855-b9ee-4a940f248743"
         new_info = {**info, "agent_session": {"value": new_tid}}
         source.sync(new_info, enqueue)
+        drained = []
+        assert source.drain_completions(new_info, lambda eid, record: drained.append(record)) == 1
+        assert drained[0]["session_id"] == TID
+        assert drained[0]["text"] == "old final"
         assert not source.claim_completion(new_info)
         new_path = path.with_name(new_tid + ".jsonl")
         append(new_path, [{**user("old in new session", "new-old"), "sessionId": new_tid}])
@@ -145,7 +148,7 @@ def test_tracked_terminal_defers_new_session_until_its_answer(tmp_path):
 
 
 @pytest.mark.parametrize("failure", [SessionUnavailable("gone"), OSError("gone")])
-def test_resolution_failure_between_scan_and_claim_defers(tmp_path, monkeypatch, failure):
+def test_closed_completion_does_not_re_resolve_session_during_claim(tmp_path, monkeypatch, failure):
     path = tmp_path / "projects/-project" / f"{TID}.jsonl"
     path.parent.mkdir(parents=True)
     append(path, [user("old", "old")])
@@ -163,10 +166,9 @@ def test_resolution_failure_between_scan_and_claim_defers(tmp_path, monkeypatch,
             def unavailable(*args):
                 raise failure
             patch.setattr(source, "_resolve", unavailable)
-            assert not source.claim_completion(info)
+            assert source.claim_completion(info)
         assert source._resolve == resolve
         source.sync(info, enqueue)
-        assert source.claim_completion(info)
         assert not source.claim_completion(info)
     finally:
         db.close()
@@ -181,11 +183,11 @@ def test_validated_binding_defers_before_first_cursor(tmp_path):
     info = {"agent": "claude", "pane_id": "w1:p1", "terminal_id": "term-a", "cwd": "/project",
             "agent_status": "idle", "agent_session": {"value": TID}}
     try:
-        assert source.claim_completion(info)
+        assert not source.claim_completion(info)
         source.bind(info, TID)
         assert not db.execute("SELECT * FROM claude_sync_cursors").fetchall()
         assert not source.claim_completion(info)
-        assert source.claim_completion({**info, "terminal_id": "never-tracked"})
+        assert not source.claim_completion({**info, "terminal_id": "never-tracked"})
     finally:
         db.close()
 
@@ -198,7 +200,7 @@ def test_pane_cursor_tracking_matches_terminal_component_exactly(tmp_path):
         db.execute("INSERT INTO claude_sync_cursors VALUES (?, ?, ?, ?, ?)",
                    (info["pane_id"] + ":" + TID, "missing", 0, 0, 0))
         assert not source.claim_completion(info)
-        assert source.claim_completion({**info, "pane_id": "w_1"})
-        assert source.claim_completion({**info, "pane_id": "wa1:pz1"})
+        assert not source.claim_completion({**info, "pane_id": "w_1"})
+        assert not source.claim_completion({**info, "pane_id": "wa1:pz1"})
     finally:
         db.close()

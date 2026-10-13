@@ -23,6 +23,11 @@ class TranscriptSync:
         self.db.execute(f"CREATE TABLE IF NOT EXISTS {self.namespace}_sync_status (terminal_id TEXT PRIMARY KEY, record TEXT NOT NULL)")
         self.db.execute(f"CREATE TABLE IF NOT EXISTS {self.namespace}_sync_final (source_key TEXT PRIMARY KEY, event_id TEXT NOT NULL)")
         self.db.execute(f"CREATE TABLE IF NOT EXISTS {self.namespace}_completion_seen (event_id TEXT PRIMARY KEY)")
+        # Legacy sync_final is deliberately not replayed: it has neither answer
+        # text nor a proven native closure. Existing cursors/seen IDs stay intact.
+        self.db.execute(f"""CREATE TABLE IF NOT EXISTS {self.namespace}_completions
+            (event_id TEXT PRIMARY KEY, source_key TEXT NOT NULL,
+             terminal_id TEXT NOT NULL, record TEXT NOT NULL)""")
 
     def diagnostic(self, info):
         key = info.get("terminal_id") or info.get("pane_id", "")
@@ -71,22 +76,58 @@ class TranscriptSync:
         self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_sync_status VALUES (?, ?)",
                         (key, json.dumps({"state": state, **fields})))
 
-    def claim_completion(self, info):
-        if info.get(AUTHORITY_ERROR):
-            return False
-        if info.get("agent") != self.agent_kind:
-            return True
-        if self.diagnostic(info).get("state") != "syncing":
-            return not self._has_tracked_source(info)
+    def _completion_rows(self, info):
+        if info.get(AUTHORITY_ERROR) or info.get("agent") != self.agent_kind:
+            return []
+        terminal = info.get("terminal_id") or info.get("pane_id", "")
+        # Already closed answers carry their own session and source evidence.
+        # A later turn/session or unavailable current transcript cannot change
+        # their content or delivery association. Outages never create candidates.
+        return self.db.execute(f"""SELECT c.event_id,c.record FROM {self.namespace}_completions c
+            WHERE c.terminal_id=? AND NOT EXISTS
+            (SELECT 1 FROM {self.namespace}_completion_seen s WHERE s.event_id=c.event_id)
+            ORDER BY c.rowid""", (terminal,)).fetchall()
+
+    def drain_completions(self, info, enqueue):
+        """Atomically claim ordered closed answers together with outbox writes."""
+        self.db.execute(f"SAVEPOINT {self.namespace}_completion_drain")
         try:
-            tid, _, _ = self._resolve(info)
-        except (SessionUnavailable, OSError):
+            rows = self._completion_rows(info)
+            for event_id, raw in rows:
+                enqueue(event_id, json.loads(raw))
+                self.db.execute(f"INSERT INTO {self.namespace}_completion_seen VALUES (?)", (event_id,))
+            self.db.execute(f"RELEASE {self.namespace}_completion_drain")
+            return len(rows)
+        except Exception:
+            self.db.execute(f"ROLLBACK TO {self.namespace}_completion_drain")
+            self.db.execute(f"RELEASE {self.namespace}_completion_drain")
+            raise
+
+    def claim_completion(self, info):
+        """Compatibility single claim; Bridge drains records with their content."""
+        rows = self._completion_rows(info)
+        if not rows:
             return False
-        key = f"{info.get('terminal_id') or info.get('pane_id', '')}:{tid}"
-        row = self.db.execute(f"SELECT event_id FROM {self.namespace}_sync_final WHERE source_key=?", (key,)).fetchone()
-        if not row:
-            return False  # Resume/startup without a new answer is not a new completion.
-        return bool(self.db.execute(f"INSERT OR IGNORE INTO {self.namespace}_completion_seen VALUES (?)", (row[0],)).rowcount)
+        return bool(self.db.execute(f"INSERT OR IGNORE INTO {self.namespace}_completion_seen VALUES (?)",
+                                    (rows[0][0],)).rowcount)
+
+    def completion_record(self, event_id, info, event, source_key, agent):
+        return event.get("_completion") or {"event_id": event_id, "source_key": source_key,
+            "terminal_id": info.get("terminal_id") or info.get("pane_id", ""),
+            "session_id": source_key.rsplit(":", 1)[-1], "turn_id": event.get("_turn_id"),
+            "text": event["text"], "phase": event.get("_phase"), "info": info, "agent": agent,
+            "source": info.get("_transcript_source")}
+
+    def queue_completion(self, record):
+        self.db.execute(f"""INSERT OR IGNORE INTO {self.namespace}_completions
+            (event_id,source_key,terminal_id,record) VALUES (?,?,?,?)""",
+            (record["event_id"], record["source_key"], record["terminal_id"],
+             json.dumps(record, ensure_ascii=False)))
+
+    def record_answer(self, record, *, new=True):
+        # Claude only emits its final assistant after the native boundary.
+        if new and not record.get("legacy"):
+            self.queue_completion(record)
 
     def _has_tracked_source(self, info):
         terminal = info.get("terminal_id") or info.get("pane_id", "")
@@ -98,10 +139,10 @@ class TranscriptSync:
                                (len(prefix), prefix))
         return any(row[0].rsplit(":", 1)[0] == terminal for row in rows)
 
-    def sync(self, info, enqueue, *, unique_workspace=False):
+    def sync(self, info, enqueue, *, unique_workspace=False, completion_agent=None):
         self.db.execute(f"SAVEPOINT {self.namespace}_sync_read")
         try:
-            result = self._sync(info, enqueue, unique_workspace=unique_workspace)
+            result = self._sync(info, enqueue, unique_workspace=unique_workspace, completion_agent=completion_agent)
             self.db.execute(f"RELEASE {self.namespace}_sync_read")
             return result
         except Exception as exc:
@@ -112,10 +153,15 @@ class TranscriptSync:
                 return 0
             raise
 
-    def _sync(self, info, enqueue, *, unique_workspace=False):
+    def _sync(self, info, enqueue, *, unique_workspace=False, completion_agent=None):
         try:
             session = self._resolve(info, unique_workspace)
             thread_id, path, _ = session
+            explicit_session = bool(session_of(info))
+            if not session_of(info):
+                info = {**info, "agent_session": {"value": thread_id}}
+            if completion_agent is not None:
+                completion_agent = {**completion_agent, "session": thread_id}
         except SessionUnavailable as exc:
             self._status(info, "unavailable", reason=str(exc))
             return 0
@@ -123,7 +169,9 @@ class TranscriptSync:
             stat = path.stat()
             terminal = info.get("terminal_id") or info.get("pane_id", "")
             source_key = f"{terminal}:{thread_id}"
-            if session_of(info) and info.get("terminal_id") and info["agent_session"].get("source") != TITLE_SOURCE:
+            info = {**info, "_transcript_source": {"path": str(path),
+                "device": stat.st_dev, "inode": stat.st_ino}}
+            if explicit_session and info.get("terminal_id") and info["agent_session"].get("source") != TITLE_SOURCE:
                 self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_session_bindings VALUES (?, ?, ?)",
                                 (terminal, thread_id, info["cwd"]))
             row = self.db.execute(f"SELECT rollout_path,device,inode,offset FROM {self.namespace}_sync_cursors WHERE source_key=?",
@@ -138,7 +186,9 @@ class TranscriptSync:
             else:
                 offset = stat.st_size
             if row and (not same_file or stat.st_size < row[3]):
-                self.reset_source(source_key)
+                recovery = self.reset_source(source_key, path)
+                if recovery is not None:
+                    offset = min(offset, recovery)
             cursor = offset
             with path.open("rb") as stream:
                 stream.seek(offset)
@@ -153,8 +203,8 @@ class TranscriptSync:
                     except (ValueError, UnicodeDecodeError):
                         cursor = next_cursor
                         continue
-                    for event_id, event in self.row_events(source_key, raw, cursor):
-                        self.emit(event_id, info, event, source_key, enqueue)
+                    for event_id, event in self.row_events(source_key, raw, cursor, info=info, agent=completion_agent):
+                        self.emit(event_id, info, event, source_key, enqueue, completion_agent)
                     cursor = next_cursor
                     self.db.execute(f"""INSERT INTO {self.namespace}_sync_cursors
                         (source_key,rollout_path,device,inode,offset) VALUES (?,?,?,?,?)
@@ -163,7 +213,7 @@ class TranscriptSync:
                         (source_key, str(path), stat.st_dev, stat.st_ino, cursor))
             # Never flush a final message while its transcript has an incomplete tail.
             for event_id, event in self.finish_events(source_key, info, cursor == stat.st_size):
-                self.emit(event_id, info, event, source_key, enqueue)
+                self.emit(event_id, info, event, source_key, enqueue, completion_agent)
             # Empty/settled rollouts also need a baseline cursor before the next turn.
             self.db.execute(f"""INSERT OR REPLACE INTO {self.namespace}_sync_cursors
                 (source_key,rollout_path,device,inode,offset) VALUES (?,?,?,?,?)""",
@@ -173,17 +223,19 @@ class TranscriptSync:
         except (OSError, sqlite3.Error):
             raise  # The enclosing savepoint also rolls back seen IDs and outbox writes.
 
-    def emit(self, event_id, info, event, source_key, enqueue):
+    def emit(self, event_id, info, event, source_key, enqueue, agent=None):
         inserted = self.db.execute(f"INSERT OR IGNORE INTO {self.namespace}_sync_seen VALUES (?)",
                                    (event_id,)).rowcount
         if inserted:
-            enqueue(event_id, info, event)
+            enqueue(event_id, info, {k: v for k, v in event.items() if not k.startswith("_")})
             if event["role"] == "assistant":
                 self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_sync_final VALUES (?, ?)",
                                 (source_key, event_id))
+        if event["role"] == "assistant":
+            self.record_answer(self.completion_record(event_id, info, event, source_key, agent), new=bool(inserted))
 
     def finish_events(self, source_key, info, complete):
         return []
 
-    def reset_source(self, source_key):
+    def reset_source(self, source_key, path=None):
         pass

@@ -122,8 +122,10 @@ def test_startup_fifo_releases_only_after_each_exact_native_turn_closes(fresh, r
         reader.sync_conversation(client.get_agent("w1:p1"))
         reader.sync_conversation(client.get_agent("w1:p1"))
         events = [json.loads(row[0]) for row in reader.db.execute("SELECT event FROM outbox")]
-        assert [event.get("text") for event in events].count("A final") == 1
-        assert [event.get("text") for event in events].count("B final") == 1
+        for kind in ("conversation.message", "agent.done"):
+            final_texts = [event.get("text") for event in events if event["type"] == kind]
+            assert final_texts.count("A final") == 1
+            assert final_texts.count("B final") == 1
         assert [event.get("text") for event in events].count("A") == 1
         assert [event.get("text") for event in events].count("B") == 1
         assert reader.inputs.find("slack", "default", "C1", "100.2")["state"] == "confirmed"

@@ -247,6 +247,14 @@ class Bridge:
         self.db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)",
                         (event["id"], json.dumps(event, ensure_ascii=False)))
 
+    def _queue_completion(self, event_id, record):
+        event = {"id": "completion:" + event_id, "type": "agent.done", "at": self.clock(),
+                 "agent": record["agent"], "text": record["text"], "summary": record["text"],
+                 "completion": {key: record[key] for key in
+                    ("event_id", "source_key", "terminal_id", "session_id", "turn_id")}}
+        self.db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)",
+                        (event["id"], json.dumps(event, ensure_ascii=False)))
+
     def sync_status(self, pane):
         info = self._agent(pane)
         with self.lock:
@@ -276,15 +284,15 @@ class Bridge:
                     return 0
                 agents = self.client.list_agents()
                 unique = sum(a.get("agent") == info.get("agent") and a.get("cwd") == info.get("cwd") for a in agents) == 1
-                public = None
+                public = self._public_agent(info, agents, enrich=False)
 
                 def enqueue(event_id, queued, message):
-                    nonlocal public
-                    if public is None:
-                        public = self._public_agent(info, agents, enrich=False)
                     self._queue_conversation(event_id, queued, message, public)
 
-                return adapter.source.sync(info, enqueue, unique_workspace=unique)
+                scanned = adapter.source.sync(info, enqueue, unique_workspace=unique,
+                                               completion_agent=public)
+                adapter.source.drain_completions(info, self._queue_completion)
+                return scanned
         except Exception:
             log.exception("%s transcript sync failed for %s", info.get("agent"), info.get("pane_id"))
             return 0
@@ -295,19 +303,6 @@ class Bridge:
         self.sync_conversation(info)
         questions = self.discover_questions(info)
         if info.get("agent_status") != "blocked":
-            # A transcript's final append can lag the terminal's idle transition.
-            # Reconcile its durable completion on periodic scans, once per answer.
-            adapter = self.adapters.get(info.get("agent"))
-            if adapter and info.get("agent_status") in ("idle", "done"):
-                with self.lock:
-                    streaming = adapter.source.diagnostic(info).get("state") == "syncing"
-                if streaming:
-                    text = self.client.read_agent_once(info["pane_id"], 160, source="visible")
-                    fresh = self._agent(info["pane_id"])
-                    if identity(fresh) == identity(info) and fresh.get("agent_status") in ("idle", "done"):
-                        with self.lock, self.db:
-                            if adapter.source.claim_completion(info):
-                                self._queue("agent.done", info, text=text)
             return
         pane = info["pane_id"]
         screen = self.client.read_agent_once(pane, 160, source="visible")
@@ -406,14 +401,12 @@ class Bridge:
         self.sync_conversation(info)
         if transition.status == "blocked":
             self.discover(info)
-        elif transition.status in ("done", "idle") and transition.prev_status in ("working", "blocked"):
+        elif (transition.status in ("done", "idle") and transition.prev_status in ("working", "blocked")
+              and info.get("agent") not in self.adapters):
             text = self.client.read_agent_once(info["pane_id"], 160, source="visible")
             if identity(self._agent(info["pane_id"])) != identity(info):
                 return
             with self.lock, self.db:
-                adapter = self.adapters.get(info.get("agent"))
-                if adapter and not adapter.source.claim_completion(info):
-                    return
                 self._queue("agent.done", info, text=text)
 
     def pending(self):
