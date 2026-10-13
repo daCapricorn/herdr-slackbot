@@ -8,7 +8,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .codex_session import (AUTHORITY_ERROR, LIVE_PROOF, TITLE_SOURCE, resolve_session,
+from .codex_session import (AUTHORITY_ERROR, LIVE_PROOF, NATIVE_STATUS, TITLE_SOURCE, resolve_session,
                             native_rollout_path, validate_rollout, SessionUnavailable)
 from .events import session_of
 from .transcript_sync import TranscriptSync
@@ -150,6 +150,140 @@ class CodexRolloutSync(TranscriptSync):
 
     def __init__(self, db, *, home=None):
         super().__init__(db, home=home or os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        db.execute("CREATE TABLE IF NOT EXISTS codex_input_readiness (source_key TEXT PRIMARY KEY, record TEXT NOT NULL)")
+
+    def input_blocker(self, info, previous=None):
+        """Read-only FIFO evidence, independent of direct-input/steering capacity."""
+        native = info.get(NATIVE_STATUS)
+        if native:
+            if native.get("thread_id") != session_of(info):
+                raise SessionUnavailable("Codex readiness identity changed")
+            if native.get("status") == "active":
+                return "codex_native_busy"
+            if native.get("status") != "idle":
+                return "codex_native_readiness_unavailable"
+        proof = info.get(LIVE_PROOF)
+        if proof:
+            path = self._fresh_receipt_path(info)
+            try:
+                path.stat()
+            except FileNotFoundError:
+                # A prior write cannot use the missing first-rollout case.
+                return None if native and native.get("status") == "idle" and previous is None else "codex_native_readiness_unavailable"
+            validate_rollout((session_of(info), path, info["cwd"]))
+        else:
+            _, path, _ = self._resolve(info)
+        if native and (native.get("path") != str(path) or native.get("cwd") != info.get("cwd")
+                       or native.get("home") != str(self.home)):
+            raise SessionUnavailable("Codex readiness source changed")
+        owner = self._input_lifecycle(info, path, allow_orphan_close=bool(native))
+        if not owner["complete"] or not owner["known"]:
+            return "codex_native_readiness_unavailable"
+        if owner["active"] is not None:
+            return "codex_native_busy"
+        if previous:
+            barrier = self._input_lifecycle(info, path, previous)
+            if not barrier["complete"] or not barrier["closed"] or barrier["active"] is not None:
+                return "codex_native_turn_unsettled"
+        return None
+
+    def _input_lifecycle(self, info, path, previous=None, limit=16 * 1024 * 1024, allow_orphan_close=False):
+        """Persist bounded incremental lifecycle scans, never rescan old history.
+
+        The general scan starts near EOF on first attach. A confirmed input's
+        separate barrier starts at its committed pre-write cutoff and requires
+        its exact native receipt and a matching closure of that same turn.
+        """
+        stat = path.stat()
+        terminal = info.get("terminal_id") or info.get("pane_id", "")
+        key = f"{terminal}:{session_of(info)}:" + (f"input:{previous['seq']}" if previous else "owner")
+        expected = None
+        start = max(0, stat.st_size - limit)
+        if previous:
+            baseline = previous.get("receipt_baseline", {})
+            start = baseline.get("offset")
+            same_file = (baseline.get("missing") is True and start == 0 or
+                         baseline.get("device") == stat.st_dev and baseline.get("inode") == stat.st_ino)
+            if (baseline.get("unavailable") or not same_file or type(start) is not int
+                    or not 0 <= start <= stat.st_size or baseline.get("path") != str(path)
+                    or baseline.get("source_key") != f"{terminal}:{session_of(info)}"):
+                raise SessionUnavailable("Codex prior input source changed")
+            expected = previous["prompt"]
+        row = self.db.execute("SELECT record FROM codex_input_readiness WHERE source_key=?", (key,)).fetchone()
+        state = json.loads(row[0]) if row else None
+        if state and state.get("anchor") and stat.st_size >= state["offset"]:
+            with path.open("rb") as stream:
+                stream.seek(max(0, state["offset"] - 256))
+                anchor = hashlib.sha256(stream.read(min(256, state["offset"]))).hexdigest()
+            if anchor != state["anchor"]:
+                if previous:
+                    raise SessionUnavailable("Codex prior input lifecycle was rewritten")
+                state = None
+        if not state or (state["path"], state["device"], state["inode"]) != (str(path), stat.st_dev, stat.st_ino) or stat.st_size < state["offset"]:
+            state = {"path": str(path), "device": stat.st_dev, "inode": stat.st_ino,
+                     "offset": start, "known": start == 0 or previous is not None,
+                     "active": None, "receipt_turn": None, "closed": False}
+            if not previous and start:
+                with path.open("rb") as stream:
+                    stream.seek(start)
+                    fragment = stream.readline(limit + 1)
+                    if not fragment.endswith(b"\n"):
+                        raise SessionUnavailable("Codex lifecycle tail has no complete records")
+                    state["offset"] = stream.tell()
+        end = min(stat.st_size, state["offset"] + limit)
+        with path.open("rb") as stream:
+            stream.seek(state["offset"])
+            while stream.tell() < end:
+                # Native tool outputs can exceed 1 MiB. Read a complete row
+                # within this scan's budget; never skip an oversized/partial
+                # row that could contain lifecycle evidence.
+                line = stream.readline(end - stream.tell() + 1)
+                if not line.endswith(b"\n") or stream.tell() > end:
+                    break
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise SessionUnavailable("Codex lifecycle record is invalid")
+                payload = raw.get("payload", {})
+                if raw.get("type") == "event_msg" and isinstance(payload, dict):
+                    event, tid = payload.get("type"), payload.get("turn_id")
+                    if event in ("task_started", "turn_started"):
+                        if not isinstance(tid, str) or not tid:
+                            raise SessionUnavailable("Codex turn start has no exact identity")
+                        state["active"], state["known"] = tid, True
+                    elif (event in ("task_complete", "turn_complete", "turn_aborted")
+                          and isinstance(tid, str) and tid
+                          and payload.get("thread_id", session_of(info)) == session_of(info)):
+                        if state["receipt_turn"] == tid:
+                            state["closed"] = True
+                        if state["active"] == tid:
+                            state["active"] = None
+                        elif not previous and allow_orphan_close and not state["known"]:
+                            # A long turn's start can predate the initial tail.
+                            # Exact closure plus observed native idle settles
+                            # that tail; a later unmatched start still blocks.
+                            state["known"] = True
+                    elif (expected is not None
+                          and expected in self.receipt_user_texts(raw, state["offset"])):
+                        item = payload.get("item")
+                        if (event == "item_completed" and isinstance(item, dict)
+                                and item.get("type") == "UserMessage"
+                                and payload.get("thread_id") == session_of(info)
+                                and isinstance(tid, str) and tid):
+                            # An upgrade can encounter an old mid-turn write:
+                            # its start predates the committed receipt cutoff.
+                            # Modern receipts independently name the owned turn.
+                            state["receipt_turn"] = tid
+                        elif (state["active"] and tid in (None, state["active"])
+                              and payload.get("thread_id", session_of(info)) == session_of(info)):
+                            state["receipt_turn"] = state["active"]
+                state["offset"] = stream.tell()
+            stream.seek(max(0, state["offset"] - 256))
+            state["anchor"] = hashlib.sha256(stream.read(min(256, state["offset"]))).hexdigest()
+        after = path.stat()
+        if (stat.st_dev, stat.st_ino) != (after.st_dev, after.st_ino) or after.st_size < stat.st_size:
+            raise SessionUnavailable("Codex lifecycle source changed while reading")
+        self.db.execute("INSERT OR REPLACE INTO codex_input_readiness VALUES (?,?)", (key, json.dumps(state)))
+        return {**state, "complete": state["offset"] == after.st_size}
 
     def latest_turn_offset(self, path):
         return _latest_turn_offset(path)
@@ -159,13 +293,7 @@ class CodexRolloutSync(TranscriptSync):
         if not proof:
             return super().receipt_baseline(info)
         tid = session_of(info)
-        if (info.get(AUTHORITY_ERROR) or not isinstance(proof, dict)
-                or info.get("agent_session", {}).get("source") != TITLE_SOURCE
-                or proof.get("thread_id") != tid or proof.get("cwd") != info.get("cwd")
-                or proof.get("home") != str(self.home) or not isinstance(proof.get("route"), dict)
-                or proof["route"].get("home") != str(self.home.resolve())):
-            raise SessionUnavailable("Codex fresh receipt proof differs from current identity")
-        path = native_rollout_path(proof.get("path"), tid, self.home)
+        path = self._fresh_receipt_path(info)
         baseline = {"source_key": f"{info.get('terminal_id') or info.get('pane_id', '')}:{tid}",
                     "path": str(path), "offset": 0}
         try:
@@ -183,6 +311,17 @@ class CodexRolloutSync(TranscriptSync):
             raise SessionUnavailable("Codex rollout changed while capturing receipt baseline")
         return {**baseline, "device": after.st_dev, "inode": after.st_ino, "offset": after.st_size,
                 "native_identity": proof}
+
+    def _fresh_receipt_path(self, info):
+        proof = info.get(LIVE_PROOF)
+        tid = session_of(info)
+        if (info.get(AUTHORITY_ERROR) or not isinstance(proof, dict)
+                or info.get("agent_session", {}).get("source") != TITLE_SOURCE
+                or proof.get("thread_id") != tid or proof.get("cwd") != info.get("cwd")
+                or proof.get("home") != str(self.home) or not isinstance(proof.get("route"), dict)
+                or proof["route"].get("home") != str(self.home.resolve())):
+            raise SessionUnavailable("Codex fresh receipt proof differs from current identity")
+        return native_rollout_path(proof.get("path"), tid, self.home)
 
     def initial_observation(self, info, session):
         # Reserve already commits the exact receipt baseline in Herdr SQLite.

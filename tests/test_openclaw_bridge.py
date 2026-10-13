@@ -163,6 +163,9 @@ def test_unknown_agent_is_not_guessed_as_codex(setup):
 
 def test_sending_cannot_answer_blocked_dialog(setup):
     client, bridge = setup
+    # This composer/approval fake has no native UUID, daemon or rollout.
+    # Native FIFO evidence is exercised by test_codex_input_readiness instead.
+    bridge.adapters["codex"].source.input_blocker = lambda info, previous=None: None
     with pytest.raises(BridgeError):
         bridge.send("w4:p2", "y")
     client.info["agent_status"] = "idle"

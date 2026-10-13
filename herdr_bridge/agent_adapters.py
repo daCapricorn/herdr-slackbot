@@ -7,7 +7,7 @@ import tomllib
 from pathlib import Path
 
 from .claude_sync import ClaudeTranscriptSync, SESSION_ID, claude_home
-from .codex_session import (AUTHORITY_ERROR, TITLE_SOURCE, LIVE_PROOF, SessionUnavailable,
+from .codex_session import (AUTHORITY_ERROR, TITLE_SOURCE, LIVE_PROOF, NATIVE_STATUS, SessionUnavailable,
                             resolve_title_session, resolve_live_title, title_session_prefix)
 from .codex_daemon import daemon_available, observe_daemon
 from .codex_sync import CodexRolloutSync
@@ -264,7 +264,7 @@ class ClaudeAdapter(AgentAdapter):
 class CodexAdapter(AgentAdapter):
     """The configured native title is authoritative; uncertainty blocks fallback."""
     def enrich(self, info, client):
-        info = {k: v for k, v in info.items() if k != LIVE_PROOF}
+        info = {k: v for k, v in info.items() if k not in (LIVE_PROOF, NATIVE_STATUS)}
         try:
             config = read_codex_config(Path(self.source.home) / "config.toml")
             process = client.process_info(info["pane_id"])
@@ -281,13 +281,14 @@ class CodexAdapter(AgentAdapter):
                         or client.process_info(info["pane_id"]) != process):
                     raise SessionUnavailable("Codex pane changed while reading its title config")
                 return info
-            tid, proof = self._title_session(info, client, process, argvs, config)
+            tid, proof, native_status = self._title_session(info, client, process, argvs, config)
         except SessionUnavailable as exc:
             return self._unavailable(info, str(exc))
         except Exception:
             return self._unavailable(info, "Codex process/config/title identity read failed")
-        return {**{k: v for k, v in info.items() if k not in (AUTHORITY_ERROR, LIVE_PROOF)},
+        return {**{k: v for k, v in info.items() if k not in (AUTHORITY_ERROR, LIVE_PROOF, NATIVE_STATUS)},
                 **({LIVE_PROOF: proof} if proof else {}),
+                **({NATIVE_STATUS: native_status} if native_status else {}),
                 "agent_session": {"agent": "codex", "kind": "id", "source": TITLE_SOURCE, "value": tid}}
 
     def _title_session(self, info, client, process, argvs, config):
@@ -301,6 +302,7 @@ class CodexAdapter(AgentAdapter):
                for argv in argvs for arg in argv[1:]):
             raise SessionUnavailable("Codex title identity does not support this execution route")
         proof = None
+        native_status = None
         explicit_embedded = any("--no-daemon" in argv for argv in argvs)
         if explicit_embedded:
             # Existing embedded sessions retain their strict persisted contract;
@@ -309,13 +311,17 @@ class CodexAdapter(AgentAdapter):
         elif daemon_available(self.source.home):
             route = foreground_codex_route(info, process, self.source.home)
             with observe_daemon(self.source.home) as observer:
-                session, proof = resolve_live_title(prefix, info.get("cwd"), self.source.home, observer)
+                session, proof, native_status = resolve_live_title(prefix, info.get("cwd"), self.source.home, observer)
                 # Complete inventory and exact metadata are checked again before
                 # trusting this observation. No lifecycle RPC attaches a thread.
-                again, new_proof = resolve_live_title(prefix, info.get("cwd"), self.source.home, observer)
+                again, new_proof, new_status = resolve_live_title(prefix, info.get("cwd"), self.source.home, observer)
                 if again != session or foreground_codex_route(info, process, self.source.home) != route:
                     raise SessionUnavailable("Codex live identity changed while reading")
                 proof = new_proof
+                # An active first read must not be erased by a later idle read.
+                # The next independent dispatch observation can establish idle.
+                if native_status.get("status") == "idle":
+                    native_status = new_status
                 if proof:
                     proof = {**proof, "route": route}
             tid = session[0]
@@ -329,11 +335,11 @@ class CodexAdapter(AgentAdapter):
         check_title_config_layers(self.source.home, info.get("cwd"))
         if read_codex_config(Path(self.source.home) / "config.toml") != config:
             raise SessionUnavailable("Codex title config changed while reading its identity")
-        return tid, proof
+        return tid, proof, native_status
 
     @staticmethod
     def _unavailable(info, reason):
-        return {**{k: v for k, v in info.items() if k != LIVE_PROOF}, "agent_session": None, AUTHORITY_ERROR: reason}
+        return {**{k: v for k, v in info.items() if k not in (LIVE_PROOF, NATIVE_STATUS)}, "agent_session": None, AUTHORITY_ERROR: reason}
 
 
 def adapters(db):

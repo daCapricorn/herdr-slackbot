@@ -167,6 +167,14 @@ class TerminalInputs:
             (record["terminal_id"], record["session_id"])).fetchone()
         return bool(row and row[0] == record["seq"])
 
+    def last_dispatched(self, record):
+        """A recorded receipt releases the write arbiter, not the native turn."""
+        row = self.db.execute("""SELECT seq FROM terminal_inputs
+            WHERE terminal_id=? AND session_id=? AND seq<?
+            AND state IN ('reserved','observing','uncertain','confirmed')
+            ORDER BY seq DESC LIMIT 1""", (record["terminal_id"], record["session_id"], record["seq"])).fetchone()
+        return self.get(row[0]) if row else None
+
     @staticmethod
     def result(record):
         result = {"input_id": record["seq"], "pane_id": record.get("pane_id"),
