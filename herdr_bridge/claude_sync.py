@@ -148,9 +148,17 @@ class ClaudeTranscriptSync(TranscriptSync):
         text = "\n".join(record["texts"].values()).strip()
         if not text or record.get("stop_reason") not in ("end_turn", "stop_sequence", "max_tokens"):
             return []
-        return [(self.event_id(key, record["id"], "assistant"), {"role": "assistant", "text": text})]
+        event_id = self.event_id(key, record["id"], "assistant")
+        info = record.get("completion_info") or {}
+        completion = {"event_id": event_id, "source_key": key,
+            "terminal_id": info.get("terminal_id") or info.get("pane_id") or key.rsplit(":", 1)[0],
+            "session_id": key.rsplit(":", 1)[-1], "turn_id": record["id"], "text": text,
+            "info": info, "agent": record.get("completion_agent"),
+            "source": info.get("_transcript_source"),
+            "legacy": "completion_info" not in record}
+        return [(event_id, {"role": "assistant", "text": text, "_completion": completion})]
 
-    def row_events(self, source_key, row, offset):
+    def row_events(self, source_key, row, offset, *, info=None, agent=None):
         tid = source_key.rsplit(":", 1)[-1]
         if row.get("isSidechain") or row.get("isMeta"):
             return []
@@ -178,6 +186,9 @@ class ClaudeTranscriptSync(TranscriptSync):
             if pending["id"] != mid:
                 events.extend(self._flush(source_key))
                 pending = {"id": mid, "texts": {}}
+            if "completion_info" not in pending:
+                pending["completion_info"] = info or {}
+                pending["completion_agent"] = agent
             pending["stop_reason"] = message.get("stop_reason") or pending.get("stop_reason")
             content = message.get("content", [])
             for index, block in enumerate(content if isinstance(content, list) else []):
@@ -210,5 +221,5 @@ class ClaudeTranscriptSync(TranscriptSync):
         # turn-duration boundary or next genuine prompt commits the answer.
         return []
 
-    def reset_source(self, source_key):
+    def reset_source(self, source_key, path=None):
         self.db.execute("DELETE FROM claude_sync_pending WHERE source_key=?", (source_key,))

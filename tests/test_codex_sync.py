@@ -314,8 +314,8 @@ def test_resume_without_new_answer_cannot_duplicate_completion_notifications(tmp
     source, db, state, rollout, info = setup_source(tmp_path, [])
     source.sync(info, lambda *args: None)
     assert not source.claim_completion(info)
-    write_rows(rollout, [row("event_msg", {"type": "item_completed", "item": {
-        "type": "AgentMessage", "id": "answer-1", "phase": "final_answer", "text": "finished"}})])
+    write_rows(rollout, [row("event_msg", {"type": "item_completed", "turn_id": "t1", "item": {
+        "type": "AgentMessage", "id": "answer-1", "phase": "final_answer", "text": "finished"}}), row("event_msg", {"type": "task_complete", "turn_id": "t1"})])
     source.sync(info, lambda *args: None)
     assert source.claim_completion(info)
     assert not source.claim_completion(info)
@@ -323,7 +323,7 @@ def test_resume_without_new_answer_cannot_duplicate_completion_notifications(tmp
     restarted = CodexRolloutSync(db, home=source.home)
     restarted.sync(info, lambda *args: pytest.fail("old answer replayed"))
     assert not restarted.claim_completion(info)
-    write_rows(rollout, [row("event_msg", {"type": "item_completed", "item": {
-        "type": "AgentMessage", "id": "answer-2", "phase": "final_answer", "text": "next task"}})])
+    write_rows(rollout, [row("event_msg", {"type": "item_completed", "turn_id": "t2", "item": {
+        "type": "AgentMessage", "id": "answer-2", "phase": "final_answer", "text": "next task"}}), row("event_msg", {"type": "task_complete", "turn_id": "t2"})])
     restarted.sync(info, lambda *args: None)
     assert restarted.claim_completion(info)
