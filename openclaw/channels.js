@@ -115,6 +115,7 @@ export class SlackPaneChannels {
         this.api.logger.warn(`Herdr pane channel deferred: ${binding.pane_id} ${error.message}`);
       }
     }
+    return bindings;
   }
 
   async archive(binding, signal) {

@@ -12,7 +12,7 @@ Slack ↔ OpenClaw Gateway / Slack adapter ↔ Herdr Bridge plugin
                                          Python worker ↔ Herdr ↔ agents
 ```
 
-The current integration supports **Slack DMs through OpenClaw**. The core and message presentation are independent of Slack, but other channel routes are not implemented. The checkout and GitHub repository can retain the name `herdr-slackbot`; the Python package and OpenClaw plugin are named `herdr-bridge`.
+The current integration supports **Slack DMs and opt-in private pane channels through OpenClaw**. The core and message presentation are independent of Slack, but other messaging providers are not implemented. The checkout and GitHub repository can retain the name `herdr-slackbot`; the Python package and OpenClaw plugin are named `herdr-bridge`.
 
 ## What it does
 
@@ -20,6 +20,7 @@ The current integration supports **Slack DMs through OpenClaw**. The core and me
 - List agents and read an exact pane's visible terminal conversation, including command output.
 - Send a prompt to an idle or completed agent.
 - Show recognized Codex command approvals and Claude single-choice dialogs with native buttons, then revalidate the exact request before sending keys.
+- Forward an owner-authored Slack message from a pane channel only when that current message explicitly mentions the OpenClaw bot. Threads keep the channel's pane route.
 - Forward Codex CLI async questions from Queued follow-up inputs, including while the agent is working. Answer a suggested choice in Slack or use `/openclaw /herdr reply` for free text.
 - Keep pending approvals/questions and outbound messages across Gateway/worker restarts.
 - Optionally stream new Codex conversation messages into each pane's private Slack channel; tool activity is summarized without tool output.
@@ -96,7 +97,13 @@ With `paneChannels.enabled: true`, Bridge creates one private Slack channel for 
 
 OpenClaw still sends messages and handles authenticated interactions. Its 2026.9.9 SDK does not expose Slack channel creation/rename/invitation, so a narrow management adapter calls the Slack Conversations API using the current OpenClaw bot credential in memory. No separate token is configured or persisted by Bridge. Add `groups:write` and `groups:write.invites` alongside the existing `groups:read` scope, then reinstall the Slack App. The selected account must use bot identity and a resolved bot token. Without the opt-in setting, existing DM routing continues.
 
-Channel commands infer the bound pane: `/openclaw /herdr read`, `/openclaw /herdr pending` and `/openclaw /herdr send <prompt>`. Explicit cross-pane targets and requests from a different channel are rejected. Pending-request messages mention the owners; completion notices do not; the 10-second attention delay remains unchanged. Channel notification and mobile settings still govern actual push delivery.
+Channel commands infer the bound pane: `/openclaw /herdr read`, `/openclaw /herdr pending` and `/openclaw /herdr send <prompt>`. Explicit cross-pane targets and requests from a different channel are rejected. In a ready pane channel, an authenticated configured owner can also send `@OpenClaw <prompt>`. The mention must be present in that exact Slack message; a thread admission, quote, earlier mention, or OpenClaw's implicit `WasMentioned` state is insufficient. Other mentions and multiline text remain part of the prompt. Mapped-channel messages that reach the `reply_dispatch` hook are consumed without invoking OpenClaw's model, including rejected or unmentioned messages. Host channel access, mention policy, and inbound-hook eligibility determine which messages reach the hook. Keep Slack `requireMention: true`.
+
+An idle/done Codex or Claude pane accepts one prompt only after Bridge rechecks the binding, terminal/session identity, status, transcript baseline, and an ANSI-proven empty bottom composer. A working pane queues prompts FIFO for that same terminal/session and posts the durable result back to the originating channel/thread. Blocked panes, unknown statuses, local drafts, changed bindings/sessions, and unknown TUI layouts do not write. Bridge reserves durably before its single terminal call and confirms only an exact native user transcript record written after the baseline. An ambiguous write is never replayed and continues to hold that terminal's input arbiter across restart until the exact receipt appears or the target identity is proven closed.
+
+A fresh default-daemon Codex session can receive its first Slack prompt before its transcript is persisted. Bridge verifies the native title against the existing daemon's loaded threads and persisted identities, then records the exact transcript cutoff. It neither starts a daemon nor initializes the conversation with a local prompt. Unsupported execution routes or relocated session databases stop submission; the first response is retained even if it finishes before the initial sync scan.
+
+The empty-composer recognizers are intentionally narrow and currently cover the observed Codex 0.162.1 and Claude Code 2.1.287 bottom layouts, including dim placeholder text after startup banners scroll away. Herdr has no atomic compare-composer-and-prompt operation, so local input can still race between the final screen read and the terminal call. Deterministic hook/state/receipt tests cover this feature; a real owner `@OpenClaw` Slack round trip remains a separate live validation step.
 
 ## Reliability
 

@@ -25,7 +25,7 @@ class HerdrForBridge(FakeClient):
     def read_agent(self, target, lines=200, **kw):
         return ReadResult(SHORT, 10, 1)
 
-    def read_agent_once(self, target, lines, source="recent_unwrapped"):
+    def read_agent_once(self, target, lines, source="recent_unwrapped", format="text"):
         return ""
 
     def ping(self):

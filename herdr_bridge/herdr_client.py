@@ -315,6 +315,8 @@ def cli_args(method: str, params: dict) -> list[str]:
         args = ["agent", "read", p["target"], "--source", _cli_source(p.get("source", "recent_unwrapped"))]
         if p.get("lines") is not None:
             args += ["--lines", str(p["lines"])]
+        if p.get("format") is not None:
+            args += ["--format", str(p["format"])]
         return args
     if method == "agent.start":
         args = ["agent", "start", p["name"], "--kind", p["kind"], "--pane", p["pane_id"]]
@@ -494,8 +496,12 @@ class HerdrClient:
     def process_info(self, pane_id: str) -> dict:
         return self.request("pane.process_info", {"pane_id": pane_id})["process_info"]
 
-    def read_agent_once(self, target: str, lines: int, source: str = "recent_unwrapped") -> str:
-        result = self.request("agent.read", {"target": target, "source": source, "lines": lines})
+    def read_agent_once(self, target: str, lines: int, source: str = "recent_unwrapped",
+                        format: str = "text") -> str:
+        params = {"target": target, "source": source, "lines": lines}
+        if format != "text":
+            params["format"] = format
+        result = self.request("agent.read", params)
         return result["read"]["text"]
 
     def read_agent(self, target: str, lines: int = 200, attempts: int = 4,
