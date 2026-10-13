@@ -952,6 +952,16 @@ class Bridge:
             raise BridgeError("Pane channel binding changed; nothing was sent")
         return binding
 
+    def _native_input_blocker(self, info, rec):
+        if rec["agent_kind"] != "codex":
+            return None
+        try:
+            return self.adapters["codex"].source.input_blocker(info, self.inputs.last_dispatched(rec))
+        except Exception:
+            # Unreadable/partial/replaced native evidence licenses no write.
+            # Keep the accepted request durable so a later read can resolve it.
+            return "codex_native_readiness_unavailable"
+
     def ingest_input(self, account_id, conversation_id, message_ts, sender_id, text,
                      thread_id=None, binding_id=None):
         """Deduplicate one authenticated Slack prompt and queue or submit it once."""
@@ -987,6 +997,9 @@ class Bridge:
             if info.get("agent_status") not in ("idle", "done"):
                 rec = self.inputs.save(rec, "rejected", reason="agent_status_unknown")
                 return self.inputs.result(rec)
+            blocker = self._native_input_blocker(info, rec)
+            if blocker:
+                return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
         return self._dispatch_input(rec["seq"])
 
     def _revalidate_input(self, rec):
@@ -1033,6 +1046,9 @@ class Bridge:
                     return self._input_result(self.inputs.save(rec, "queued", reason="agent_busy"))
                 if status not in ("idle", "done"):
                     return self._input_result(self.inputs.save(rec, "rejected", reason="agent_status_unknown"))
+                blocker = self._native_input_blocker(info, rec)
+                if blocker:
+                    return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
                 adapter = self.adapters[rec["agent_kind"]]
                 try:
                     baseline = adapter.source.receipt_baseline(info)
@@ -1048,12 +1064,27 @@ class Bridge:
                 if (fresh.get("agent_status") not in ("idle", "done")
                         or fresh.get("state_change_seq") != info.get("state_change_seq")):
                     return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
-                # This is the last external read before the reserve commit and
-                # one terminal write. It follows transcript/source resolution,
-                # which can be slow enough for a local draft to appear.
+                blocker = self._native_input_blocker(fresh, rec)
+                if blocker:
+                    return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
+                # Transcript resolution can be slow enough for a draft or a
+                # local native turn to appear. Recheck both before reserving.
                 screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
                 if not known_empty_composer(rec["agent_kind"], screen):
                     return self._input_result(self.inputs.save(rec, "rejected", reason="composer_not_known_empty"))
+                if rec["agent_kind"] == "codex":
+                    fresh = self._revalidate_input(rec)
+                    if (fresh.get("agent_status") not in ("idle", "done")
+                            or fresh.get("state_change_seq") != info.get("state_change_seq")):
+                        return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
+                    blocker = self._native_input_blocker(fresh, rec)
+                    if blocker:
+                        return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
+                    # Native metadata reads can outlast a local composer edit.
+                    # Keep the final external read the exact ANSI draft guard.
+                    screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
+                    if not known_empty_composer(rec["agent_kind"], screen):
+                        return self._input_result(self.inputs.save(rec, "rejected", reason="composer_not_known_empty"))
                 rec = self.inputs.save(rec, "reserved", reason="terminal_write_reserved",
                     attempt_id=uuid.uuid4().hex, reserved_at=self.clock(),
                     dispatch_sequence=fresh.get("state_change_seq"), receipt_baseline=baseline)
@@ -1208,6 +1239,9 @@ class Bridge:
             if info.get("agent_status") not in ("idle", "done"):
                 rec = self.inputs.save(rec, "rejected", reason="agent_status_unknown")
                 raise BridgeError("Agent status is not recognized as safe; nothing was sent")
+            blocker = self._native_input_blocker(info, rec)
+            if blocker:
+                return self.inputs.result(self.inputs.save(rec, "queued", reason=blocker))
         return self._dispatch_input(rec["seq"])
 
     def close(self):

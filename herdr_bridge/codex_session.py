@@ -14,6 +14,8 @@ from .events import session_of
 AUTHORITY_ERROR = "authoritative_session_error"
 TITLE_SOURCE = "bridge:codex-title"
 LIVE_PROOF = "codex_live_identity"
+# Runtime readiness is independent of the narrowly scoped fresh-file proof.
+NATIVE_STATUS = "codex_native_status"
 # Codex's session-id title item: a full UUID or its first 29 characters + "...".
 TITLE_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-(?:[0-9a-f]{12}|[0-9a-f]{5}\.\.\.)")
 THREAD_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -159,7 +161,8 @@ def resolve_live_title(prefix, cwd, home, observer):
     if tid not in loaded:
         # The daemon inventory was complete; existing persisted-only behavior is
         # retained for unloaded threads, including strict rollout validation.
-        return resolve_title_session(prefix, cwd, home=home), None
+        session = resolve_title_session(prefix, cwd, home=home)
+        return session, None, {"thread_id": tid, "status": "notLoaded"}
     thread = observer.read(tid)
     if (not isinstance(thread, dict) or thread.get("id") != tid or thread.get("cwd") != cwd
             or thread.get("source") not in ("cli", "vscode")
@@ -169,11 +172,13 @@ def resolve_live_title(prefix, cwd, home, observer):
             or thread["status"].get("type") not in ("idle", "active", "systemError")):
         raise SessionUnavailable("Codex live metadata is not a loaded direct-input root thread")
     path = native_rollout_path(thread.get("path"), tid, home)
+    status = {"thread_id": tid, "cwd": cwd, "home": str(Path(home)),
+              "path": str(path), "status": thread["status"]["type"]}
     if rows:
         if (len(rows) != 1 or rows[0][2] != cwd or rows[0][3] != 0 or rows[0][4] is not None
                 or rows[0][1] != str(path)):
             raise SessionUnavailable("Codex live metadata disagrees with persisted root identity")
-        return validate_rollout((tid, path, cwd)), None
+        return validate_rollout((tid, path, cwd)), None, status
     # Only absence of an exact row licenses the fresh proof. Corrupt existing
     # files must still fail; ENOENT alone is the narrowly allowed fresh case.
     try:
@@ -184,7 +189,7 @@ def resolve_live_title(prefix, cwd, home, observer):
         raise SessionUnavailable("Cannot inspect Codex live rollout") from exc
     else:
         validate_rollout((tid, path, cwd))
-    return (tid, path, cwd), {"thread_id": tid, "cwd": cwd, "home": str(Path(home)), "path": str(path)}
+    return (tid, path, cwd), {"thread_id": tid, "cwd": cwd, "home": str(Path(home)), "path": str(path)}, status
 
 
 def validate_rollout(session):
