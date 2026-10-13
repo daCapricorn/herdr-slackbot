@@ -127,6 +127,19 @@ def test_paginated_rollout_user_message_turn_items_are_synced(tmp_path):
     state.close()
 
 
+def test_prompt_receipt_requires_exact_native_user_record_after_baseline(tmp_path):
+    source, db, state, rollout, info = setup_source(tmp_path, [
+        row("event_msg", {"type":"user_message","message":"same prompt"})])
+    baseline = source.receipt_baseline(info)
+    assert not source.receipt_recorded(info,baseline,"same prompt")
+    write_rows(rollout,[row("event_msg", {"type":"item_completed","item":{
+        "type":"UserMessage","id":"new","content":[{"type":"text","text":"different"}]}})])
+    assert not source.receipt_recorded(info,baseline,"same prompt")
+    write_rows(rollout,[row("event_msg", {"type":"user_message","message":"same prompt"})])
+    assert source.receipt_recorded(info,baseline,"same prompt")
+    state.close()
+
+
 def test_ignores_tool_output_async_messages_and_nonfinal_assistant_text(tmp_path):
     source, db, state, _, info = setup_source(tmp_path, [
         row("event_msg", {"type": "task_started", "turn_id": "t"}, ordinal=1),

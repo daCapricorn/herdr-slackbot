@@ -8,7 +8,8 @@ import re
 import sqlite3
 from pathlib import Path
 
-from .codex_session import AUTHORITY_ERROR, resolve_session, validate_rollout, SessionUnavailable
+from .codex_session import (AUTHORITY_ERROR, LIVE_PROOF, TITLE_SOURCE, resolve_session,
+                            native_rollout_path, validate_rollout, SessionUnavailable)
 from .events import session_of
 from .transcript_sync import TranscriptSync
 
@@ -153,6 +154,62 @@ class CodexRolloutSync(TranscriptSync):
     def latest_turn_offset(self, path):
         return _latest_turn_offset(path)
 
+    def receipt_baseline(self, info):
+        proof = info.get(LIVE_PROOF)
+        if not proof:
+            return super().receipt_baseline(info)
+        tid = session_of(info)
+        if (info.get(AUTHORITY_ERROR) or not isinstance(proof, dict)
+                or info.get("agent_session", {}).get("source") != TITLE_SOURCE
+                or proof.get("thread_id") != tid or proof.get("cwd") != info.get("cwd")
+                or proof.get("home") != str(self.home) or not isinstance(proof.get("route"), dict)
+                or proof["route"].get("home") != str(self.home.resolve())):
+            raise SessionUnavailable("Codex fresh receipt proof differs from current identity")
+        path = native_rollout_path(proof.get("path"), tid, self.home)
+        baseline = {"source_key": f"{info.get('terminal_id') or info.get('pane_id', '')}:{tid}",
+                    "path": str(path), "offset": 0}
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            try:
+                stat = path.stat()  # Capture a rollout materialized during the first stat.
+            except FileNotFoundError:
+                return {**baseline, "missing": True, "native_identity": proof}
+        # Existing files, including files appearing after metadata read, must
+        # pass the usual session_meta contract before snapshotting their size.
+        validate_rollout((tid, path, info["cwd"]))
+        after = path.stat()
+        if (stat.st_dev, stat.st_ino) != (after.st_dev, after.st_ino) or after.st_size < stat.st_size:
+            raise SessionUnavailable("Codex rollout changed while capturing receipt baseline")
+        return {**baseline, "device": after.st_dev, "inode": after.st_ino, "offset": after.st_size,
+                "native_identity": proof}
+
+    def initial_observation(self, info, session):
+        # Reserve already commits the exact receipt baseline in Herdr SQLite.
+        # Recover that cutoff even if a very fast first turn completes before
+        # discovery, or the bridge restarts. Never override an existing cursor.
+        tid, path, cwd = session
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminal_inputs'").fetchone():
+            terminal = info.get("terminal_id") or info.get("pane_id", "")
+            records = self.db.execute("SELECT record FROM terminal_inputs WHERE terminal_id=? AND session_id=? "
+                "AND state IN ('reserved','observing','uncertain','confirmed') ORDER BY seq", (terminal, tid))
+            for (raw,) in records:
+                rec = json.loads(raw)
+                baseline = rec.get("receipt_baseline", {})
+                proof = baseline.get("native_identity", {})
+                if (rec.get("agent_kind") == "codex" and rec.get("attempt_id")
+                        and baseline.get("source_key") == f"{terminal}:{tid}" and baseline.get("path") == str(path)
+                        and proof.get("thread_id") == tid and proof.get("cwd") == cwd
+                        and proof.get("home") == str(self.home) and proof.get("path") == str(path)):
+                    native_rollout_path(str(path), tid, self.home)
+                    stat = path.stat()
+                    offset = baseline.get("offset")
+                    same_file = (baseline.get("missing") is True and offset == 0 or
+                                 baseline.get("device") == stat.st_dev and baseline.get("inode") == stat.st_ino)
+                    if same_file and type(offset) is int and 0 <= offset <= stat.st_size:
+                        return {"offset": offset}
+        return super().initial_observation(info, session)
+
     def _resolve(self, info, unique_workspace=False):
         if info.get(AUTHORITY_ERROR):
             raise SessionUnavailable(info[AUTHORITY_ERROR])
@@ -206,3 +263,15 @@ class CodexRolloutSync(TranscriptSync):
                         if summary:
                             event = {"role": "tool", "text": summary}
         return [(_stable_id(source_key, raw, cursor, event["role"], event["text"]), event)] if event else []
+
+    def receipt_user_texts(self, raw, offset):
+        payload = raw.get("payload", {})
+        if raw.get("type") != "event_msg" or not isinstance(payload, dict):
+            return ()
+        if payload.get("type") == "user_message":
+            text = _clean_user_text(str(payload.get("message") or ""))
+        elif payload.get("type") == "item_completed" and isinstance(payload.get("item"), dict):
+            text = _user_item(payload["item"])
+        else:
+            text = None
+        return (text,) if text else ()

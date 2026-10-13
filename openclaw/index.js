@@ -25,9 +25,44 @@ export function authorized(config, ctx) {
     && config.ownerIds.map(slackUserId).includes(slackUserId(ctx.senderId));
 }
 
+export function stripBotMention(text, botId, mentionStripPatterns = []) {
+  if (typeof text !== "string" || typeof botId !== "string") return "";
+  const literal = `<@${botId}>`;
+  const rendered = mentionStripPatterns.find(pattern => typeof pattern === "string"
+    && (pattern.toUpperCase() === literal.toUpperCase()
+      || pattern.toUpperCase().startsWith(`${literal.toUpperCase()} (`) && pattern.endsWith(")")));
+  const exact = rendered ?? literal;
+  const escaped = exact.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
+  return text.replace(new RegExp(escaped,"gi"),"").trim()
+    .replace(/&(amp|lt|gt);/g, entity => ({"&amp;":"&","&lt;":"<","&gt;":">"})[entity]);
+}
+
+function inputStatus(result) {
+  if (result.outcome === "confirmed") return `Prompt recorded by ${result.kind} in ${result.pane_id}.`;
+  if (result.outcome === "queued") return `Prompt queued for ${result.pane_id}; it will be rechecked when the agent is idle.`;
+  if (result.outcome === "rejected") return result.reason === "agent_blocked_use_approval"
+    ? "Prompt was not sent. Use the exact approval or question controls already shown for this pane."
+    : "Prompt was not sent because the pane, session, or composer could not be verified safe.";
+  return `Prompt submission to ${result.pane_id ?? "the pane"} is uncertain because no exact transcript receipt was observed. It was not retried.`;
+}
+
+function finishTakeover(hookCtx, {outcome="skipped", reason, text} = {}) {
+  let queuedFinal = false;
+  try {
+    if (text && !hookCtx.abortSignal?.aborted)
+      queuedFinal = Boolean(hookCtx.dispatcher.sendFinalReply({text}));
+  } finally {
+    hookCtx.dispatcher.markComplete();
+    hookCtx.recordProcessed(outcome,{reason});
+    hookCtx.markIdle("message_completed");
+  }
+  return {handled:true,queuedFinal,counts:hookCtx.dispatcher.getQueuedCounts()};
+}
+
 export function registerBridge(api, workerFactory = (...args)=>new Worker(...args), channelFactory = (...args)=>new SlackPaneChannels(...args)) {
     let config = api.pluginConfig;
     let worker, timer, busy = false, stopping = true, controller, pumping, paneChannels, synchronizing;
+    const knownChannels = new Map();
     const call = (method, params) => {
       if (!worker || stopping) throw new Error("Herdr bridge service is not running");
       return worker.call(method, params);
@@ -46,6 +81,14 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
     };
     const requestAllowed = (ctx, requestId) => call("authorize_request",{
       request_id:requestId,account_id:ctx.accountId,conversation_id:ctx.conversationId});
+    const channelKey = (accountId,conversationId) => `${accountId}:${conversationId}`;
+    const rememberBindings = (bindings) => {
+      for (const binding of bindings ?? [])
+        if (binding?.account_id && binding?.channel_id)
+          knownChannels.set(channelKey(binding.account_id,binding.channel_id),binding);
+      return bindings;
+    };
+    const refreshKnownChannels = async()=>rememberBindings(await call("pane_channels",{account_id:config.route.accountId}));
     const edits = new Map();
     // Authenticated callback editors stay in memory; never persist response URLs.
     const cardEditors = new Map();
@@ -78,6 +121,8 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
           worker.start();
         };
         startWorker();
+        try { await refreshKnownChannels(); }
+        catch (error) { api.logger.warn(`Herdr pane input cache unavailable: ${error?.name ?? "Error"}`); }
         const pump = async () => {
           if (busy || stopping) return;
           busy = true;
@@ -89,7 +134,7 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
             }
             if (paneChannels && !synchronizing) {
               // Provisioning a new pane must not delay existing channels' events.
-              synchronizing = paneChannels.sync(controller.signal)
+              synchronizing = paneChannels.sync(controller.signal).then(rememberBindings).then(refreshKnownChannels)
                 .catch(error => { if (!stopping) api.logger.warn(`Herdr pane discovery deferred: ${error.message}`); })
                 .finally(() => { synchronizing = undefined; });
             }
@@ -104,6 +149,18 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
               // other panes and independent completion/results can still progress.
               if (conversation && failedConversations.has(conversation)) continue;
               try {
+                if (event.type === "input.updated") {
+                  const route = event.route;
+                  const identity = await paneChannels?.identity(controller.signal);
+                  if (!route || route.channel !== "slack" || route.accountId !== config.route.accountId
+                      || !/^[CG][A-Z0-9]+$/.test(route.conversationId)
+                      || route.to !== `channel:${route.conversationId}`
+                      || !identity?.team_id || route.team_id !== identity.team_id)
+                    throw new Error("Queued input update route is no longer authorized");
+                  await deliver(api,route,{text:inputStatus(event.result)},controller.signal);
+                  await call("ack", {event_id:event.id});
+                  continue;
+                }
                 if (["approval.requested","agent.blocked","question.requested"].includes(event.type)) {
                   event = await call("event_for_delivery",{event_id:event.id});
                   if (!event) continue; // Handled locally or deferred: do not deliver/ack.
@@ -181,6 +238,62 @@ export function registerBridge(api, workerFactory = (...args)=>new Worker(...arg
         await worker?.stop();
         worker = undefined;
       },
+    });
+    if (typeof api.on === "function") api.on("reply_dispatch", async(event, hookCtx) => {
+      const ctx = event?.ctx ?? {};
+      const surface = String(ctx.Surface ?? ctx.Provider ?? ctx.OriginatingChannel ?? "").toLowerCase();
+      const accountId = ctx.AccountId, conversationId = ctx.NativeChannelId;
+      if (surface !== "slack" || accountId !== config.route.accountId
+          || typeof conversationId !== "string" || conversationId.startsWith("D")) return;
+      const key = channelKey(accountId,conversationId);
+      let binding;
+      try {
+        binding = await call("pane_for_channel",{account_id:accountId,conversation_id:conversationId});
+        if (!binding) return;
+        knownChannels.set(key,binding);
+      } catch (error) {
+        if (!knownChannels.has(key)) return;
+        api.logger.warn(`Herdr pane input lookup failed closed: ${error?.name ?? "Error"}`);
+        return finishTakeover(hookCtx,{outcome:"error",reason:"herdr_lookup_failed",
+          text:"Herdr could not verify this pane binding, so no prompt was sent."});
+      }
+      const failClosed = (reason,text)=>finishTakeover(hookCtx,{outcome:"skipped",reason,text});
+      try {
+        if (event.sendPolicy !== "allow" || hookCtx.abortSignal?.aborted)
+          return failClosed("herdr_dispatch_not_authorized");
+        if (ctx.InboundEventKind && ctx.InboundEventKind !== "user_request")
+          return failClosed("herdr_non_message_update");
+        if (ctx.ProviderUpdateKind && ctx.ProviderUpdateKind !== "message")
+          return failClosed("herdr_non_message_update");
+        if (ctx.SenderIsBot === true) return failClosed("herdr_bot_sender");
+        const senderId = slackUserId(ctx.SenderId);
+        if (ctx.CommandAuthorized !== true || !config.ownerIds.map(slackUserId).includes(senderId))
+          return failClosed("herdr_sender_not_owner");
+        const identity = await paneChannels?.identity(controller?.signal);
+        if (!identity?.user_id || !identity?.team_id || binding.team_id !== identity.team_id
+            || ctx.GroupSpace !== identity.team_id)
+          return failClosed("herdr_workspace_identity_mismatch",
+            "Herdr could not verify this pane's Slack workspace, so no prompt was sent.");
+        const mentioned = Array.isArray(ctx.MentionedUserIds) && ctx.MentionedUserIds.map(slackUserId).includes(slackUserId(identity.user_id));
+        if (!mentioned) return failClosed("herdr_unmentioned");
+        const raw = ctx.ChannelContext?.chat?.commandSourceText;
+        if (typeof raw !== "string" || !new RegExp(`<@${identity.user_id}>`,"i").test(raw))
+          return failClosed("herdr_raw_mention_unavailable",
+            "Herdr could not verify the explicit OpenClaw mention, so no prompt was sent.");
+        const text = stripBotMention(raw,identity.user_id,ctx.ChannelContext?.chat?.mentionStripPatterns);
+        if (!text) return failClosed("herdr_empty_prompt","Add prompt text after mentioning OpenClaw.");
+        if (!ctx.MessageSid || hookCtx.abortSignal?.aborted)
+          return failClosed("herdr_message_identity_unavailable",
+            "Herdr could not verify this Slack message identity, so no prompt was sent.");
+        const result = await call("ingest_input",{account_id:accountId,conversation_id:conversationId,
+          message_ts:String(ctx.MessageSid),sender_id:senderId,text,
+          thread_id:ctx.MessageThreadId == null ? null : String(ctx.MessageThreadId),binding_id:binding.id});
+        return finishTakeover(hookCtx,{outcome:"completed",reason:`herdr_${result.outcome}`,text:inputStatus(result)});
+      } catch (error) {
+        api.logger.warn(`Herdr pane input failed closed: ${error?.name ?? "Error"}`);
+        return finishTakeover(hookCtx,{outcome:"error",reason:"herdr_input_failed",
+          text:"Herdr could not safely submit this prompt. No automatic retry will occur."});
+      }
     });
     api.registerCommand({
       name: "herdr", description: "Herdr status, read, pending, send, approvals, and question replies",

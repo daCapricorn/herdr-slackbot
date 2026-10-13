@@ -7,13 +7,15 @@ import tomllib
 from pathlib import Path
 
 from .claude_sync import ClaudeTranscriptSync, SESSION_ID, claude_home
-from .codex_session import (AUTHORITY_ERROR, TITLE_SOURCE, SessionUnavailable,
-                            resolve_title_session, title_session_prefix)
+from .codex_session import (AUTHORITY_ERROR, TITLE_SOURCE, LIVE_PROOF, SessionUnavailable,
+                            resolve_title_session, resolve_live_title, title_session_prefix)
+from .codex_daemon import daemon_available, observe_daemon
 from .codex_sync import CodexRolloutSync
 
 TITLE_ID_ITEMS = ("session-id", "thread-id")
 MANAGED_CONFIG_PATH = Path("/etc/codex/managed_config.toml")
 SYSTEM_CONFIG_PATH = Path("/etc/codex/config.toml")
+SYSTEM_REQUIREMENTS_PATH = Path("/etc/codex/requirements.toml")
 
 
 def foreground_claude_session(info, process, *, home=None, started=None):
@@ -66,6 +68,8 @@ def terminal_title_items(config, argv):
     """Bounded title config: user config plus direct CLI title overrides."""
     if "profile" in config:
         raise SessionUnavailable("Codex profile config is unsupported for title identity")
+    if "sqlite_home" in config:
+        raise SessionUnavailable("Codex relocated SQLite home is unsupported for title identity")
     tui = config.get("tui")
     if tui is not None and not isinstance(tui, dict):
         raise SessionUnavailable("Codex tui config is invalid for title identity")
@@ -160,14 +164,75 @@ def check_title_config_layers(home, cwd):
         raise SessionUnavailable("Codex title config needs an absolute pane directory")
     root = Path(home).resolve()
     directory = Path(cwd).resolve()
-    paths = [SYSTEM_CONFIG_PATH]
+    paths = [SYSTEM_CONFIG_PATH, SYSTEM_REQUIREMENTS_PATH]
     paths.extend(parent / ".codex/config.toml" for parent in (directory, *directory.parents)
                  if (parent / ".codex").resolve() != root)
     for path in paths:
         config = read_codex_config(path)
         tui = config.get("tui")
-        if "profile" in config or (tui is not None and (not isinstance(tui, dict) or "terminal_title" in tui)):
+        if "sqlite_home" in config or "profile" in config or (tui is not None and (not isinstance(tui, dict) or "terminal_title" in tui)):
             raise SessionUnavailable(f"Codex title/profile config layer is unsupported: {path}")
+
+
+def foreground_codex_route(info, process, home):
+    """Prove the native foreground PID uses this home and the default local route.
+
+    Read only route keys from the process environment; don't retain or log the
+    rest of that map. PID creation time and executable are rechecked after RPCs.
+    """
+    import psutil
+    candidates = [p for p in process.get("foreground_processes", []) if codex_argv(p)]
+    if len(candidates) != 1:
+        raise SessionUnavailable("Fresh Codex identity needs one native foreground process")
+    candidate = candidates[0]
+    pid, argv = candidate.get("pid"), candidate.get("argv")
+    if type(pid) is not int or pid <= 0 or codex_argv(candidate) != argv:
+        raise SessionUnavailable("Fresh Codex process route is unsupported")
+    if any(arg.split("=", 1)[0] in ("--remote", "--remote-auth-token-env", "--no-daemon", "--exec-server-url",
+                                    "--workload-identity", "--codex-home", "--oss", "--strict-config",
+                                    "--dangerously-bypass-hook-trust", "--approve-for-me", "--not-so-yolo",
+                                    "--search", "--enable", "--disable", "--config")
+           or arg.startswith("--config=") or arg.startswith("-c") for arg in argv[1:]):
+        raise SessionUnavailable("Fresh Codex identity only supports the default local daemon route")
+    proc = psutil.Process(pid)
+    started = proc.create_time()
+    executable = proc.exe()
+    if (proc.cmdline() != argv or proc.cwd() != info.get("cwd")
+            or not (os.path.basename(executable) == "codex" or os.path.basename(executable).startswith("codex-"))):
+        raise SessionUnavailable("Codex foreground process does not match the pane")
+    environment = proc.environ()
+    selected = {key: environment.get(key) for key in ("CODEX_HOME", "HOME", "CODEX_APP_SERVER_URL", "CODEX_EXEC_SERVER_URL", "CODEX_SQLITE_HOME")}
+    workload_selected = any(key in environment for key in ("OPENAI_FEDERATION_RULE_ID", "OPENAI_IDENTITY_TOKEN_FILE"))
+    del environment
+    if (workload_selected or selected["CODEX_APP_SERVER_URL"] is not None
+            or selected["CODEX_EXEC_SERVER_URL"] is not None or selected["CODEX_SQLITE_HOME"] is not None):
+        raise SessionUnavailable("Fresh Codex execution endpoint is unsupported")
+    native_home = selected["CODEX_HOME"] or (str(Path(selected["HOME"]) / ".codex") if selected["HOME"] else None)
+    if not native_home or not Path(native_home).is_absolute() or Path(native_home).resolve() != Path(home).resolve():
+        raise SessionUnavailable("Codex foreground home differs from the local daemon home")
+    return {"pid": pid, "started": started, "executable": executable, "home": str(Path(home).resolve())}
+
+
+def check_default_daemon_overrides(config, argvs):
+    unsupported = ("remote", "app_server_url", "exec_server_url", "codex_home", "sqlite_home", "workload_identity", "no_daemon")
+    if any(key in config for key in unsupported):
+        raise SessionUnavailable("Codex daemon route config is unsupported for fresh identity")
+    for argv in argvs:
+        args = iter(argv[1:])
+        for arg in args:
+            if arg == "--":
+                break
+            if arg in ("-c", "--config"):
+                override = next(args, "")
+            elif arg.startswith("--config="):
+                override = arg[len("--config="):]
+            elif arg.startswith("-c") and not arg.startswith("--"):
+                override = arg[2:].removeprefix("=")
+            else:
+                continue
+            key = override.partition("=")[0].strip().split(".", 1)[0]
+            if key in unsupported:
+                raise SessionUnavailable("Codex daemon route override is unsupported for fresh identity")
 
 
 class AgentAdapter:
@@ -199,6 +264,7 @@ class ClaudeAdapter(AgentAdapter):
 class CodexAdapter(AgentAdapter):
     """The configured native title is authoritative; uncertainty blocks fallback."""
     def enrich(self, info, client):
+        info = {k: v for k, v in info.items() if k != LIVE_PROOF}
         try:
             config = read_codex_config(Path(self.source.home) / "config.toml")
             process = client.process_info(info["pane_id"])
@@ -215,31 +281,59 @@ class CodexAdapter(AgentAdapter):
                         or client.process_info(info["pane_id"]) != process):
                     raise SessionUnavailable("Codex pane changed while reading its title config")
                 return info
-            tid = self._title_session(info, client, process, argvs)
+            tid, proof = self._title_session(info, client, process, argvs, config)
         except SessionUnavailable as exc:
             return self._unavailable(info, str(exc))
         except Exception:
             return self._unavailable(info, "Codex process/config/title identity read failed")
-        return {**{k: v for k, v in info.items() if k != AUTHORITY_ERROR},
+        return {**{k: v for k, v in info.items() if k not in (AUTHORITY_ERROR, LIVE_PROOF)},
+                **({LIVE_PROOF: proof} if proof else {}),
                 "agent_session": {"agent": "codex", "kind": "id", "source": TITLE_SOURCE, "value": tid}}
 
-    def _title_session(self, info, client, process, argvs):
+    def _title_session(self, info, client, process, argvs, config):
         if process.get("pane_id") != info.get("pane_id") or not argvs:
             raise SessionUnavailable("Codex title identity needs a Codex foreground process")
         prefix = title_session_prefix(info.get("terminal_title_stripped"))
         if not prefix:
             raise SessionUnavailable("Codex title export enabled but the title has no exact session id")
-        tid, _, _ = resolve_title_session(prefix, info.get("cwd"), home=self.source.home)
+        check_default_daemon_overrides(config, argvs)
+        if any(arg.split("=", 1)[0] in ("--remote", "--remote-auth-token-env", "--exec-server-url", "--workload-identity", "--codex-home")
+               for argv in argvs for arg in argv[1:]):
+            raise SessionUnavailable("Codex title identity does not support this execution route")
+        proof = None
+        explicit_embedded = any("--no-daemon" in argv for argv in argvs)
+        if explicit_embedded:
+            # Existing embedded sessions retain their strict persisted contract;
+            # a socket elsewhere in this home doesn't make them daemon clients.
+            tid, _, _ = resolve_title_session(prefix, info.get("cwd"), home=self.source.home)
+        elif daemon_available(self.source.home):
+            route = foreground_codex_route(info, process, self.source.home)
+            with observe_daemon(self.source.home) as observer:
+                session, proof = resolve_live_title(prefix, info.get("cwd"), self.source.home, observer)
+                # Complete inventory and exact metadata are checked again before
+                # trusting this observation. No lifecycle RPC attaches a thread.
+                again, new_proof = resolve_live_title(prefix, info.get("cwd"), self.source.home, observer)
+                if again != session or foreground_codex_route(info, process, self.source.home) != route:
+                    raise SessionUnavailable("Codex live identity changed while reading")
+                proof = new_proof
+                if proof:
+                    proof = {**proof, "route": route}
+            tid = session[0]
+        else:
+            tid, _, _ = resolve_title_session(prefix, info.get("cwd"), home=self.source.home)
         fresh = client.get_agent(info["pane_id"])
         if (any(fresh.get(k) != info.get(k) for k in ("pane_id", "terminal_id", "cwd", "agent"))
                 or title_session_prefix(fresh.get("terminal_title_stripped")) != prefix
                 or client.process_info(info["pane_id"]) != process):
             raise SessionUnavailable("Codex pane changed while reading its title identity")
-        return tid
+        check_title_config_layers(self.source.home, info.get("cwd"))
+        if read_codex_config(Path(self.source.home) / "config.toml") != config:
+            raise SessionUnavailable("Codex title config changed while reading its identity")
+        return tid, proof
 
     @staticmethod
     def _unavailable(info, reason):
-        return {**info, "agent_session": None, AUTHORITY_ERROR: reason}
+        return {**{k: v for k, v in info.items() if k != LIVE_PROOF}, "agent_session": None, AUTHORITY_ERROR: reason}
 
 
 def adapters(db):

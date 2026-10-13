@@ -17,6 +17,7 @@ from .questions import CodexQuestionSource, QuestionUnavailable, fingerprint as 
 from .channels import PaneChannels
 from .agent_adapters import adapters
 from .codex_session import AUTHORITY_ERROR
+from .terminal_inputs import TerminalInputs, known_empty_composer
 
 log = logging.getLogger(__name__)
 CONSUMED_STATES = {"reserved", "dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
@@ -90,6 +91,10 @@ class Bridge:
         self.lock = threading.RLock()
         self.adapters = adapters(self.db)
         self.channels = PaneChannels(self.db)
+        self.inputs = TerminalInputs(self.db, self.clock)
+        for record in self.inputs.started():
+            if not record.get("arbiter_released"):
+                self.sending.setdefault(record["pane_id"], f"input:{record['seq']}")
         self.db.commit()
 
     def pane_channels(self, account_id):
@@ -442,7 +447,7 @@ class Bridge:
             ready = []
             for (raw,) in self.db.execute("SELECT event FROM outbox ORDER BY rowid").fetchall():
                 queued = json.loads(raw)
-                if account_id and queued["type"] != "approval.updated":
+                if account_id and queued["type"] not in ("approval.updated", "input.updated"):
                     a = queued["agent"]
                     if not queued.get("route") and not self.channels.route(account_id, a["pane_id"], a.get("terminal_id")):
                         continue
@@ -569,8 +574,7 @@ class Bridge:
                 rec["dispatch"].update(plan)
             else:
                 _, fresh = self._live_dialog(rec)  # The Slack edit may have taken seconds.
-            if rec["pane_id"] in self.sending:
-                raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
+            self._ensure_pane_available(rec)
             rec["dispatch"].update(started_at=self.clock(), focused=fresh.get("focused"), revision=fresh.get("revision"))
             rec["followup_deadline"] = self.clock() + self.followup_timeout
             self._save(rec, "dispatching")
@@ -607,9 +611,17 @@ class Bridge:
         return dialog, fresh
 
     def _claim_pane(self, rec):
+        self._ensure_pane_available(rec)
+        self.sending[rec["pane_id"]] = rec["id"]
+
+    def _ensure_pane_available(self, rec):
         if rec["pane_id"] in self.sending:
             raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
-        self.sending[rec["pane_id"]] = rec["id"]
+        terminal = rec.get("terminal_id")
+        if not terminal and rec.get("identity"):
+            terminal = rec["identity"][1]
+        if self.inputs.blocker({"terminal_id": terminal, "seq": rec.get("seq")}):
+            raise BridgeError("This terminal has an unresolved prompt write; wait and check status. Nothing was sent")
 
     def _live_question(self, rec, option, answer):
         info = self._agent(rec["pane_id"])
@@ -649,8 +661,7 @@ class Bridge:
         else:
             dialog, fresh = self._live_dialog(rec)
             plan = {"keys": keys_for(dialog, option)}
-        if rec["pane_id"] in self.sending:
-            raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
+        self._ensure_pane_available(rec)
         if rec.get("dispatch"):
             rec.setdefault("attempts", []).append(rec["dispatch"])
         rec["dispatch"] = {"attempt_id": uuid.uuid4().hex, "option": option,
@@ -919,20 +930,285 @@ class Bridge:
                 "reason": reason, "retryable": retryable if reason == "question_still_pending" else False,
                 "elapsed_ms": round((self.monotonic() - start) * 1000)}
 
-    def send(self, pane, text):
-        with self.lock:
-            if not isinstance(text, str) or not text.strip() or len(text) > 16000:
-                raise BridgeError("Prompt must contain 1–16000 characters")
-            info = self._agent(pane)
-            require_session_authority(info)
+    def _input_snapshot(self, info):
+        require_session_authority(info)
+        session = session_of(info)
+        if not isinstance(session, str) or not session:
+            raise BridgeError("Agent session identity unavailable; nothing was sent")
+        if info.get("agent") not in self.adapters:
+            raise BridgeError("Only Codex and Claude panes accept remote prompts; nothing was sent")
+        return {"pane_id": info["pane_id"], "terminal_id": info["terminal_id"],
+                "session_id": session, "agent_kind": info["agent"],
+                "observed_status": info.get("agent_status"),
+                "observed_sequence": info.get("state_change_seq")}
+
+    def _input_binding(self, account_id, channel_id, expected=None):
+        binding = self.channels.from_channel(account_id, channel_id)
+        if (not binding or binding.get("closed") or binding.get("state") != "ready"
+                or not binding.get("channel_id") or not binding.get("terminal_id")):
+            raise BridgeError("This Slack channel is not a ready Herdr pane; nothing was sent")
+        if expected and any(binding.get(key) != expected.get(key)
+                            for key in ("id", "pane_id", "terminal_id", "channel_id", "account_id")):
+            raise BridgeError("Pane channel binding changed; nothing was sent")
+        return binding
+
+    def ingest_input(self, account_id, conversation_id, message_ts, sender_id, text,
+                     thread_id=None, binding_id=None):
+        """Deduplicate one authenticated Slack prompt and queue or submit it once."""
+        if not all(isinstance(value, str) and value for value in
+                   (account_id, conversation_id, message_ts, sender_id)):
+            raise BridgeError("Slack input identity is incomplete; nothing was sent")
+        if not isinstance(text, str) or not text.strip() or len(text) > 16000:
+            raise BridgeError("Prompt must contain 1–16000 characters; nothing was sent")
+        text = text.strip()
+        with self.lock, self.db:
+            duplicate = self.inputs.find("slack", account_id, conversation_id, message_ts)
+            if duplicate:
+                return self._input_result(duplicate)
+            binding = self._input_binding(account_id, conversation_id)
+            if binding_id and binding["id"] != binding_id:
+                raise BridgeError("Pane channel binding changed; nothing was sent")
+            info = self._agent(binding["pane_id"])
+            snapshot = self._input_snapshot(info)
+            if snapshot["terminal_id"] != binding["terminal_id"]:
+                raise BridgeError("Pane channel terminal identity changed; nothing was sent")
+            rec = self.inputs.insert({"source": "slack", "account_id": account_id,
+                "channel_id": conversation_id, "message_ts": message_ts,
+                "sender_id": sender_id, "thread_id": str(thread_id) if thread_id is not None else None,
+                "binding": {key: binding.get(key) for key in
+                    ("id", "account_id", "channel_id", "pane_id", "terminal_id", "team_id")},
+                "prompt": text, **snapshot})
+            if info.get("agent_status") == "blocked":
+                rec = self.inputs.save(rec, "rejected", reason="agent_blocked_use_approval")
+                return self.inputs.result(rec)
+            if info.get("agent_status") == "working":
+                rec = self.inputs.save(rec, "queued", reason="agent_busy")
+                return self._input_result(rec)
             if info.get("agent_status") not in ("idle", "done"):
-                raise BridgeError("Agent must be idle/done; use an exact approval request to answer a dialog")
-            fresh = self._agent(pane)
-            require_session_authority(fresh)
-            if identity(fresh) != identity(info) or fresh.get("agent_status") not in ("idle", "done"):
-                raise BridgeError("Agent changed before dispatch")
-            self.client.prompt_agent(pane, text)
-            return {"pane_id": pane, "outcome": "dispatched"}
+                rec = self.inputs.save(rec, "rejected", reason="agent_status_unknown")
+                return self.inputs.result(rec)
+        return self._dispatch_input(rec["seq"])
+
+    def _revalidate_input(self, rec):
+        if rec["source"] == "slack":
+            self._input_binding(rec["account_id"], rec["channel_id"], rec["binding"])
+        info = self._agent(rec["pane_id"])
+        require_session_authority(info)
+        if identity(info) != (rec["session_id"], rec["terminal_id"], rec["agent_kind"]):
+            raise BridgeError("Agent terminal or session changed; nothing was sent")
+        return info
+
+    def _input_result(self, rec):
+        with self.lock, self.db:
+            rec = self.inputs.get(rec["seq"])
+            if rec["source"] == "slack" and rec["state"] == "queued" and not rec.get("notify_updates"):
+                rec = self.inputs.save(rec, "queued", notify_updates=True)
+            if (rec.get("source") == "slack" and rec.get("notify_updates")
+                    and rec["state"] in ("confirmed", "uncertain", "rejected")
+                    and rec.get("last_notified_state") != rec["state"]):
+                result = self.inputs.result(rec)
+                event = {"id": uuid.uuid4().hex, "type": "input.updated", "at": self.clock(),
+                         "result": result, "route": {"channel": "slack",
+                         "accountId": rec["account_id"], "conversationId": rec["channel_id"],
+                         "to": f"channel:{rec['channel_id']}", "threadId": rec.get("thread_id"),
+                         "team_id": rec.get("binding", {}).get("team_id")}}
+                self.db.execute("INSERT INTO outbox VALUES (?,?)", (event["id"], json.dumps(event)))
+                rec = self.inputs.save(rec, rec["state"], last_notified_state=rec["state"])
+            return self.inputs.result(rec)
+
+    def _dispatch_input(self, seq):
+        with self.lock, self.db:
+            rec = self.inputs.get(seq)
+            if not rec or rec["state"] != "queued":
+                return self._input_result(rec) if rec else {"input_id": seq, "outcome": "rejected", "reason": "input_absent"}
+            if (not self.inputs.is_first(rec) or self.inputs.blocker(rec)
+                    or rec["pane_id"] in self.sending):
+                return self._input_result(rec)
+            try:
+                info = self._revalidate_input(rec)
+                status = info.get("agent_status")
+                if status == "blocked":
+                    return self._input_result(self.inputs.save(rec, "rejected", reason="agent_blocked_use_approval"))
+                if status == "working":
+                    return self._input_result(self.inputs.save(rec, "queued", reason="agent_busy"))
+                if status not in ("idle", "done"):
+                    return self._input_result(self.inputs.save(rec, "rejected", reason="agent_status_unknown"))
+                adapter = self.adapters[rec["agent_kind"]]
+                try:
+                    baseline = adapter.source.receipt_baseline(info)
+                except Exception as exc:
+                    if info.get("codex_live_identity"):
+                        raise  # A fresh native proof never permits an unavailable baseline.
+                    baseline = {"unavailable": type(exc).__name__}
+                fresh = self._revalidate_input(rec)
+                if baseline.get("native_identity"):
+                    current_baseline = adapter.source.receipt_baseline(fresh)
+                    if any(current_baseline.get(key) != baseline.get(key) for key in ("source_key", "path")):
+                        raise BridgeError("Codex native rollout path changed; nothing was sent")
+                if (fresh.get("agent_status") not in ("idle", "done")
+                        or fresh.get("state_change_seq") != info.get("state_change_seq")):
+                    return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
+                # This is the last external read before the reserve commit and
+                # one terminal write. It follows transcript/source resolution,
+                # which can be slow enough for a local draft to appear.
+                screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
+                if not known_empty_composer(rec["agent_kind"], screen):
+                    return self._input_result(self.inputs.save(rec, "rejected", reason="composer_not_known_empty"))
+                rec = self.inputs.save(rec, "reserved", reason="terminal_write_reserved",
+                    attempt_id=uuid.uuid4().hex, reserved_at=self.clock(),
+                    dispatch_sequence=fresh.get("state_change_seq"), receipt_baseline=baseline)
+                self._claim_pane({**rec, "id": f"input:{rec['seq']}"})
+            except BridgeError as exc:
+                rec = self.inputs.save(rec, "rejected", reason="revalidation_failed")
+                log.info("Herdr prompt rejected before terminal write: input=%s error=%s", rec["seq"], type(exc).__name__)
+                return self._input_result(rec)
+            except Exception as exc:
+                rec = self.inputs.save(rec, "rejected", reason="guard_unavailable")
+                log.info("Herdr prompt guard unavailable: input=%s error=%s", rec["seq"], type(exc).__name__)
+                return self._input_result(rec)
+        try:
+            try:
+                self.client.prompt_agent(rec["pane_id"], rec["prompt"])
+            except Exception as exc:
+                rec = self._save_input_progress(rec["seq"], "uncertain", reason="terminal_write_outcome_unknown",
+                                                error_type=type(exc).__name__)
+                return self._input_result(rec)
+            rec = self._save_input_progress(rec["seq"], "observing", reason="awaiting_exact_transcript_receipt",
+                                            write_returned_at=self.clock())
+            if rec["state"] == "confirmed" or rec.get("arbiter_released"):
+                return self._input_result(rec)
+            deadline = self.monotonic() + self.confirmation_timeout
+            while True:
+                try:
+                    live = self._revalidate_started_input(rec)
+                    baseline = rec.get("receipt_baseline", {})
+                    if not baseline.get("unavailable") and self.adapters[rec["agent_kind"]].source.receipt_recorded(
+                            live, baseline, rec["prompt"]):
+                        rec = self._save_input_progress(rec["seq"], "confirmed", reason="exact_user_transcript_recorded",
+                                                        confirmed_at=self.clock())
+                        return self._input_result(rec)
+                except Exception:
+                    pass
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    rec = self._save_input_progress(rec["seq"], "uncertain", reason="exact_transcript_receipt_unavailable")
+                    return self._input_result(rec)
+                self.sleep(min(self.confirmation_interval, remaining))
+        finally:
+            with self.lock:
+                rec = self.inputs.get(rec["seq"])
+                if (rec.get("state") not in ("reserved", "observing", "uncertain")
+                        or rec.get("arbiter_released")):
+                    self._release_input_arbiter(rec)
+
+    def _save_input_progress(self, seq, state, **fields):
+        with self.lock, self.db:
+            current = self.inputs.get(seq)
+            if current["state"] == "confirmed" or current.get("arbiter_released"):
+                return current
+            return self.inputs.save(current, state, **fields)
+
+    def _input_target_info(self, rec):
+        panes = self.client.list_panes()
+        if (not isinstance(panes, list) or any(not isinstance(pane, dict)
+                or not isinstance(pane.get("pane_id"), str) or ":p" not in pane["pane_id"]
+                or not isinstance(pane.get("terminal_id"), str) or not pane["terminal_id"]
+                for pane in panes)
+                or len({pane["pane_id"] for pane in panes}) != len(panes)
+                or len({pane["terminal_id"] for pane in panes}) != len(panes)):
+            raise BridgeError("Terminal inventory unavailable or ambiguous")
+        targets = [pane for pane in panes if pane["terminal_id"] == rec["terminal_id"]]
+        if not any(pane["pane_id"] == rec["pane_id"] and pane["terminal_id"] == rec["terminal_id"]
+                   for pane in panes):
+            with self.lock:
+                self._release_input_arbiter(rec)
+        if not targets:
+            return None
+        info = self._agent(targets[0]["pane_id"])
+        require_session_authority(info)
+        if info["terminal_id"] != rec["terminal_id"] or not all(identity(info)):
+            raise BridgeError("Terminal changed or session identity unavailable")
+        return info
+
+    def _revalidate_started_input(self, rec):
+        info = self._input_target_info(rec)
+        if info is None or identity(info) != (rec["session_id"], rec["terminal_id"], rec["agent_kind"]):
+            raise BridgeError("Agent terminal or session changed; nothing was sent")
+        return info
+
+    def _input_identity_closed(self, rec, info):
+        expected = (rec["session_id"], rec["terminal_id"], rec["agent_kind"])
+        return info is None or identity(info) != expected
+
+    def _release_input_arbiter(self, rec):
+        owner = f"input:{rec['seq']}"
+        if self.sending.get(rec["pane_id"]) == owner:
+            self.sending.pop(rec["pane_id"])
+
+    def _release_input_if_closed(self, rec, info):
+        if not self._input_identity_closed(rec, info):
+            return False
+        with self.lock, self.db:
+            current = self.inputs.get(rec["seq"])
+            if current and current["state"] != "confirmed" and not current.get("arbiter_released"):
+                current = self.inputs.save(current, "uncertain",
+                    reason="target_identity_closed_unconfirmed", arbiter_released=True)
+                self._release_input_arbiter(current)
+                self._input_result(current)
+        return True
+
+    def reconcile_inputs(self):
+        """Observe started attempts and release at most one FIFO item per terminal."""
+        with self.lock:
+            started = self.inputs.started()
+        for rec in started:
+            try:
+                info = self._input_target_info(rec)
+            except Exception:
+                continue
+            if self._release_input_if_closed(rec, info):
+                continue
+            baseline = rec.get("receipt_baseline", {})
+            if baseline.get("unavailable"):
+                continue
+            try:
+                if self.adapters[rec["agent_kind"]].source.receipt_recorded(info, baseline, rec["prompt"]):
+                    with self.lock, self.db:
+                        current = self.inputs.get(rec["seq"])
+                        if current and current["state"] != "confirmed" and not current.get("arbiter_released"):
+                            current = self.inputs.save(current, "confirmed", reason="exact_user_transcript_recorded")
+                            self._release_input_arbiter(current)
+                            self._input_result(current)
+            except Exception:
+                continue
+        with self.lock:
+            queued = self.inputs.queued()
+        terminals = set()
+        for rec in queued:
+            if rec["terminal_id"] in terminals:
+                continue
+            terminals.add(rec["terminal_id"])
+            self._dispatch_input(rec["seq"])
+
+    def send(self, pane, text):
+        """Compatibility facade for `/herdr send`, using the same safe arbiter."""
+        if not isinstance(text, str) or not text.strip() or len(text) > 16000:
+            raise BridgeError("Prompt must contain 1–16000 characters")
+        with self.lock, self.db:
+            info = self._agent(pane)
+            snapshot = self._input_snapshot(info)
+            rec = self.inputs.insert({"source": "command", "account_id": "local",
+                "channel_id": pane, "message_ts": uuid.uuid4().hex, "sender_id": "authorized-command",
+                "thread_id": None, "binding": None, "prompt": text.strip(), **snapshot})
+            if info.get("agent_status") == "blocked":
+                rec = self.inputs.save(rec, "rejected", reason="agent_blocked_use_approval")
+                raise BridgeError("Agent is blocked; use an exact approval request. Nothing was sent")
+            if info.get("agent_status") == "working":
+                return self.inputs.result(self.inputs.save(rec, "queued", reason="agent_busy"))
+            if info.get("agent_status") not in ("idle", "done"):
+                rec = self.inputs.save(rec, "rejected", reason="agent_status_unknown")
+                raise BridgeError("Agent status is not recognized as safe; nothing was sent")
+        return self._dispatch_input(rec["seq"])
 
     def close(self):
         self.db.close()

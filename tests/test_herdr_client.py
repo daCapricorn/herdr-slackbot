@@ -48,8 +48,8 @@ def test_read_line_handles_chunks_and_leftovers():
 @pytest.mark.parametrize("method,params,expected", [
     ("agent.list", {}, ["agent", "list"]),
     ("agent.get", {"target": "coder"}, ["agent", "get", "coder"]),
-    ("agent.read", {"target": "w1:p1", "source": "recent_unwrapped", "lines": 200},
-     ["agent", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "200"]),
+    ("agent.read", {"target": "w1:p1", "source": "recent_unwrapped", "lines": 200, "format": "ansi"},
+     ["agent", "read", "w1:p1", "--source", "recent-unwrapped", "--lines", "200", "--format", "ansi"]),
     ("agent.start", {"name": "slack-1", "kind": "claude", "pane_id": "w1:p2",
                      "args": ["--model", "opus"], "timeout_ms": 60000},
      ["agent", "start", "slack-1", "--kind", "claude", "--pane", "w1:p2", "--timeout", "60000", "--", "--model", "opus"]),

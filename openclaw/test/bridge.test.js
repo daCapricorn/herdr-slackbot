@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import plugin, { authorized, commandContext } from "../index.js";
+import plugin, { authorized, commandContext, stripBotMention } from "../index.js";
 import { answerText, eventPayload, deliver, buttonLabel, messageSummary } from "../presentation.js";
 import { readFileSync } from "node:fs";
 
@@ -21,6 +21,61 @@ test("native Slack command context canonicalizes only stable IDs and authentic o
   assert.throws(()=>commandContext({...trusted,from:"slack:channel:C2",conversationId:"C3"}),/Conflicting/);
   for (const changes of [{senderId:"u2"},{isAuthorizedSender:false},{accountId:"other"},{channel:"discord"}])
     assert.equal(authorized(config,commandContext({...ctx,...changes})),false);
+});
+test("bot mention stripping preserves other mentions and decodes Slack entities once", () => {
+  const raw = '<@UBOT> (OpenClaw)\nrun <@U2> (Teammate) &amp;&amp; x &lt; y &amp;lt; z (keep me)';
+  assert.equal(stripBotMention(raw,"UBOT",["<@UBOT> (OpenClaw)","<@U2> (Teammate)"]),
+    'run <@U2> (Teammate) && x < y &lt; z (keep me)');
+  assert.equal(stripBotMention("<@UBOT> (legitimate user text)","UBOT",[]),"(legitimate user text)");
+});
+
+test("reply dispatch claims only an explicit current-message owner mention in a mapped pane channel", async t => {
+  const {mkdtemp,rm} = await import("node:fs/promises");
+  const {tmpdir} = await import("node:os");
+  const stateDir = await mkdtemp(`${tmpdir()}/herdr-input-hook-`);
+  t.after(()=>rm(stateDir,{recursive:true,force:true}));
+  const registrations = {}, calls = [], finals = [], processed = [];
+  const binding = {id:"binding-1",account_id:"default",channel_id:"C1",team_id:"T1",
+    pane_id:"w1:p1",terminal_id:"term-1",state:"ready",closed:false};
+  const worker = {child:{exitCode:null},start(){},async stop(){},async call(method,params) {
+    calls.push({method,params});
+    if (method === "pane_channels") return [binding];
+    if (method === "pane_for_channel") return binding;
+    if (method === "events") return [];
+    if (method === "ingest_input") return {input_id:1,pane_id:"w1:p1",kind:"codex",outcome:"confirmed"};
+    return {};
+  }};
+  const channel = {sync:async()=>[binding],identity:async()=>({user_id:"UBOT",team_id:"T1"})};
+  const hookConfig = {...config,paneChannels:{enabled:true}};
+  const api = {pluginConfig:hookConfig,logger:{info(){},warn(){}},registerService:s=>registrations.service=s,
+    registerCommand(){},registerInteractiveHandler(){},registerTool(){},
+    on:(name,handler,options)=>registrations[name]={handler,options},
+    runtime:{config:{current:()=>({})},channel:{outbound:{loadAdapter:async()=>({sendPayload:async()=>({})})}}}};
+  plugin.register(api,()=>worker,()=>channel);
+  assert.equal(registrations.reply_dispatch.options,undefined);
+  await registrations.service.start({stateDir,config:{plugins:{entries:{"herdr-bridge":{config:hookConfig}}}}});
+  t.after(()=>registrations.service.stop());
+  const hookCtx = () => ({dispatcher:{sendFinalReply:payload=>(finals.push(payload),true),
+      markComplete(){},getQueuedCounts:()=>({final:1})},
+    recordProcessed:(outcome,details)=>processed.push({outcome,details}),markIdle(){}});
+  const base = {sendPolicy:"allow",ctx:{Surface:"slack",AccountId:"default",NativeChannelId:"C1",
+    GroupSpace:"T1",InboundEventKind:"user_request",ProviderUpdateKind:"message",SenderId:"U1",
+    CommandAuthorized:true,SenderIsBot:false,MessageSid:"100.1",MessageThreadId:"90.1",
+    MentionedUserIds:["UBOT"],WasMentioned:true,ChannelContext:{chat:{
+      commandSourceText:'<@UBOT> (OpenClaw)\nline 1 &amp;&amp; line 2 <@U2> (Other) &amp;lt;',
+      mentionStripPatterns:["<@UBOT> (OpenClaw)","<@U2> (Other)"]}}}};
+  assert.equal((await registrations.reply_dispatch.handler(base,hookCtx())).handled,true);
+  const admitted = calls.find(call=>call.method === "ingest_input");
+  assert.deepEqual(admitted.params,{account_id:"default",conversation_id:"C1",message_ts:"100.1",
+    sender_id:"U1",text:"line 1 && line 2 <@U2> (Other) &lt;",thread_id:"90.1",binding_id:"binding-1"});
+  const count = calls.filter(call=>call.method === "ingest_input").length;
+  const implicit = structuredClone(base);
+  implicit.ctx.MessageSid = "100.2";
+  delete implicit.ctx.MentionedUserIds;
+  assert.equal((await registrations.reply_dispatch.handler(implicit,hookCtx())).handled,true);
+  assert.equal(calls.filter(call=>call.method === "ingest_input").length,count);
+  assert.equal(processed.at(-1).details.reason,"herdr_unmentioned");
+  assert.match(finals[0].text,/Prompt recorded/);
 });
 test("portable approval actions carry exact request and option, never raw keys", () => {
   const payload = eventPayload({ type: "approval.requested", agent: { pane_id: "w4:p2", kind: "codex" },
@@ -243,6 +298,29 @@ test("conversation outage retains order, recovers after restart and does not res
   await bridge.restart();
   for(let i=0;i<10;i++) await new Promise(resolve=>setImmediate(resolve));
   assert.equal(sent.length,3);
+});
+
+test("queued prompt result returns to its persisted Slack thread before acknowledgement", async t => {
+  const pending = new Map([["input-1",{id:"input-1",type:"input.updated",
+    result:{input_id:1,pane_id:"w1:p1",kind:"claude",outcome:"confirmed"},
+    route:{channel:"slack",accountId:"default",conversationId:"C1",to:"channel:C1",threadId:"90.1",team_id:"T1"}}]]);
+  const delivered = [];
+  const paneConfig = {...config,paneChannels:{enabled:true}};
+  const channel = {sync:async()=>[],identity:async()=>({user_id:"UBOT",team_id:"T1"})};
+  const bridge = await runningBridge(t,{config:paneConfig,channelFactory:()=>channel,
+    call:async(method,params)=> {
+      if (method === "pane_channels") return [];
+      if (method === "events") return [...pending.values()];
+      if (method === "ack") pending.delete(params.event_id);
+      return {};
+    },update:async ctx=>delivered.push(ctx)});
+  for(let i=0;i<30 && pending.size;i++) await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(pending.size,0);
+  assert.equal(delivered.length,1);
+  assert.equal(delivered[0].to,"channel:C1");
+  assert.equal(delivered[0].threadId,"90.1");
+  assert.match(delivered[0].payload.text,/Prompt recorded by claude/);
+  assert.ok(bridge.calls.some(call=>call.method === "ack" && call.params.event_id === "input-1"));
 });
 
 test("authorized answer/check/retry callbacks bind the source card and invoke only their own method", async t => {

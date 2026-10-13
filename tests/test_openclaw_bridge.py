@@ -166,6 +166,13 @@ def test_sending_cannot_answer_blocked_dialog(setup):
     with pytest.raises(BridgeError):
         bridge.send("w4:p2", "y")
     client.info["agent_status"] = "idle"
+    rejected = bridge.send("w4:p2", "inspect project")
+    assert rejected["outcome"] == "rejected" and not client.prompts
+    client.screen = """› \x1b[2mAsk Codex to do anything\x1b[0m
+
+  GPT-6.1-Sol medium · /project
+  ← for agents · ? for shortcuts
+"""
     bridge.send("w4:p2", "inspect project")
     assert client.prompts == [("w4:p2", "inspect project")]
     with pytest.raises(BridgeError):

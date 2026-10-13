@@ -89,7 +89,8 @@ export async function deliver(api, route, payload, signal) {
   const adapter = await api.runtime.channel.outbound.loadAdapter(route.channel);
   if (!adapter?.sendPayload) throw new Error(`OpenClaw channel ${route.channel} has no payload sender`);
   const cfg = api.runtime.config.current();
-  const ctx = { cfg, to: route.to, accountId: route.accountId, text: payload.text ?? "", payload, signal,
+  const ctx = { cfg, to: route.to, accountId: route.accountId, threadId: route.threadId,
+    text: payload.text ?? "", payload, signal,
     assertDirectAdapterHandoff: () => signal?.throwIfAborted() };
   const normalized = adapter.normalizePayload ? adapter.normalizePayload({ cfg, accountId: route.accountId, payload }) : payload;
   if (!normalized) throw new Error("OpenClaw channel suppressed the bridge payload");

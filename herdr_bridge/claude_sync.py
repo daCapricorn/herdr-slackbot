@@ -77,6 +77,18 @@ class ClaudeTranscriptSync(TranscriptSync):
             raise SessionUnavailable("Bound directory changed; bind the current session again")
         return resolve_claude(info, home=self.home, thread_id=row[0] if row else None)
 
+    def receipt_baseline(self, info):
+        """Allow the exact first-turn path only when it does not exist yet."""
+        try:
+            return super().receipt_baseline(info)
+        except SessionUnavailable:
+            tid, path, _ = resolve_claude(info, home=self.home, require_rollout=False)
+            if path.exists():
+                raise
+            return {"source_key": f"{info.get('terminal_id') or info.get('pane_id', '')}:{tid}",
+                    "path": str(path), "device": None, "inode": None,
+                    "offset": 0, "missing": True}
+
     def bind(self, info, thread_id):
         if not info.get("terminal_id"):
             raise SessionUnavailable("Exact terminal id required for binding")
@@ -186,6 +198,12 @@ class ClaudeTranscriptSync(TranscriptSync):
                     events.append((self.event_id(source_key, tool_id, "tool"), {"role": "tool", "text": summary}))
             self.db.execute("INSERT OR REPLACE INTO claude_sync_pending VALUES (?,?)", (source_key, json.dumps(pending)))
         return events
+
+    def receipt_user_texts(self, row, offset):
+        if row.get("isSidechain") or row.get("isMeta"):
+            return ()
+        start = turn_start(row)
+        return (start[1],) if start and start[0] == "user" else ()
 
     def finish_events(self, source_key, info, complete):
         # Herdr idle can precede the last transcript append. Only a durable

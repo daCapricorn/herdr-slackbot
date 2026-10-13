@@ -29,6 +29,43 @@ class TranscriptSync:
         row = self.db.execute(f"SELECT record FROM {self.namespace}_sync_status WHERE terminal_id=?", (key,)).fetchone()
         return json.loads(row[0]) if row else {"state": "pending", "reason": "Not scanned yet"}
 
+    def receipt_baseline(self, info):
+        """Snapshot the exact session file before a terminal prompt write."""
+        thread_id, path, _ = self._resolve(info)
+        stat = path.stat()
+        return {"source_key": f"{info.get('terminal_id') or info.get('pane_id', '')}:{thread_id}",
+                "path": str(path), "device": stat.st_dev, "inode": stat.st_ino,
+                "offset": stat.st_size}
+
+    def receipt_recorded(self, info, baseline, expected):
+        """Find one exact native user record strictly after the baseline."""
+        thread_id, path, _ = self._resolve(info)
+        key = f"{info.get('terminal_id') or info.get('pane_id', '')}:{thread_id}"
+        stat = path.stat()
+        same_file = (baseline.get("missing") is True
+                     or stat.st_dev == baseline.get("device") and stat.st_ino == baseline.get("inode"))
+        if (key != baseline.get("source_key") or str(path) != baseline.get("path") or not same_file
+                or stat.st_size < baseline.get("offset", -1)):
+            return False
+        with path.open("rb") as stream:
+            stream.seek(baseline["offset"])
+            while line := stream.readline():
+                if not line.endswith(b"\n"):
+                    break
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and expected in self.receipt_user_texts(row, stream.tell() - len(line)):
+                    return True
+        return False
+
+    def receipt_user_texts(self, row, offset):
+        return ()
+
+    def initial_observation(self, info, session):
+        return load_observation(self.home, info, session)
+
     def _status(self, info, state, **fields):
         key = info.get("terminal_id") or info.get("pane_id", "")
         self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_sync_status VALUES (?, ?)",
@@ -94,7 +131,7 @@ class TranscriptSync:
             same_file = row and row[0] == str(path) and row[1] == stat.st_dev and row[2] == stat.st_ino
             if same_file and stat.st_size >= row[3]:
                 offset = row[3]
-            elif not row and (observation := load_observation(self.home, info, session)):
+            elif not row and (observation := self.initial_observation(info, session)):
                 offset = observation["offset"]
             elif info.get("agent_status") in ("working", "blocked"):
                 offset = self.latest_turn_offset(path)

@@ -130,7 +130,7 @@ class FakeHerdr:
         text = self.screens.get(target, "")
         return ReadResult(text, len(text.splitlines()), 1)
 
-    def read_agent_once(self, target, lines, source="recent_unwrapped"):
+    def read_agent_once(self, target, lines, source="recent_unwrapped", format="text"):
         if self.visible_error:
             raise self.visible_error
         return self.visible.get(target, "")

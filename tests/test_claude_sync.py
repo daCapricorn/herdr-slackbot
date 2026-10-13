@@ -64,6 +64,21 @@ def test_baseline_skips_history_and_streams_user_final_and_tool_summary(source):
     sync.sync(info, lambda *args: pytest.fail("duplicate"))
 
 
+def test_prompt_receipt_handles_exact_first_native_user_record(tmp_path):
+    db = sqlite3.connect(tmp_path / "bridge.sqlite")
+    sync = ClaudeTranscriptSync(db,home=tmp_path)
+    info = {"agent":"claude","pane_id":"w1:p1","terminal_id":"term-a","cwd":"/project",
+            "agent_session":{"value":TID}}
+    baseline = sync.receipt_baseline(info)
+    assert baseline["missing"] is True and baseline["offset"] == 0
+    path = Path(baseline["path"])
+    path.parent.mkdir(parents=True)
+    append(path,[user("historical-looking exact text")])
+    assert sync.receipt_recorded(info,baseline,"historical-looking exact text")
+    assert not sync.receipt_recorded(info,baseline,"other text")
+    db.close()
+
+
 def test_split_answer_stages_across_restart_and_waits_for_turn_end(source):
     sync, db, path, info, enqueue = source
     sync.sync(info, enqueue)
