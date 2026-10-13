@@ -178,3 +178,36 @@ def test_macos_entrypoint_runs_from_another_directory(tmp_path):
                             cwd=tmp_path, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["settings"]["socket_mode_enabled"] is True
+
+
+def test_unix_request_times_out_on_a_silent_server_without_resending():
+    requests = []
+
+    def silent(connection):
+        requests.append(receive_request(connection))
+        assert connection.recv(1) == b""  # Client gives up and closes.
+
+    with unix_peer(silent) as path:
+        with pytest.raises(hc.HerdrOutcomeUnknown):
+            hc.UnixSocketTransport(path, request_timeout=0.2).request("agent.send_keys", {"keys": ["1"]})
+    assert [r["method"] for r in requests] == ["agent.send_keys"]
+
+
+def test_unix_subscription_has_no_deadline_after_ack():
+    def subscribe(connection):
+        receive_request(connection)
+        connection.sendall(b'{"result":{"type":"subscription_started"}}\n')
+        assert connection.recv(1) == b""
+
+    with unix_peer(subscribe) as path:
+        stream = hc.UnixSocketTransport(path, request_timeout=0.2).open_stream("events.subscribe", {"subscriptions": []})
+        assert stream._handle.connection.gettimeout() is None
+        stream.close()
+
+
+def test_request_timeout_extends_for_requested_herdr_waits():
+    assert hc.request_timeout({}, 10) == 10
+    assert hc.request_timeout({"timeout_ms": 30000}, 10) == 40
+    assert hc.request_timeout({"wait": {"timeout_ms": 5000}}, 10) == 15
+    assert hc.request_timeout({"wait": {"timeout_ms": None}}, 10) is None
+    assert hc.request_timeout({"timeout_ms": 30000}, None) is None

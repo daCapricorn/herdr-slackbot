@@ -231,6 +231,9 @@ class EofAfterWriteHandle:
     def read(self, n):
         return b""
 
+    def settimeout(self, timeout):
+        pass
+
     def close(self):
         pass
 
