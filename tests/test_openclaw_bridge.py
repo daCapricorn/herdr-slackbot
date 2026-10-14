@@ -124,7 +124,8 @@ def test_old_expiry_timestamp_does_not_block_an_exact_live_approval(setup):
     token = request(client, bridge)
     rec, state = bridge._record(token)
     rec["expires_at"] = 1  # An existing pre-upgrade request already past its old deadline.
-    bridge._save(rec,state)
+    with bridge.lock, bridge.db:
+        bridge._save(rec,state)
     bridge.clock = lambda: 1001
     assert bridge.answer(token,0)["outcome"] in ("confirmed","unconfirmed")
     assert client.keys == [("w4:p2",["1"])]
