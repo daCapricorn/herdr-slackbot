@@ -33,6 +33,8 @@ log = logging.getLogger(__name__)
 
 PIPE_PREFIX = "\\\\.\\pipe\\"
 READ_CHUNK = 65536
+# Per-request reply deadline (seconds) beyond any wait the request itself asks for.
+REQUEST_TIMEOUT = 10.0
 
 # Windows error codes seen when opening a named pipe.
 _ERROR_FILE_NOT_FOUND = 2
@@ -85,6 +87,31 @@ def pipe_path(socket_path: str) -> str:
     return PIPE_PREFIX + socket_path
 
 
+# Herdr's own readiness wait when `agent.start` omits timeout_ms (herdr agent start --help).
+AGENT_START_DEFAULT_WAIT_MS = 30000
+
+
+def request_timeout(method: str, params: dict, base: float | None) -> float | None:
+    """Total reply budget for one request: `base` plus any Herdr-side wait it asks for.
+
+    `agent.wait` and `agent.prompt` with `wait` block until a state matches and
+    wait indefinitely without timeout_ms, so they stay unbounded in that case.
+    """
+    if base is None:
+        return None
+    if method == "agent.wait":
+        wait_ms = params.get("timeout_ms")
+    elif method == "agent.prompt" and params.get("wait") is not None:
+        wait_ms = (params["wait"] or {}).get("timeout_ms")
+    elif method == "agent.start":
+        wait_ms = params.get("timeout_ms")
+        if wait_ms is None:
+            wait_ms = AGENT_START_DEFAULT_WAIT_MS
+    else:
+        return base
+    return None if wait_ms is None else base + wait_ms / 1000
+
+
 def _unwrap(response: dict, method: str) -> dict:
     if "error" in response:
         err = response.get("error") or {}
@@ -94,14 +121,19 @@ def _unwrap(response: dict, method: str) -> dict:
     return response["result"]
 
 
-def _read_line(handle, buf: bytearray) -> bytes | None:
-    """Read one NDJSON line from a raw pipe handle, keeping leftovers in `buf`."""
+def _read_line(handle, buf: bytearray, before_read=None) -> bytes | None:
+    """Read one NDJSON line from a raw pipe handle, keeping leftovers in `buf`.
+
+    `before_read` runs before every read, so a caller can shrink the remaining budget.
+    """
     while True:
         nl = buf.find(b"\n")
         if nl >= 0:
             line = bytes(buf[:nl])
             del buf[: nl + 1]
             return line
+        if before_read is not None:
+            before_read()
         chunk = handle.read(READ_CHUNK)
         if not chunk:
             if buf:
@@ -119,6 +151,7 @@ class PipeTransport:
         self.path = pipe_path(socket_path)
         self.busy_retries = busy_retries
         self.busy_delay = busy_delay
+        self.request_timeout = None
         self._ids = itertools.count(1)
 
     def _open(self):
@@ -136,6 +169,27 @@ class PipeTransport:
                 break
         raise HerdrUnavailable(f"cannot open {self.path}: {last}")
 
+    def _set_timeout(self, handle, timeout: float | None) -> None:
+        """Named pipes have no read deadline; Unix sockets override this."""
+
+    def _deadline(self, handle, timeout: float | None):
+        """Arm one absolute deadline; the returned callback re-arms the remaining budget.
+
+        A per-recv timeout alone would let a server trickling bytes hold the caller forever.
+        """
+        if timeout is None:
+            self._set_timeout(handle, None)
+            return None
+        expires = time.monotonic() + timeout
+
+        def arm():
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Herdr reply deadline exceeded")
+            self._set_timeout(handle, remaining)
+        arm()
+        return arm
+
     def _send(self, handle, method: str, params: dict) -> str:
         req_id = f"hs-{next(self._ids)}"
         payload = json.dumps({"id": req_id, "method": method, "params": params}, ensure_ascii=False)
@@ -143,11 +197,13 @@ class PipeTransport:
         return req_id
 
     def request(self, method: str, params: dict | None = None) -> dict:
+        params = params or {}
         handle = self._open()  # raises HerdrUnavailable: nothing was sent
         try:
+            arm = self._deadline(handle, request_timeout(method, params, self.request_timeout))
             try:
-                self._send(handle, method, params or {})
-                line = _read_line(handle, bytearray())
+                self._send(handle, method, params)
+                line = _read_line(handle, bytearray(), arm)
             except OSError as exc:
                 raise HerdrOutcomeUnknown(f"{method}: pipe failed after sending: {exc}") from exc
         finally:
@@ -166,12 +222,17 @@ class PipeTransport:
     def open_stream(self, method: str, params: dict) -> "EventStream":
         handle = self._open()
         try:
-            self._send(handle, method, params)
-            buf = bytearray()
-            line = _read_line(handle, buf)
+            arm = self._deadline(handle, self.request_timeout)
+            try:
+                self._send(handle, method, params)
+                buf = bytearray()
+                line = _read_line(handle, buf, arm)
+            except OSError as exc:
+                raise HerdrOutcomeUnknown(f"{method}: no acknowledgement: {exc}") from exc
             if not line:
                 raise HerdrUnavailable(f"{method}: connection closed without a response")
             ack = _unwrap(json.loads(line.decode("utf-8")), method)
+            self._set_timeout(handle, None)  # Event streams stay open indefinitely.
         except BaseException:
             handle.close()
             raise
@@ -243,6 +304,9 @@ class _SocketHandle:
     def read(self, size: int) -> bytes:
         return self.connection.recv(size)
 
+    def settimeout(self, timeout: float | None) -> None:
+        self.connection.settimeout(timeout)
+
     def write(self, data: bytes) -> None:
         self.connection.sendall(data)
 
@@ -257,11 +321,13 @@ class _SocketHandle:
 class UnixSocketTransport(PipeTransport):
     """Herdr's Unix-domain socket, using the same NDJSON framing as Windows."""
 
-    def __init__(self, socket_path: str, connect_timeout: float = 5.0):
+    def __init__(self, socket_path: str, connect_timeout: float = 5.0,
+                 request_timeout: float | None = REQUEST_TIMEOUT):
         if not socket_path:
             raise HerdrUnavailable("HERDR_SOCKET_PATH is not set")
         self.path = socket_path
         self.connect_timeout = connect_timeout
+        self.request_timeout = request_timeout
         self._ids = itertools.count(1)
 
     def _open(self) -> _SocketHandle:
@@ -269,11 +335,14 @@ class UnixSocketTransport(PipeTransport):
         try:
             connection.settimeout(self.connect_timeout)
             connection.connect(self.path)
-            connection.settimeout(None)  # subscriptions and agent waits can be long-lived
         except OSError as exc:
             connection.close()
             raise HerdrUnavailable(f"cannot connect to {self.path}: {exc}") from exc
         return _SocketHandle(connection)
+
+    def _set_timeout(self, handle, timeout: float | None) -> None:
+        # A silent server raises socket.timeout (an OSError): outcome unknown, never resent.
+        handle.settimeout(timeout)
 
 
 def _cancel_blocking_read(native_thread_id: int) -> None:
@@ -380,7 +449,7 @@ class CliTransport:
         params = params or {}
         argv = [self.herdr_bin, *cli_args(method, params)]
         try:
-            proc = subprocess.run(argv, capture_output=True, timeout=self.timeout,
+            proc = subprocess.run(argv, capture_output=True, timeout=request_timeout(method, params, self.timeout),
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as exc:
             raise HerdrUnavailable(f"{argv[0]} failed: {exc}") from exc
@@ -422,7 +491,7 @@ class AutoTransport:
     def __init__(self, socket_path: str, herdr_bin: str = "herdr"):
         transport = PipeTransport if sys.platform == "win32" else UnixSocketTransport
         self.pipe = transport(socket_path) if socket_path else None
-        self.cli = CliTransport(herdr_bin)
+        self.cli = CliTransport(herdr_bin, timeout=REQUEST_TIMEOUT)
 
     def request(self, method: str, params: dict | None = None) -> dict:
         if self.pipe is not None:

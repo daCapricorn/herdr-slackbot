@@ -60,10 +60,9 @@ def caller_agent(client, cwd, pids, *, tid=None, home=None):
 
 
 class HookTransport(UnixSocketTransport):
-    def _open(self):
-        handle = super()._open()
-        handle.connection.settimeout(0.5)
-        return handle
+    """Agent hooks must never stall the agent: half-second connect and reply limits."""
+    def __init__(self, socket_path, connect_timeout=0.5, request_timeout=0.5):
+        super().__init__(socket_path, connect_timeout, request_timeout)
 
 
 def report_session(payload, env, client, *, home=None, seq=None, pids=None):

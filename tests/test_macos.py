@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 
 import pytest
@@ -178,3 +179,82 @@ def test_macos_entrypoint_runs_from_another_directory(tmp_path):
                             cwd=tmp_path, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["settings"]["socket_mode_enabled"] is True
+
+
+def test_unix_request_times_out_on_a_silent_server_without_resending():
+    requests = []
+
+    def silent(connection):
+        requests.append(receive_request(connection))
+        assert connection.recv(1) == b""  # Client gives up and closes.
+
+    with unix_peer(silent) as path:
+        with pytest.raises(hc.HerdrOutcomeUnknown):
+            hc.UnixSocketTransport(path, request_timeout=0.2).request("agent.send_keys", {"keys": ["1"]})
+    assert [r["method"] for r in requests] == ["agent.send_keys"]
+
+
+def test_unix_subscription_has_no_deadline_after_ack():
+    def subscribe(connection):
+        receive_request(connection)
+        connection.sendall(b'{"result":{"type":"subscription_started"}}\n')
+        assert connection.recv(1) == b""
+
+    with unix_peer(subscribe) as path:
+        stream = hc.UnixSocketTransport(path, request_timeout=0.2).open_stream("events.subscribe", {"subscriptions": []})
+        assert stream._handle.connection.gettimeout() is None
+        stream.close()
+
+
+def test_unix_reply_deadline_is_absolute_when_the_server_trickles():
+    def trickle(connection):
+        receive_request(connection)
+        try:
+            for byte in b'{"result":{"type":"ok"}}\n':
+                connection.sendall(bytes([byte]))
+                time.sleep(0.02)
+        except OSError:
+            pass  # Client gave up mid-reply.
+
+    with unix_peer(trickle) as path:
+        with pytest.raises(hc.HerdrOutcomeUnknown):
+            hc.UnixSocketTransport(path, request_timeout=0.06).request("agent.send_keys", {"keys": ["enter"]})
+
+
+def test_unix_subscription_handshake_deadline_is_a_herdr_error():
+    def silent(connection):
+        receive_request(connection)
+        assert connection.recv(1) == b""
+
+    with unix_peer(silent) as path:
+        with pytest.raises(hc.HerdrOutcomeUnknown):
+            hc.UnixSocketTransport(path, request_timeout=0.2).open_stream("events.subscribe", {"subscriptions": []})
+
+
+@pytest.mark.parametrize("method,params,expected", [
+    ("agent.list", {}, 10),
+    ("agent.list", {"timeout_ms": 30000}, 10),  # Only methods that wait extend the budget.
+    ("agent.wait", {"target": "a", "timeout_ms": 5000}, 15),
+    ("agent.wait", {"target": "a", "until": ["done"]}, None),
+    ("agent.wait", {"target": "a", "timeout_ms": None}, None),
+    ("agent.prompt", {"target": "a", "text": "x"}, 10),
+    ("agent.prompt", {"target": "a", "text": "x", "wait": {"timeout_ms": 5000}}, 15),
+    ("agent.prompt", {"target": "a", "text": "x", "wait": {"timeout_ms": None}}, None),
+    ("agent.start", {"pane_id": "p"}, 40),
+    ("agent.start", {"pane_id": "p", "timeout_ms": 120000}, 130),
+])
+def test_request_timeout_follows_each_methods_herdr_wait(method, params, expected):
+    assert hc.request_timeout(method, params, 10) == expected
+    assert hc.request_timeout(method, params, None) is None
+
+
+def test_cli_keeps_an_unbounded_agent_wait_unbounded(monkeypatch):
+    observed = []
+
+    def run(argv, **kwargs):
+        observed.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(argv, 0, b'{"result":{"type":"agent_wait"}}', b"")
+    monkeypatch.setattr(hc.subprocess, "run", run)
+    hc.CliTransport(timeout=10).request("agent.wait", {"target": "a", "until": ["done"]})
+    hc.CliTransport(timeout=10).request("agent.wait", {"target": "a", "timeout_ms": 5000})
+    assert observed == [None, 15]
