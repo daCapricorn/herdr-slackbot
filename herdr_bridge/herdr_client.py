@@ -87,16 +87,29 @@ def pipe_path(socket_path: str) -> str:
     return PIPE_PREFIX + socket_path
 
 
-def request_timeout(params: dict, base: float | None) -> float | None:
-    """Reply deadline for one request: `base` plus any Herdr-side wait it asks for."""
+# Herdr's own readiness wait when `agent.start` omits timeout_ms (herdr agent start --help).
+AGENT_START_DEFAULT_WAIT_MS = 30000
+
+
+def request_timeout(method: str, params: dict, base: float | None) -> float | None:
+    """Total reply budget for one request: `base` plus any Herdr-side wait it asks for.
+
+    `agent.wait` and `agent.prompt` with `wait` block until a state matches and
+    wait indefinitely without timeout_ms, so they stay unbounded in that case.
+    """
     if base is None:
         return None
-    waits = [params.get("timeout_ms")]
-    if isinstance(params.get("wait"), dict):
-        waits.append(params["wait"].get("timeout_ms"))
-        if waits[-1] is None:
-            return None  # An unbounded Herdr wait is intentional.
-    return base + max((w for w in waits if isinstance(w, (int, float))), default=0) / 1000
+    if method == "agent.wait":
+        wait_ms = params.get("timeout_ms")
+    elif method == "agent.prompt" and params.get("wait") is not None:
+        wait_ms = (params["wait"] or {}).get("timeout_ms")
+    elif method == "agent.start":
+        wait_ms = params.get("timeout_ms")
+        if wait_ms is None:
+            wait_ms = AGENT_START_DEFAULT_WAIT_MS
+    else:
+        return base
+    return None if wait_ms is None else base + wait_ms / 1000
 
 
 def _unwrap(response: dict, method: str) -> dict:
@@ -108,14 +121,19 @@ def _unwrap(response: dict, method: str) -> dict:
     return response["result"]
 
 
-def _read_line(handle, buf: bytearray) -> bytes | None:
-    """Read one NDJSON line from a raw pipe handle, keeping leftovers in `buf`."""
+def _read_line(handle, buf: bytearray, before_read=None) -> bytes | None:
+    """Read one NDJSON line from a raw pipe handle, keeping leftovers in `buf`.
+
+    `before_read` runs before every read, so a caller can shrink the remaining budget.
+    """
     while True:
         nl = buf.find(b"\n")
         if nl >= 0:
             line = bytes(buf[:nl])
             del buf[: nl + 1]
             return line
+        if before_read is not None:
+            before_read()
         chunk = handle.read(READ_CHUNK)
         if not chunk:
             if buf:
@@ -154,6 +172,24 @@ class PipeTransport:
     def _set_timeout(self, handle, timeout: float | None) -> None:
         """Named pipes have no read deadline; Unix sockets override this."""
 
+    def _deadline(self, handle, timeout: float | None):
+        """Arm one absolute deadline; the returned callback re-arms the remaining budget.
+
+        A per-recv timeout alone would let a server trickling bytes hold the caller forever.
+        """
+        if timeout is None:
+            self._set_timeout(handle, None)
+            return None
+        expires = time.monotonic() + timeout
+
+        def arm():
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Herdr reply deadline exceeded")
+            self._set_timeout(handle, remaining)
+        arm()
+        return arm
+
     def _send(self, handle, method: str, params: dict) -> str:
         req_id = f"hs-{next(self._ids)}"
         payload = json.dumps({"id": req_id, "method": method, "params": params}, ensure_ascii=False)
@@ -164,10 +200,10 @@ class PipeTransport:
         params = params or {}
         handle = self._open()  # raises HerdrUnavailable: nothing was sent
         try:
-            self._set_timeout(handle, request_timeout(params, self.request_timeout))
+            arm = self._deadline(handle, request_timeout(method, params, self.request_timeout))
             try:
                 self._send(handle, method, params)
-                line = _read_line(handle, bytearray())
+                line = _read_line(handle, bytearray(), arm)
             except OSError as exc:
                 raise HerdrOutcomeUnknown(f"{method}: pipe failed after sending: {exc}") from exc
         finally:
@@ -186,10 +222,13 @@ class PipeTransport:
     def open_stream(self, method: str, params: dict) -> "EventStream":
         handle = self._open()
         try:
-            self._set_timeout(handle, self.request_timeout)
-            self._send(handle, method, params)
-            buf = bytearray()
-            line = _read_line(handle, buf)
+            arm = self._deadline(handle, self.request_timeout)
+            try:
+                self._send(handle, method, params)
+                buf = bytearray()
+                line = _read_line(handle, buf, arm)
+            except OSError as exc:
+                raise HerdrOutcomeUnknown(f"{method}: no acknowledgement: {exc}") from exc
             if not line:
                 raise HerdrUnavailable(f"{method}: connection closed without a response")
             ack = _unwrap(json.loads(line.decode("utf-8")), method)
@@ -410,7 +449,7 @@ class CliTransport:
         params = params or {}
         argv = [self.herdr_bin, *cli_args(method, params)]
         try:
-            proc = subprocess.run(argv, capture_output=True, timeout=request_timeout(params, self.timeout),
+            proc = subprocess.run(argv, capture_output=True, timeout=request_timeout(method, params, self.timeout),
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as exc:
             raise HerdrUnavailable(f"{argv[0]} failed: {exc}") from exc
