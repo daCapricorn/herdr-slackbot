@@ -279,6 +279,10 @@ class Bridge:
             return 0
         try:
             with self.lock, self.db:
+                # sqlite's connection context begins lazily. Start the owning
+                # transaction before source SAVEPOINTs, whose outermost RELEASE
+                # would otherwise commit before completion/outbox draining.
+                self.db.execute("BEGIN")
                 live = self._agent(info["pane_id"])
                 if identity(live) != identity(info):
                     return 0
@@ -521,7 +525,7 @@ class Bridge:
 
     def prepare_answer(self, request_id, option=None, retry_from=None, answer_text=None):
         """Reserve a human choice without writing, so OpenClaw can show progress first."""
-        with self.lock:
+        with self.lock, self.db:
             rec, state = self._record(request_id)
             if retry_from is not None:
                 if retry_from in {a.get("attempt_id") for a in rec.get("attempts", [])}:
@@ -557,22 +561,24 @@ class Bridge:
 
     def dispatch_reserved(self, request_id, attempt_id):
         with self.lock:
-            rec, state = self._record(request_id)
-            if attempt_id != rec.get("dispatch", {}).get("attempt_id"):
-                raise BridgeError("Submission is stale; nothing was sent")
-            if state != "reserved":
-                return self._result(rec, state)  # A duplicate commit never writes again.
-            if rec.get("kind") == "codex_question":
-                plan, fresh = self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
-                rec["dispatch"].update(plan)
-            else:
-                _, fresh = self._live_dialog(rec)  # The Slack edit may have taken seconds.
-            self._ensure_pane_available(rec)
-            rec["dispatch"].update(started_at=self.clock(), focused=fresh.get("focused"), revision=fresh.get("revision"))
-            rec["followup_deadline"] = self.clock() + self.followup_timeout
-            self._save(rec, "dispatching")
+            with self.db:
+                rec, state = self._record(request_id)
+                if attempt_id != rec.get("dispatch", {}).get("attempt_id"):
+                    raise BridgeError("Submission is stale; nothing was sent")
+                if state != "reserved":
+                    return self._result(rec, state)  # A duplicate commit never writes again.
+                if rec.get("kind") == "codex_question":
+                    plan, fresh = self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
+                    rec["dispatch"].update(plan)
+                else:
+                    _, fresh = self._live_dialog(rec)  # The Slack edit may have taken seconds.
+                self._ensure_pane_available(rec)
+                rec["dispatch"].update(started_at=self.clock(), focused=fresh.get("focused"), revision=fresh.get("revision"))
+                rec["followup_deadline"] = self.clock() + self.followup_timeout
+                self._save(rec, "dispatching")
             self._claim_pane(rec)
             self.active.add(request_id)
+
         return self._finish_dispatch(rec)
 
     def _record(self, request_id):
@@ -582,9 +588,9 @@ class Bridge:
         return json.loads(row[0]), row[1]
 
     def _save(self, rec, state):
-        with self.db:
-            self.db.execute("UPDATE approvals SET record=?, state=? WHERE id=?",
-                            (json.dumps(rec), state, rec["id"]))
+        """Stage an approval update; the caller owns its transaction."""
+        self.db.execute("UPDATE approvals SET record=?, state=? WHERE id=?",
+                        (json.dumps(rec), state, rec["id"]))
 
     def _live_dialog(self, rec):
         info = self._agent(rec["pane_id"])
@@ -679,10 +685,10 @@ class Bridge:
             except Exception as exc:
                 # An ambiguous receipt is still consumed; observe, never auto-retry.
                 rec["dispatch"]["error_type"] = type(exc).__name__
-            with self.lock:
+            with self.lock, self.db:
                 self._save(rec, "dispatching")
             verification = self._confirm_answer(rec)
-            with self.lock:
+            with self.lock, self.db:
                 self.active.discard(rec["id"])
                 if self.sending.get(rec["pane_id"]) == rec["id"]:
                     self.sending.pop(rec["pane_id"])
@@ -711,6 +717,7 @@ class Bridge:
                              and verification.get("reason") != "agent_replaced")}
 
     def _store_verification(self, rec, verification):
+        """Stage verification and its outbox update in the caller's transaction."""
         rec["verification"] = verification
         outcome = "reserved" if verification["outcome"] == "not_sent" else verification["outcome"]
         result = self._result(rec, outcome)
@@ -718,44 +725,45 @@ class Bridge:
         signature = [outcome, verification["reason"], result["retry_token"], result["watching"]]
         changed = signature != rec.get("last_result_signature")
         rec["last_result_signature"] = signature
-        with self.db:
-            self.db.execute("UPDATE approvals SET record=?,state=? WHERE id=?",
-                            (json.dumps(rec),outcome,rec["id"]))
-            if changed:
-                prefix = "approval-update-" + rec["id"] + "-"
-                self.db.execute("DELETE FROM outbox WHERE id LIKE ?", (prefix + "%",))
-                event_id = prefix + uuid.uuid4().hex
-                self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event_id, json.dumps({
-                    "id": event_id, "type": "approval.updated", "result": result})))
+        self.db.execute("UPDATE approvals SET record=?,state=? WHERE id=?",
+                        (json.dumps(rec),outcome,rec["id"]))
+        if changed:
+            prefix = "approval-update-" + rec["id"] + "-"
+            self.db.execute("DELETE FROM outbox WHERE id LIKE ?", (prefix + "%",))
+            event_id = prefix + uuid.uuid4().hex
+            self.db.execute("INSERT INTO outbox VALUES (?, ?)", (event_id, json.dumps({
+                "id": event_id, "type": "approval.updated", "result": result})))
         log.info("Herdr answer verification: %s attempt=%s outcome=%s reason=%s elapsed_ms=%s",
                  rec["id"], result["attempt_id"], outcome, verification["reason"], verification["elapsed_ms"])
         return result
 
     def check(self, request_id, *, timeout=None):
         with self.lock:
-            rec, state = self._record(request_id)
-            if state not in CONSUMED_STATES:
-                raise BridgeError("No approval attempt to check; nothing was sent")
-            if request_id in self.active or state == "confirmed":
-                return self._result(rec, state)
-            if state == "reserved":
-                try:
-                    if rec.get("kind") == "codex_question":
-                        self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
-                    else:
-                        self._live_dialog(rec)
-                    retryable = True
-                except Exception:
-                    retryable = False
-                return self._store_verification(rec, {"outcome": "not_sent", "reason": "not_submitted",
-                                                     "retryable": retryable, "elapsed_ms": 0})
-            # Legacy/crashed records are queryable, never silently rearmed.
-            rec["dispatch"].setdefault("attempt_id", uuid.uuid4().hex)
-            self._save(rec, state)
+            with self.db:
+                rec, state = self._record(request_id)
+                if state not in CONSUMED_STATES:
+                    raise BridgeError("No approval attempt to check; nothing was sent")
+                if request_id in self.active or state == "confirmed":
+                    return self._result(rec, state)
+                if state == "reserved":
+                    try:
+                        if rec.get("kind") == "codex_question":
+                            self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
+                        else:
+                            self._live_dialog(rec)
+                        retryable = True
+                    except Exception:
+                        retryable = False
+                    return self._store_verification(rec, {"outcome": "not_sent", "reason": "not_submitted",
+                                                         "retryable": retryable, "elapsed_ms": 0})
+                # Legacy/crashed records are queryable, never silently rearmed.
+                rec["dispatch"].setdefault("attempt_id", uuid.uuid4().hex)
+                self._save(rec, state)
             self.active.add(request_id)
+
         try:
             verification = self._confirm_answer(rec, timeout=timeout)
-            with self.lock:
+            with self.lock, self.db:
                 self.active.discard(request_id)
                 return self._store_verification(rec, verification)
         finally:
@@ -778,7 +786,7 @@ class Bridge:
                     and rec.get("verification", {}).get("reason") != "agent_replaced"):
                 self.check(rec["id"], timeout=self.confirmation_interval * 2)
             elif rec.get("followup_deadline") and not rec.get("watch_expired"):
-                with self.lock:
+                with self.lock, self.db:
                     rec, state = self._record(rec["id"])
                     if rec["id"] in self.active or state == "confirmed":
                         continue
@@ -1005,102 +1013,104 @@ class Bridge:
         return info
 
     def _input_result(self, rec):
-        with self.lock, self.db:
-            rec = self.inputs.get(rec["seq"])
-            if rec["source"] == "slack" and rec["state"] == "queued" and not rec.get("notify_updates"):
-                rec = self.inputs.save(rec, "queued", notify_updates=True)
-            if (rec.get("source") == "slack" and rec.get("notify_updates")
-                    and rec["state"] in ("confirmed", "uncertain", "rejected")
-                    and rec.get("last_notified_state") != rec["state"]):
-                result = self.inputs.result(rec)
-                event = {"id": uuid.uuid4().hex, "type": "input.updated", "at": self.clock(),
-                         "result": result, "route": {"channel": "slack",
-                         "accountId": rec["account_id"], "conversationId": rec["channel_id"],
-                         "to": f"channel:{rec['channel_id']}", "threadId": rec.get("thread_id"),
-                         "team_id": rec.get("binding", {}).get("team_id")}}
-                self.db.execute("INSERT INTO outbox VALUES (?,?)", (event["id"], json.dumps(event)))
-                rec = self.inputs.save(rec, rec["state"], last_notified_state=rec["state"])
-            return self.inputs.result(rec)
+        """Stage input notification state and outbox; caller holds lock/transaction."""
+        rec = self.inputs.get(rec["seq"])
+        if rec["source"] == "slack" and rec["state"] == "queued" and not rec.get("notify_updates"):
+            rec = self.inputs.save(rec, "queued", notify_updates=True)
+        if (rec.get("source") == "slack" and rec.get("notify_updates")
+                and rec["state"] in ("confirmed", "uncertain", "rejected")
+                and rec.get("last_notified_state") != rec["state"]):
+            result = self.inputs.result(rec)
+            event = {"id": uuid.uuid4().hex, "type": "input.updated", "at": self.clock(),
+                     "result": result, "route": {"channel": "slack",
+                     "accountId": rec["account_id"], "conversationId": rec["channel_id"],
+                     "to": f"channel:{rec['channel_id']}", "threadId": rec.get("thread_id"),
+                     "team_id": rec.get("binding", {}).get("team_id")}}
+            self.db.execute("INSERT INTO outbox VALUES (?,?)", (event["id"], json.dumps(event)))
+            rec = self.inputs.save(rec, rec["state"], last_notified_state=rec["state"])
+        return self.inputs.result(rec)
 
     def _dispatch_input(self, seq):
-        with self.lock, self.db:
-            rec = self.inputs.get(seq)
-            if not rec or rec["state"] != "queued":
-                return self._input_result(rec) if rec else {"input_id": seq, "outcome": "rejected", "reason": "input_absent"}
-            if (not self.inputs.is_first(rec) or self.inputs.blocker(rec)
-                    or rec["pane_id"] in self.sending):
-                return self._input_result(rec)
-            try:
-                info = self._revalidate_input(rec)
-                status = info.get("agent_status")
-                if status == "blocked":
-                    return self._input_result(self.inputs.save(rec, "rejected", reason="agent_blocked_use_approval"))
-                if status == "working":
-                    return self._input_result(self.inputs.save(rec, "queued", reason="agent_busy"))
-                if status not in ("idle", "done"):
-                    return self._input_result(self.inputs.save(rec, "rejected", reason="agent_status_unknown"))
-                blocker = self._native_input_blocker(info, rec)
-                if blocker:
-                    return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
-                adapter = self.adapters[rec["agent_kind"]]
+        with self.lock:
+            with self.db:
+                rec = self.inputs.get(seq)
+                if not rec or rec["state"] != "queued":
+                    return self._input_result(rec) if rec else {"input_id": seq, "outcome": "rejected", "reason": "input_absent"}
+                if (not self.inputs.is_first(rec) or self.inputs.blocker(rec)
+                        or rec["pane_id"] in self.sending):
+                    return self._input_result(rec)
                 try:
-                    baseline = adapter.source.receipt_baseline(info)
-                except Exception as exc:
-                    if info.get("codex_live_identity"):
-                        raise  # A fresh native proof never permits an unavailable baseline.
-                    baseline = {"unavailable": type(exc).__name__}
-                fresh = self._revalidate_input(rec)
-                if baseline.get("native_identity"):
-                    current_baseline = adapter.source.receipt_baseline(fresh)
-                    if any(current_baseline.get(key) != baseline.get(key) for key in ("source_key", "path")):
-                        raise BridgeError("Codex native rollout path changed; nothing was sent")
-                if (fresh.get("agent_status") not in ("idle", "done")
-                        or fresh.get("state_change_seq") != info.get("state_change_seq")):
-                    return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
-                blocker = self._native_input_blocker(fresh, rec)
-                if blocker:
-                    return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
-                # Transcript resolution can be slow enough for a draft or a
-                # local native turn to appear. Recheck both before reserving.
-                screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
-                if not known_empty_composer(rec["agent_kind"], screen):
-                    return self._input_result(self.inputs.save(rec, "rejected", reason="composer_not_known_empty"))
-                if rec["agent_kind"] == "codex":
+                    info = self._revalidate_input(rec)
+                    status = info.get("agent_status")
+                    if status == "blocked":
+                        return self._input_result(self.inputs.save(rec, "rejected", reason="agent_blocked_use_approval"))
+                    if status == "working":
+                        return self._input_result(self.inputs.save(rec, "queued", reason="agent_busy"))
+                    if status not in ("idle", "done"):
+                        return self._input_result(self.inputs.save(rec, "rejected", reason="agent_status_unknown"))
+                    blocker = self._native_input_blocker(info, rec)
+                    if blocker:
+                        return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
+                    adapter = self.adapters[rec["agent_kind"]]
+                    try:
+                        baseline = adapter.source.receipt_baseline(info)
+                    except Exception as exc:
+                        if info.get("codex_live_identity"):
+                            raise  # A fresh native proof never permits an unavailable baseline.
+                        baseline = {"unavailable": type(exc).__name__}
                     fresh = self._revalidate_input(rec)
+                    if baseline.get("native_identity"):
+                        current_baseline = adapter.source.receipt_baseline(fresh)
+                        if any(current_baseline.get(key) != baseline.get(key) for key in ("source_key", "path")):
+                            raise BridgeError("Codex native rollout path changed; nothing was sent")
                     if (fresh.get("agent_status") not in ("idle", "done")
                             or fresh.get("state_change_seq") != info.get("state_change_seq")):
                         return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
                     blocker = self._native_input_blocker(fresh, rec)
                     if blocker:
                         return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
-                    # Native metadata reads can outlast a local composer edit.
-                    # Keep the final external read the exact ANSI draft guard.
+                    # Transcript resolution can be slow enough for a draft or a
+                    # local native turn to appear. Recheck both before reserving.
                     screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
                     if not known_empty_composer(rec["agent_kind"], screen):
                         return self._input_result(self.inputs.save(rec, "rejected", reason="composer_not_known_empty"))
-                rec = self.inputs.save(rec, "reserved", reason="terminal_write_reserved",
-                    attempt_id=uuid.uuid4().hex, reserved_at=self.clock(),
-                    dispatch_sequence=fresh.get("state_change_seq"), receipt_baseline=baseline)
-                self._claim_pane({**rec, "id": f"input:{rec['seq']}"})
-            except BridgeError as exc:
-                rec = self.inputs.save(rec, "rejected", reason="revalidation_failed")
-                log.info("Herdr prompt rejected before terminal write: input=%s error=%s", rec["seq"], type(exc).__name__)
-                return self._input_result(rec)
-            except Exception as exc:
-                rec = self.inputs.save(rec, "rejected", reason="guard_unavailable")
-                log.info("Herdr prompt guard unavailable: input=%s error=%s", rec["seq"], type(exc).__name__)
-                return self._input_result(rec)
+                    if rec["agent_kind"] == "codex":
+                        fresh = self._revalidate_input(rec)
+                        if (fresh.get("agent_status") not in ("idle", "done")
+                                or fresh.get("state_change_seq") != info.get("state_change_seq")):
+                            return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
+                        blocker = self._native_input_blocker(fresh, rec)
+                        if blocker:
+                            return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
+                        # Native metadata reads can outlast a local composer edit.
+                        # Keep the final external read the exact ANSI draft guard.
+                        screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
+                        if not known_empty_composer(rec["agent_kind"], screen):
+                            return self._input_result(self.inputs.save(rec, "rejected", reason="composer_not_known_empty"))
+                    self._ensure_pane_available({**rec, "id": f"input:{rec['seq']}"})
+                    rec = self.inputs.save(rec, "reserved", reason="terminal_write_reserved",
+                        attempt_id=uuid.uuid4().hex, reserved_at=self.clock(),
+                        dispatch_sequence=fresh.get("state_change_seq"), receipt_baseline=baseline)
+                except BridgeError as exc:
+                    rec = self.inputs.save(rec, "rejected", reason="revalidation_failed")
+                    log.info("Herdr prompt rejected before terminal write: input=%s error=%s", rec["seq"], type(exc).__name__)
+                    return self._input_result(rec)
+                except Exception as exc:
+                    rec = self.inputs.save(rec, "rejected", reason="guard_unavailable")
+                    log.info("Herdr prompt guard unavailable: input=%s error=%s", rec["seq"], type(exc).__name__)
+                    return self._input_result(rec)
+            self._claim_pane({**rec, "id": f"input:{rec['seq']}"})
         try:
             try:
                 self.client.prompt_agent(rec["pane_id"], rec["prompt"])
             except Exception as exc:
                 rec = self._save_input_progress(rec["seq"], "uncertain", reason="terminal_write_outcome_unknown",
                                                 error_type=type(exc).__name__)
-                return self._input_result(rec)
+                return self.inputs.result(rec)
             rec = self._save_input_progress(rec["seq"], "observing", reason="awaiting_exact_transcript_receipt",
                                             write_returned_at=self.clock())
             if rec["state"] == "confirmed" or rec.get("arbiter_released"):
-                return self._input_result(rec)
+                return self.inputs.result(rec)
             deadline = self.monotonic() + self.confirmation_timeout
             while True:
                 try:
@@ -1110,13 +1120,13 @@ class Bridge:
                             live, baseline, rec["prompt"]):
                         rec = self._save_input_progress(rec["seq"], "confirmed", reason="exact_user_transcript_recorded",
                                                         confirmed_at=self.clock())
-                        return self._input_result(rec)
+                        return self.inputs.result(rec)
                 except Exception:
                     pass
                 remaining = deadline - self.monotonic()
                 if remaining <= 0:
                     rec = self._save_input_progress(rec["seq"], "uncertain", reason="exact_transcript_receipt_unavailable")
-                    return self._input_result(rec)
+                    return self.inputs.result(rec)
                 self.sleep(min(self.confirmation_interval, remaining))
         finally:
             with self.lock:
@@ -1130,7 +1140,9 @@ class Bridge:
             current = self.inputs.get(seq)
             if current["state"] == "confirmed" or current.get("arbiter_released"):
                 return current
-            return self.inputs.save(current, state, **fields)
+            current = self.inputs.save(current, state, **fields)
+            self._input_result(current)
+            return self.inputs.get(seq)
 
     def _input_target_info(self, rec):
         panes = self.client.list_panes()
