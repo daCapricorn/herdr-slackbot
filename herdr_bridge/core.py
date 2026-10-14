@@ -18,19 +18,16 @@ from .channels import PaneChannels
 from .agent_adapters import adapters
 from .codex_session import AUTHORITY_ERROR
 from .terminal_inputs import TerminalInputs, known_empty_composer
+from .errors import BridgeError
 
 log = logging.getLogger(__name__)
 CONSUMED_STATES = {"reserved", "dispatching", "dispatched", "confirmed", "unconfirmed", "uncertain"}
 ATTENTION_EVENTS = {"approval.requested", "agent.blocked", "question.requested"}
 
 
-class BridgeError(ValueError):
-    pass
-
-
 def require_session_authority(info):
     if info.get(AUTHORITY_ERROR):
-        raise BridgeError("Agent session identity unavailable; nothing was sent")
+        raise BridgeError("Agent session identity unavailable; nothing was sent", code="session_identity_unavailable")
 
 
 def identity(info):
@@ -115,14 +112,14 @@ class Bridge:
 
     def channel_provisioned(self, binding_id, channel_id, team_id):
         if not isinstance(channel_id, str) or not channel_id.startswith(("C", "G")):
-            raise BridgeError("Expected a Slack channel ID")
+            raise BridgeError("Expected a Slack channel ID", code="invalid_channel", outcome="not_sent")
         with self.lock, self.db:
             rec = self.channels.get(binding_id)
             if rec.get("channel_id") and (rec["channel_id"] != channel_id or rec.get("team_id") != team_id):
-                raise BridgeError("Pane already has another channel binding")
+                raise BridgeError("Pane already has another channel binding", code="channel_binding_conflict", outcome="not_sent")
             other = self.channels.from_channel(rec["account_id"], channel_id)
             if other and other["id"] != binding_id:
-                raise BridgeError("Slack channel already belongs to another pane")
+                raise BridgeError("Slack channel already belongs to another pane", code="channel_binding_conflict", outcome="not_sent")
             rec.update(channel_id=channel_id, team_id=team_id, state="provisioning")
             return self.channels.save(rec)
 
@@ -130,7 +127,7 @@ class Bridge:
         with self.lock, self.db:
             rec = self.channels.get(binding_id)
             if not rec.get("channel_id"):
-                raise BridgeError("Channel has not been created")
+                raise BridgeError("Channel has not been created", code="channel_not_created", outcome="not_sent")
             rec.update(state="ready", channel_name=channel_name, topic=topic)
             return self.channels.save(rec)
 
@@ -138,7 +135,7 @@ class Bridge:
         with self.lock, self.db:
             rec = self.channels.get(binding_id)
             if not rec.get("closed"):
-                raise BridgeError("Close the Herdr pane before archiving its channel")
+                raise BridgeError("Close the Herdr pane before archiving its channel", code="pane_not_closed", outcome="not_sent")
             rec["state"] = "archived"
             return self.channels.save(rec)
 
@@ -174,9 +171,9 @@ class Bridge:
             route = rec.get("delivery_route")
             if route:
                 if route["accountId"] != account_id or route["conversationId"] != conversation_id:
-                    raise BridgeError("Request belongs to a different pane channel")
+                    raise BridgeError("Request belongs to a different pane channel", code="request_channel_mismatch", outcome="not_sent")
             elif not isinstance(conversation_id, str) or not conversation_id.startswith("D"):
-                raise BridgeError("Legacy requests can only be answered in Slack DM")
+                raise BridgeError("Legacy requests can only be answered in Slack DM", code="request_channel_mismatch", outcome="not_sent")
             return {"pane_id": rec["pane_id"]}
 
     def status(self):
@@ -210,12 +207,12 @@ class Bridge:
 
     def _agent(self, pane):
         if not isinstance(pane, str) or ":p" not in pane:
-            raise BridgeError("Use an exact pane ID, for example w4:p2")
+            raise BridgeError("Use an exact pane ID, for example w4:p2", code="invalid_pane")
         info = self.client.get_agent(pane)
         if info.get("pane_id") != pane:
-            raise BridgeError("Pane identity mismatch")
+            raise BridgeError("Pane identity mismatch", code="pane_identity_mismatch")
         if not info.get("terminal_id"):
-            raise BridgeError("Herdr did not provide a terminal identity")
+            raise BridgeError("Herdr did not provide a terminal identity", code="terminal_identity_unavailable")
         return self._enrich_agent(info)
 
     def read(self, pane, lines=120):
@@ -223,7 +220,7 @@ class Bridge:
         # Visible reads do not scroll or disturb a blocked/working TUI.
         text = self.client.read_agent_once(pane, max(1, min(int(lines), 300)), source="visible")
         if identity(self._agent(pane)) != identity(info):
-            raise BridgeError("Agent changed during read")
+            raise BridgeError("Agent changed during read", code="agent_changed", outcome="not_sent")
         return {"agent": self._public_agent(info), "text": text}
 
     def _queue(self, kind, agent, **fields):
@@ -266,7 +263,7 @@ class Bridge:
         with self.lock, self.db:
             adapter = self.adapters.get(info.get("agent"))
             if not adapter:
-                raise BridgeError("Agent has no session adapter")
+                raise BridgeError("Agent has no session adapter", code="session_adapter_unavailable", outcome="not_sent")
             adapter.source.bind(info, thread_id)
         self.sync_conversation(info)
         return self.sync_status(pane)
@@ -536,26 +533,26 @@ class Bridge:
                     # An unsubmitted reservation can be resumed only by its exact button.
                     if state == "reserved" and retry_from == rec["dispatch"]["attempt_id"]:
                         return {**self._result(rec, state), "outcome": "checking", "ready_to_dispatch": True}
-                    raise BridgeError("Retry is stale or acceptance is unknown; check status first. Nothing was sent")
+                    raise BridgeError("Retry is stale or acceptance is unknown; check status first. Nothing was sent", code="stale_retry", details={"request_id": request_id}, outcome="not_sent")
                 option = rec["dispatch"]["option"]
                 self._reserve(rec, option, rec["dispatch"].get("answer") if option is None else None)
             else:
                 custom = rec.get("kind") == "codex_question" and answer_text is not None and option is None
                 if custom:
                     if not isinstance(answer_text, str) or not answer_text.strip() or len(answer_text) > 8000:
-                        raise BridgeError("Question answer must contain 1–8000 characters; nothing was sent")
+                        raise BridgeError("Question answer must contain 1–8000 characters; nothing was sent", code="invalid_answer", details={"request_id": request_id}, outcome="not_sent")
                     answer_text = answer_text.strip()
                 elif answer_text is not None or type(option) is not int or option not in {o["index"] for o in rec["options"]}:
-                    raise BridgeError("Unsupported option; nothing was sent")
+                    raise BridgeError("Unsupported option; nothing was sent", code="invalid_option", details={"request_id": request_id}, outcome="not_sent")
                 if state in CONSUMED_STATES:
                     if (option != rec.get("dispatch", {}).get("option")
                             or custom and answer_text != rec["dispatch"].get("answer")):
-                        raise BridgeError("A different option was already submitted; nothing was sent")
+                        raise BridgeError("A different option was already submitted; nothing was sent", code="choice_conflict", details={"request_id": request_id}, outcome="not_sent")
                     return {**self._result(rec, state),
                             "outcome": "checking" if state == "reserved" else self._result(rec, state)["outcome"],
                             "ready_to_dispatch": state == "reserved"}
                 if state != "pending":
-                    raise BridgeError("Request was superseded; nothing was sent")
+                    raise BridgeError("Request was superseded; nothing was sent", code="request_superseded", details={"request_id": request_id}, outcome="not_sent")
                 self._reserve(rec, option, answer_text)
             return {**self._result(rec, "reserved"), "outcome": "checking", "ready_to_dispatch": True}
 
@@ -564,7 +561,7 @@ class Bridge:
             with self.db:
                 rec, state = self._record(request_id)
                 if attempt_id != rec.get("dispatch", {}).get("attempt_id"):
-                    raise BridgeError("Submission is stale; nothing was sent")
+                    raise BridgeError("Submission is stale; nothing was sent", code="stale_submission", details={"request_id": request_id, "attempt_id": attempt_id}, outcome="not_sent")
                 if state != "reserved":
                     return self._result(rec, state)  # A duplicate commit never writes again.
                 if rec.get("kind") == "codex_question":
@@ -584,7 +581,7 @@ class Bridge:
     def _record(self, request_id):
         row = self.db.execute("SELECT record, state FROM approvals WHERE id=?", (request_id,)).fetchone()
         if not row:
-            raise BridgeError("Request is absent; nothing was sent")
+            raise BridgeError("Request is absent; nothing was sent", code="request_absent", details={"request_id": request_id})
         return json.loads(row[0]), row[1]
 
     def _save(self, rec, state):
@@ -597,16 +594,16 @@ class Bridge:
         require_session_authority(info)
         if (tuple(rec["identity"]) != identity(info) or info.get("agent_status") != "blocked"
                 or rec.get("sequence") != info.get("state_change_seq")):
-            raise BridgeError("Agent changed or is no longer blocked; nothing was sent")
+            raise BridgeError("Agent changed or is no longer blocked; nothing was sent", code="agent_changed", outcome="not_sent")
         screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
         dialog = current_dialog(screen, info.get("agent"))
         if not dialog or dialog.fingerprint != rec["fingerprint"]:
-            raise BridgeError("Dialog changed; nothing was sent")
+            raise BridgeError("Dialog changed; nothing was sent", code="dialog_changed", outcome="not_sent")
         fresh = self._agent(rec["pane_id"])
         require_session_authority(fresh)
         if (identity(fresh) != identity(info) or fresh.get("agent_status") != "blocked"
                 or fresh.get("state_change_seq") != rec.get("sequence")):
-            raise BridgeError("Agent changed before dispatch; nothing was sent")
+            raise BridgeError("Agent changed before dispatch; nothing was sent", code="agent_changed", outcome="not_sent")
         return dialog, fresh
 
     def _claim_pane(self, rec):
@@ -615,30 +612,30 @@ class Bridge:
 
     def _ensure_pane_available(self, rec):
         if rec["pane_id"] in self.sending:
-            raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent")
+            raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent", code="pane_busy", outcome="not_sent")
         terminal = rec.get("terminal_id")
         if not terminal and rec.get("identity"):
             terminal = rec["identity"][1]
         if self.inputs.blocker({"terminal_id": terminal, "seq": rec.get("seq")}):
-            raise BridgeError("This terminal has an unresolved prompt write; wait and check status. Nothing was sent")
+            raise BridgeError("This terminal has an unresolved prompt write; wait and check status. Nothing was sent", code="terminal_write_unresolved", outcome="not_sent")
 
     def _live_question(self, rec, option, answer):
         info = self._agent(rec["pane_id"])
         require_session_authority(info)
         if identity(info) != tuple(rec["identity"]):
-            raise BridgeError("Agent changed; nothing was sent")
+            raise BridgeError("Agent changed; nothing was sent", code="agent_changed")
         try:
             snapshot = self._question_snapshot(info)
             question = snapshot["pending"].get(rec["question"]["id"])
             if not question or question_fingerprint(question) != rec["fingerprint"]:
-                raise BridgeError("Question was answered, expired or changed; nothing was sent")
+                raise BridgeError("Question was answered, expired or changed; nothing was sent", code="question_changed")
             screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible")
             plan = input_plan(screen, question, option, answer, list(snapshot["pending"]))
             fresh = self._agent(rec["pane_id"])
             require_session_authority(fresh)
             if (identity(fresh) != identity(info) or fresh.get("state_change_seq") != info.get("state_change_seq")
                     or plan["mode"] == "prompt" and fresh.get("agent_status") not in ("working", "idle", "done", "blocked")):
-                raise BridgeError("Question input changed or an approval is open; nothing was sent")
+                raise BridgeError("Question input changed or an approval is open; nothing was sent", code="question_changed")
             if plan["mode"] == "prompt":
                 # Herdr can classify the collapsed async summary as blocked even
                 # though the main composer is visible and empty. agent.prompt
@@ -648,10 +645,10 @@ class Bridge:
             # Recheck structured evidence after reading the terminal.
             current = self._question_snapshot(fresh)["pending"].get(question["id"])
             if not current or question_fingerprint(current) != rec["fingerprint"]:
-                raise BridgeError("Question changed before dispatch; nothing was sent")
+                raise BridgeError("Question changed before dispatch; nothing was sent", code="question_changed")
             return plan, fresh
         except QuestionUnavailable as exc:
-            raise BridgeError(str(exc)) from exc
+            raise BridgeError(str(exc), code="question_unavailable") from exc
 
     def _reserve(self, rec, option, answer_text=None):
         if rec.get("kind") == "codex_question":
@@ -742,7 +739,7 @@ class Bridge:
             with self.db:
                 rec, state = self._record(request_id)
                 if state not in CONSUMED_STATES:
-                    raise BridgeError("No approval attempt to check; nothing was sent")
+                    raise BridgeError("No approval attempt to check; nothing was sent", code="approval_attempt_absent", details={"request_id": request_id}, outcome="not_sent")
                 if request_id in self.active or state == "confirmed":
                     return self._result(rec, state)
                 if state == "reserved":
@@ -800,7 +797,7 @@ class Bridge:
         fields = {k: binding[k] for k in ("channel", "accountId", "conversationId", "messageTs")}
         if (fields["channel"] != "slack" or not all(isinstance(v, str) and v for v in fields.values())
                 or not fields["conversationId"].startswith(("D", "C", "G"))):
-            raise BridgeError("Approval result cards require a Slack conversation")
+            raise BridgeError("Approval result cards require a Slack conversation", code="invalid_card_binding", outcome="not_sent")
         with self.lock, self.db:
             self.authorize_request(request_id, fields["accountId"], fields["conversationId"])
             self.db.execute("INSERT OR IGNORE INTO cards VALUES (?, ?)",
@@ -935,9 +932,9 @@ class Bridge:
         require_session_authority(info)
         session = session_of(info)
         if not isinstance(session, str) or not session:
-            raise BridgeError("Agent session identity unavailable; nothing was sent")
+            raise BridgeError("Agent session identity unavailable; nothing was sent", code="session_identity_unavailable", outcome="not_sent")
         if info.get("agent") not in self.adapters:
-            raise BridgeError("Only Codex and Claude panes accept remote prompts; nothing was sent")
+            raise BridgeError("Only Codex and Claude panes accept remote prompts; nothing was sent", code="unsupported_agent", outcome="not_sent")
         return {"pane_id": info["pane_id"], "terminal_id": info["terminal_id"],
                 "session_id": session, "agent_kind": info["agent"],
                 "observed_status": info.get("agent_status"),
@@ -947,10 +944,10 @@ class Bridge:
         binding = self.channels.from_channel(account_id, channel_id)
         if (not binding or binding.get("closed") or binding.get("state") != "ready"
                 or not binding.get("channel_id") or not binding.get("terminal_id")):
-            raise BridgeError("This Slack channel is not a ready Herdr pane; nothing was sent")
+            raise BridgeError("This Slack channel is not a ready Herdr pane; nothing was sent", code="channel_not_ready", outcome="not_sent")
         if expected and any(binding.get(key) != expected.get(key)
                             for key in ("id", "pane_id", "terminal_id", "channel_id", "account_id")):
-            raise BridgeError("Pane channel binding changed; nothing was sent")
+            raise BridgeError("Pane channel binding changed; nothing was sent", code="channel_binding_changed", outcome="not_sent")
         return binding
 
     def _native_input_blocker(self, info, rec):
@@ -968,9 +965,9 @@ class Bridge:
         """Deduplicate one authenticated Slack prompt and queue or submit it once."""
         if not all(isinstance(value, str) and value for value in
                    (account_id, conversation_id, message_ts, sender_id)):
-            raise BridgeError("Slack input identity is incomplete; nothing was sent")
+            raise BridgeError("Slack input identity is incomplete; nothing was sent", code="invalid_input_identity", outcome="not_sent")
         if not isinstance(text, str) or not text.strip() or len(text) > 16000:
-            raise BridgeError("Prompt must contain 1–16000 characters; nothing was sent")
+            raise BridgeError("Prompt must contain 1–16000 characters; nothing was sent", code="invalid_prompt", outcome="not_sent")
         text = text.strip()
         with self.lock, self.db:
             duplicate = self.inputs.find("slack", account_id, conversation_id, message_ts)
@@ -978,11 +975,11 @@ class Bridge:
                 return self._input_result(duplicate)
             binding = self._input_binding(account_id, conversation_id)
             if binding_id and binding["id"] != binding_id:
-                raise BridgeError("Pane channel binding changed; nothing was sent")
+                raise BridgeError("Pane channel binding changed; nothing was sent", code="channel_binding_changed", outcome="not_sent")
             info = self._agent(binding["pane_id"])
             snapshot = self._input_snapshot(info)
             if snapshot["terminal_id"] != binding["terminal_id"]:
-                raise BridgeError("Pane channel terminal identity changed; nothing was sent")
+                raise BridgeError("Pane channel terminal identity changed; nothing was sent", code="terminal_identity_changed", outcome="not_sent")
             rec = self.inputs.insert({"source": "slack", "account_id": account_id,
                 "channel_id": conversation_id, "message_ts": message_ts,
                 "sender_id": sender_id, "thread_id": str(thread_id) if thread_id is not None else None,
@@ -1009,7 +1006,7 @@ class Bridge:
         info = self._agent(rec["pane_id"])
         require_session_authority(info)
         if identity(info) != (rec["session_id"], rec["terminal_id"], rec["agent_kind"]):
-            raise BridgeError("Agent terminal or session changed; nothing was sent")
+            raise BridgeError("Agent terminal or session changed; nothing was sent", code="agent_identity_changed", outcome="not_sent")
         return info
 
     def _input_result(self, rec):
@@ -1062,7 +1059,7 @@ class Bridge:
                     if baseline.get("native_identity"):
                         current_baseline = adapter.source.receipt_baseline(fresh)
                         if any(current_baseline.get(key) != baseline.get(key) for key in ("source_key", "path")):
-                            raise BridgeError("Codex native rollout path changed; nothing was sent")
+                            raise BridgeError("Codex native rollout path changed; nothing was sent", code="native_rollout_changed", outcome="not_sent")
                     if (fresh.get("agent_status") not in ("idle", "done")
                             or fresh.get("state_change_seq") != info.get("state_change_seq")):
                         return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
@@ -1152,7 +1149,7 @@ class Bridge:
                 for pane in panes)
                 or len({pane["pane_id"] for pane in panes}) != len(panes)
                 or len({pane["terminal_id"] for pane in panes}) != len(panes)):
-            raise BridgeError("Terminal inventory unavailable or ambiguous")
+            raise BridgeError("Terminal inventory unavailable or ambiguous", code="terminal_inventory_unavailable")
         targets = [pane for pane in panes if pane["terminal_id"] == rec["terminal_id"]]
         if not any(pane["pane_id"] == rec["pane_id"] and pane["terminal_id"] == rec["terminal_id"]
                    for pane in panes):
@@ -1163,13 +1160,13 @@ class Bridge:
         info = self._agent(targets[0]["pane_id"])
         require_session_authority(info)
         if info["terminal_id"] != rec["terminal_id"] or not all(identity(info)):
-            raise BridgeError("Terminal changed or session identity unavailable")
+            raise BridgeError("Terminal changed or session identity unavailable", code="terminal_identity_changed")
         return info
 
     def _revalidate_started_input(self, rec):
         info = self._input_target_info(rec)
         if info is None or identity(info) != (rec["session_id"], rec["terminal_id"], rec["agent_kind"]):
-            raise BridgeError("Agent terminal or session changed; nothing was sent")
+            raise BridgeError("Agent terminal or session changed; nothing was sent", code="agent_identity_changed")
         return info
 
     def _input_identity_closed(self, rec, info):
@@ -1229,7 +1226,7 @@ class Bridge:
     def send(self, pane, text):
         """Compatibility facade for `/herdr send`, using the same safe arbiter."""
         if not isinstance(text, str) or not text.strip() or len(text) > 16000:
-            raise BridgeError("Prompt must contain 1–16000 characters")
+            raise BridgeError("Prompt must contain 1–16000 characters", code="invalid_prompt", outcome="not_sent")
         with self.lock, self.db:
             info = self._agent(pane)
             snapshot = self._input_snapshot(info)
@@ -1238,12 +1235,12 @@ class Bridge:
                 "thread_id": None, "binding": None, "prompt": text.strip(), **snapshot})
             if info.get("agent_status") == "blocked":
                 rec = self.inputs.save(rec, "rejected", reason="agent_blocked_use_approval")
-                raise BridgeError("Agent is blocked; use an exact approval request. Nothing was sent")
+                raise BridgeError("Agent is blocked; use an exact approval request. Nothing was sent", code="agent_blocked", outcome="not_sent")
             if info.get("agent_status") == "working":
                 return self.inputs.result(self.inputs.save(rec, "queued", reason="agent_busy"))
             if info.get("agent_status") not in ("idle", "done"):
                 rec = self.inputs.save(rec, "rejected", reason="agent_status_unknown")
-                raise BridgeError("Agent status is not recognized as safe; nothing was sent")
+                raise BridgeError("Agent status is not recognized as safe; nothing was sent", code="agent_status_unknown", outcome="not_sent")
             blocker = self._native_input_blocker(info, rec)
             if blocker:
                 return self.inputs.result(self.inputs.save(rec, "queued", reason=blocker))

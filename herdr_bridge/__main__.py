@@ -10,6 +10,31 @@ from concurrent.futures import ThreadPoolExecutor
 from .events import SubscriptionManager
 from .herdr_client import HerdrClient
 from .core import Bridge
+from .errors import BridgeError, error_payload
+
+
+def response_for_request(line, methods):
+    """Execute once; unclassified failures after invocation remain unknown."""
+    request = {}
+    invoked = False
+    try:
+        request = json.loads(line)
+        method = request["method"]
+        if method not in methods:
+            raise BridgeError("Unknown bridge method", code="unknown_method", outcome="not_sent")
+        # Resolve arguments before invoking any method. Serialization/shape
+        # failures here cannot have reached terminal-effect code.
+        params = request.get("params", {})
+        if not isinstance(params, dict):
+            raise BridgeError("Bridge params must be an object", code="invalid_request", outcome="not_sent")
+        invoked = True
+        result = methods[method](**params)
+        return {"id": request.get("id"), "result": result}
+    except Exception as exc:
+        if not invoked and not isinstance(exc, BridgeError):
+            exc = BridgeError(str(exc), code="invalid_request", outcome="not_sent")
+        return {"id": request.get("id") if isinstance(request, dict) else None,
+                "error": error_payload(exc, outcome=None if invoked else "not_sent")}
 
 
 def lock_state(path):
@@ -67,17 +92,7 @@ def main():
     output_lock = threading.Lock()
 
     def handle(line):
-        request = {}
-        try:
-            request = json.loads(line)
-            method = request["method"]
-            if method not in methods:
-                raise ValueError("Unknown bridge method")
-            result = methods[method](**request.get("params", {}))
-            response = {"id": request.get("id"), "result": result}
-        except Exception as exc:
-            response = {"id": request.get("id") if isinstance(request, dict) else None,
-                        "error": {"code": getattr(exc, "code", "bridge_error"), "message": str(exc)}}
+        response = response_for_request(line, methods)
         with output_lock:
             print(json.dumps(response, ensure_ascii=False), flush=True)
 
