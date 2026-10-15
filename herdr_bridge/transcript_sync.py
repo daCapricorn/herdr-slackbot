@@ -1,4 +1,5 @@
 """Shared durable transcript contract: atomic cursor, dedupe, outbox and completion."""
+import copy
 import json
 import sqlite3
 from pathlib import Path
@@ -68,7 +69,7 @@ class TranscriptSync:
     def receipt_user_texts(self, row, offset):
         return ()
 
-    def initial_observation(self, info, session):
+    def initial_observation(self, info, session, *, records=None):
         return load_observation(self.home, info, session)
 
     def _status(self, info, state, **fields):
@@ -138,6 +139,104 @@ class TranscriptSync:
         rows = self.db.execute(f"SELECT source_key FROM {self.namespace}_sync_cursors WHERE substr(source_key, 1, ?) = ?",
                                (len(prefix), prefix))
         return any(row[0].rsplit(":", 1)[0] == terminal for row in rows)
+
+    def evidence_snapshot(self, info):
+        """Materialize only Bridge state; caller holds the state lock."""
+        terminal = info.get("terminal_id") or info.get("pane_id", "")
+        binding = self.binding_snapshot(info)
+        return {"binding": binding, "info": {**copy.deepcopy(info), "_bridge_binding": binding},
+                "terminal": terminal}
+
+    def sync_snapshot(self, evidence, session):
+        tid, path, _ = session
+        key = f"{evidence['terminal']}:{tid}"
+        cursor = self.db.execute(f"SELECT rollout_path,device,inode,offset FROM {self.namespace}_sync_cursors WHERE source_key=?", (key,)).fetchone()
+        snapshot = {**evidence, "session": session, "key": key, "cursor": cursor,
+                    "turns": (), "inputs": ()}
+        if self.namespace == "codex":
+            snapshot["turns"] = tuple(self.db.execute("SELECT event_id,turn_id,record,validated,conflicted FROM codex_completion_pending WHERE source_key=? ORDER BY event_id", (key,)).fetchall())
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminal_inputs'").fetchone():
+                snapshot["inputs"] = tuple(self.db.execute("SELECT record FROM terminal_inputs WHERE terminal_id=? AND session_id=? AND state IN ('reserved','observing','uncertain','confirmed') ORDER BY seq", (evidence["terminal"], tid)).fetchall())
+        return snapshot
+
+    def read_sync_batch(self, snapshot, *, limit=16 * 1024 * 1024):
+        """Read detached native bytes. No Bridge connection or reducer access."""
+        session = snapshot["session"]
+        tid, path, _ = session
+        info, row = snapshot["info"], snapshot["cursor"]
+        stat = path.stat()
+        same = row and row[:3] == (str(path), stat.st_dev, stat.st_ino)
+        reset = bool(row and (not same or stat.st_size < row[3]))
+        if same and stat.st_size >= row[3]:
+            offset = row[3]
+        else:
+            observation = self.initial_observation(info, session, records=snapshot["inputs"]) if not row else None
+            if observation:
+                offset = observation["offset"]
+            elif info.get("agent_status") in ("working", "blocked"):
+                offset = self.latest_turn_offset(path)
+            else:
+                offset = stat.st_size
+        if reset and snapshot["turns"]:
+            recovery = self.read_reset_offset(path, {r[1] for r in snapshot["turns"]})
+            if recovery is not None:
+                offset = min(offset, recovery)
+        cursor, rows = offset, []
+        end = min(stat.st_size, offset + limit)
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            while stream.tell() < end:
+                line = stream.readline()
+                # Soft batch budget: preserve complete oversized transcript
+                # rows, stopping only at their boundary. Partial tails hold.
+                if not line.endswith(b"\n"):
+                    break
+                next_cursor = stream.tell()
+                try:
+                    raw = json.loads(line)
+                    if not isinstance(raw, dict):
+                        raise ValueError("invalid rollout row")
+                except (ValueError, UnicodeDecodeError):
+                    raw = None
+                rows.append((cursor, next_cursor, raw))
+                cursor = next_cursor
+        after = path.stat()
+        if (stat.st_dev, stat.st_ino) != (after.st_dev, after.st_ino) or after.st_size < stat.st_size:
+            raise SessionUnavailable("Transcript source changed while reading")
+        return {"rows": rows, "offset": offset, "cursor": cursor, "reset": reset,
+                "complete": cursor == after.st_size, "device": stat.st_dev, "inode": stat.st_ino}
+
+    def apply_sync_batch(self, snapshot, batch, enqueue, *, completion_agent=None):
+        """CAS then apply existing reducers atomically under caller transaction."""
+        info, session, key = snapshot["info"], snapshot["session"], snapshot["key"]
+        if self.binding_snapshot(info) != snapshot["binding"]:
+            return 0
+        current = self.sync_snapshot(self.evidence_snapshot(info), session)
+        if any(current[k] != snapshot[k] for k in ("cursor", "turns", "inputs")):
+            return 0
+        tid, path, _ = session
+        explicit = bool(session_of(info))
+        if not explicit:
+            info = {**info, "agent_session": {"value": tid}}
+        info = {**info, "_transcript_source": {"path": str(path), "device": batch["device"], "inode": batch["inode"]}}
+        if completion_agent is not None:
+            completion_agent = {**completion_agent, "session": tid}
+        if explicit and info.get("terminal_id") and info["agent_session"].get("source") != TITLE_SOURCE:
+            self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_session_bindings VALUES (?,?,?)", (snapshot["terminal"], tid, info["cwd"]))
+        if batch["reset"]:
+            self.apply_reset(key)
+        for offset, next_cursor, raw in batch["rows"]:
+            if raw is not None:
+                for event_id, event in self.row_events(key, raw, offset, info=info, agent=completion_agent):
+                    self.emit(event_id, info, event, key, enqueue, completion_agent)
+        for event_id, event in self.finish_events(key, info, batch["complete"]):
+            self.emit(event_id, info, event, key, enqueue, completion_agent)
+        self.db.execute(f"INSERT OR REPLACE INTO {self.namespace}_sync_cursors VALUES (?,?,?,?,?)", (key, str(path), batch["device"], batch["inode"], batch["cursor"]))
+        self._status(info, "syncing", thread_id=tid, offset=batch["cursor"])
+        return batch["cursor"] - batch["offset"]
+
+    def apply_reset(self, key):
+        self.reset_source(key)
 
     def sync(self, info, enqueue, *, unique_workspace=False, completion_agent=None):
         self.db.execute(f"SAVEPOINT {self.namespace}_sync_read")

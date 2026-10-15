@@ -44,7 +44,9 @@ def test_conversation_display_metadata_uses_snapshot_without_rebinding(tmp_path,
     monkeypatch.setattr("herdr_bridge.core.session_model",
                         lambda info, **kwargs: inspected.append(copy.deepcopy(info)) or "snapshot-model")
     try:
-        bridge._queue_conversation("message-a", original, {"role": "user", "text": "from A"})
+        display = bridge._public_agent(original, enrich=False)
+        with bridge.lock, bridge.db:
+            bridge._queue_conversation("message-a", original, {"role": "user", "text": "from A"}, display)
         event = json.loads(bridge.db.execute("SELECT event FROM outbox").fetchone()[0])
         assert event["agent"]["session"] == TID
         assert event["agent"]["model"] == "snapshot-model"

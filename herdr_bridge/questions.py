@@ -6,6 +6,7 @@ envelope as its desktop and terminal UI. This module does not write to Codex sta
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -84,7 +85,7 @@ class _Rollout:
         if not self.valid:
             raise QuestionUnavailable("Codex session identity is unavailable")
         return {"thread_id": self.thread_id, "turn_id": self.turn_id,
-                "pending": dict(self.pending), "answers": dict(self.answers)}
+                "pending": copy.deepcopy(self.pending), "answers": dict(self.answers)}
 
     def apply(self, row):
         if not isinstance(row, dict) or not isinstance(row.get("payload"), dict):
@@ -142,8 +143,7 @@ class CodexQuestionSource:
         self.lock = threading.RLock()
 
     def snapshot(self, info, *, unique_workspace=False):
-        with self.lock:
-            return self._snapshot(info, unique_workspace=unique_workspace)
+        return self._snapshot(info, unique_workspace=unique_workspace)
 
     def _snapshot(self, info, *, unique_workspace=False):
         if info.get("agent") != "codex" or not info.get("cwd"):
@@ -152,11 +152,22 @@ class CodexQuestionSource:
             tid, rollout, cwd = resolve_session(info, home=self.home, unique_workspace=unique_workspace)
             path = str(rollout)
             key = (tid, path, cwd)
-            if key not in self.cache:
-                if len(self.cache) >= 64:
-                    self.cache.pop(next(iter(self.cache)))
-                self.cache[key] = _Rollout(Path(path), tid, cwd)
-            return self.cache[key].read()
+            with self.lock:
+                if key not in self.cache:
+                    if len(self.cache) >= 64:
+                        unused = next((k for k, entry in self.cache.items() if not entry["users"]), None)
+                        if unused is not None:
+                            self.cache.pop(unused)
+                    self.cache[key] = {"reader": _Rollout(Path(path), tid, cwd),
+                                       "lock": threading.Lock(), "users": 0}
+                entry = self.cache[key]
+                entry["users"] += 1
+            try:
+                with entry["lock"]:
+                    return entry["reader"].read()
+            finally:
+                with self.lock:
+                    entry["users"] -= 1
         except SessionUnavailable as exc:
             raise QuestionUnavailable(str(exc)) from exc
         except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
