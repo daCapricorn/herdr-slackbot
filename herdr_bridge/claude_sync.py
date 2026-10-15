@@ -71,8 +71,7 @@ class ClaudeTranscriptSync(TranscriptSync):
     def _resolve(self, info, unique_workspace=False):
         if session_of(info):
             return resolve_claude(info, home=self.home)
-        row = self.db.execute("SELECT thread_id,cwd FROM claude_session_bindings WHERE terminal_id=?",
-                              (info.get("terminal_id"),)).fetchone()
+        row = info["_bridge_binding"] if "_bridge_binding" in info else self.binding_snapshot(info)
         if row and row[1] != info.get("cwd"):
             raise SessionUnavailable("Bound directory changed; bind the current session again")
         return resolve_claude(info, home=self.home, thread_id=row[0] if row else None)
@@ -89,19 +88,29 @@ class ClaudeTranscriptSync(TranscriptSync):
                     "path": str(path), "device": None, "inode": None,
                     "offset": 0, "missing": True}
 
-    def bind(self, info, thread_id):
+    def validate_binding(self, info, thread_id):
         if not info.get("terminal_id"):
             raise SessionUnavailable("Exact terminal id required for binding")
-        tid, _, cwd = resolve_claude(info, home=self.home, thread_id=thread_id)
+        return resolve_claude(info, home=self.home, thread_id=thread_id)
+
+    def apply_binding(self, info, session):
+        tid, _, cwd = session
         self.db.execute("INSERT OR REPLACE INTO claude_session_bindings VALUES (?,?,?)", (info["terminal_id"], tid, cwd))
         self._status(info, "ready", thread_id=tid, source="explicit", reason="Bound; waiting for next scan")
         return self.diagnostic(info)
 
-    def bound_info(self, info):
-        row = self.db.execute("SELECT thread_id FROM claude_session_bindings WHERE terminal_id=?", (info.get("terminal_id"),)).fetchone()
-        if not row:
+    def bind(self, info, thread_id):
+        return self.apply_binding(info, self.validate_binding(info, thread_id))
+
+    def binding_snapshot(self, info):
+        return self.db.execute("SELECT thread_id,cwd FROM claude_session_bindings WHERE terminal_id=?", (info.get("terminal_id"),)).fetchone()
+
+    def bound_info(self, info, *, binding=...):
+        if binding is ...:
+            binding = self.binding_snapshot(info)
+        if not binding:
             return info
-        tid, _, _ = self._resolve(info)
+        tid, _, _ = self._resolve({**info, "_bridge_binding": binding})
         return {**info, "agent_session": {"value": tid}}
 
     def latest_turn_offset(self, path):

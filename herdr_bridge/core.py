@@ -1,6 +1,7 @@
 """Domain events and exact, one-shot terminal replies. No channel SDK imports."""
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ from .metadata import session_model
 from .questions import CodexQuestionSource, QuestionUnavailable, fingerprint as question_fingerprint, input_plan
 from .channels import PaneChannels
 from .agent_adapters import adapters
-from .codex_session import AUTHORITY_ERROR
+from .codex_session import AUTHORITY_ERROR, SessionUnavailable
 from .terminal_inputs import TerminalInputs, known_empty_composer
 from .errors import BridgeError
 
@@ -69,6 +70,7 @@ class Bridge:
         self.followup_timeout = followup_timeout
         self.question_source = question_source or CodexQuestionSource()
         self.notification_delay = max(0.0, float(notification_delay))
+        self.operations = {}  # exact terminal -> nonblocking probe/effect owner
         self.active = set()
         self.sending = {}  # pane -> request, only terminal writes/initial confirmation
         Path(state_path).parent.mkdir(parents=True, exist_ok=True)
@@ -199,7 +201,8 @@ class Bridge:
             unique = sum(a.get("agent") == info.get("agent") and a.get("cwd") == info.get("cwd") for a in agents) == 1
             with self.lock:
                 adapter = self.adapters.get(info.get("agent"))
-                metadata_info = adapter.source.bound_info(info) if enrich and adapter else info
+                binding = adapter.source.binding_snapshot(info) if enrich and adapter else None
+            metadata_info = adapter.source.bound_info(info, binding=binding) if enrich and adapter else info
             result["model"] = session_model(metadata_info, unique_workspace=unique)
         except Exception:
             result["model"] = None
@@ -225,7 +228,7 @@ class Bridge:
 
     def _queue(self, kind, agent, **fields):
         event = {"id": uuid.uuid4().hex, "type": kind, "at": self.clock(),
-                 "agent": self._public_agent(agent), **fields}
+                 "agent": agent, **fields}
         if kind in ATTENTION_EVENTS:
             event["notify_after"] = event["at"] + self.notification_delay
         if kind in ("approval.requested", "question.requested"):
@@ -240,7 +243,7 @@ class Bridge:
 
     def _queue_conversation(self, event_id, info, message, agent=None):
         event = {"id": event_id, "type": "conversation.message", "at": self.clock(),
-                 "agent": agent or self._public_agent(info, enrich=False), **message}
+                 "agent": agent or public_agent(info), **message}
         self.db.execute("INSERT OR IGNORE INTO outbox VALUES (?, ?)",
                         (event["id"], json.dumps(event, ensure_ascii=False)))
 
@@ -260,41 +263,70 @@ class Bridge:
 
     def bind_session(self, pane, thread_id):
         info = self._agent(pane)
-        with self.lock, self.db:
-            adapter = self.adapters.get(info.get("agent"))
-            if not adapter:
-                raise BridgeError("Agent has no session adapter", code="session_adapter_unavailable", outcome="not_sent")
-            adapter.source.bind(info, thread_id)
+        adapter = self.adapters.get(info.get("agent"))
+        if not adapter:
+            raise BridgeError("Agent has no session adapter", code="session_adapter_unavailable", outcome="not_sent")
+        source = adapter.source
+        with self.lock:
+            binding = source.binding_snapshot(info)
+            owner = self._claim_operation({"terminal_id": info["terminal_id"]})
+            if not owner:
+                raise BridgeError("This pane is still processing another approval; wait and check status. Nothing was sent", code="pane_busy", outcome="not_sent")
+        try:
+            session = source.validate_binding(info, thread_id)
+            fresh = self._agent(pane)
+            with self.lock, self.db:
+                if identity(fresh) != identity(info) or source.binding_snapshot(info) != binding:
+                    raise BridgeError("Agent changed; nothing was sent", code="agent_changed", outcome="not_sent")
+                source.apply_binding(info, session)
+        finally:
+            self._release_operation(owner)
         self.sync_conversation(info)
         return self.sync_status(pane)
 
+    def _source_info(self, info):
+        with self.lock:
+            source = self.adapters[info["agent"]].source
+            return source.evidence_snapshot(info)["info"]
+
     def sync_conversation(self, info):
-        """Persist normalized conversation events and their source cursor atomically."""
-        info = self._enrich_agent(info)
+        """Native reader is detached; cursor and all reducers commit by CAS."""
+        info = self._enrich_agent(copy.deepcopy(info))
         adapter = self.adapters.get(info.get("agent"))
         if not adapter:
             return 0
+        source = adapter.source
+        batch = None
         try:
-            with self.lock, self.db:
-                # sqlite's connection context begins lazily. Start the owning
-                # transaction before source SAVEPOINTs, whose outermost RELEASE
-                # would otherwise commit before completion/outbox draining.
-                self.db.execute("BEGIN")
-                live = self._agent(info["pane_id"])
-                if identity(live) != identity(info):
+            live = self._agent(info["pane_id"])
+            if identity(live) != identity(info):
+                return 0
+            agents = self.client.list_agents()
+            unique = sum(a.get("agent") == info.get("agent") and a.get("cwd") == info.get("cwd") for a in agents) == 1
+            public = self._public_agent(info, agents, enrich=False)
+            with self.lock:
+                evidence = source.evidence_snapshot(info)
+            session = source._resolve(evidence["info"], unique)
+            with self.lock:
+                if source.binding_snapshot(info) != evidence["binding"]:
                     return 0
-                agents = self.client.list_agents()
-                unique = sum(a.get("agent") == info.get("agent") and a.get("cwd") == info.get("cwd") for a in agents) == 1
-                public = self._public_agent(info, agents, enrich=False)
-
-                def enqueue(event_id, queued, message):
-                    self._queue_conversation(event_id, queued, message, public)
-
-                scanned = adapter.source.sync(info, enqueue, unique_workspace=unique,
-                                               completion_agent=public)
-                adapter.source.drain_completions(info, self._queue_completion)
+                snapshot = source.sync_snapshot(evidence, session)
+            batch = source.read_sync_batch(snapshot)
+            live = self._agent(info["pane_id"])
+            if identity(live) != identity(info):
+                return 0
+            with self.lock, self.db:
+                self.db.execute("BEGIN")
+                scanned = source.apply_sync_batch(snapshot, batch,
+                    lambda eid, queued, message: self._queue_conversation(eid, queued, message, public),
+                    completion_agent=public)
+                source.drain_completions(info, self._queue_completion)
                 return scanned
-        except Exception:
+        except Exception as exc:
+            with self.lock, self.db:
+                source._status(info, "unavailable", reason=str(exc) if isinstance(exc, SessionUnavailable) else f"Transcript read failed: {type(exc).__name__}")
+                if batch is None:
+                    source.drain_completions(info, self._queue_completion)
             log.exception("%s transcript sync failed for %s", info.get("agent"), info.get("pane_id"))
             return 0
 
@@ -322,6 +354,7 @@ class Bridge:
                     continue
                 return  # A verified expanded/collapsed async input already has its own card.
         fingerprint = dialog.fingerprint if dialog else None
+        display = self._public_agent(info)
         with self.lock, self.db:
             rows = self.db.execute("SELECT id, record, state FROM approvals").fetchall()
             for request_id, raw, state in rows:
@@ -351,7 +384,7 @@ class Bridge:
                    "created_at": self.clock(),
                    "options": options}
             self.db.execute("INSERT INTO approvals VALUES (?, ?, 'pending')", (request_id, json.dumps(rec)))
-            self._queue("approval.requested" if options else "agent.blocked", info,
+            self._queue("approval.requested" if options else "agent.blocked", display,
                         request=rec, text=screen)
 
     def _question_snapshot(self, info, agents=None):
@@ -359,7 +392,8 @@ class Bridge:
         unique = sum(a.get("agent") == "codex" and a.get("cwd") == info.get("cwd") for a in agents) == 1
         try:
             with self.lock:
-                question_info = self.adapters["codex"].source.bound_info(info)
+                binding = self.adapters["codex"].source.binding_snapshot(info)
+            question_info = self.adapters["codex"].source.bound_info(info, binding=binding)
         except Exception as exc:
             raise QuestionUnavailable(str(exc)) from exc
         return self.question_source.snapshot(question_info, unique_workspace=unique)
@@ -377,6 +411,7 @@ class Bridge:
         fresh = self._agent(info["pane_id"])
         if fresh.get(AUTHORITY_ERROR) or identity(fresh) != identity(info):
             return {}
+        display = self._public_agent(info)
         with self.lock, self.db:
             for question in snapshot["pending"].values():
                 fp = question_fingerprint(question)
@@ -392,7 +427,7 @@ class Bridge:
                        "created_at": self.clock(),
                        "options": [{"index": i, "label": o} for i, o in enumerate(question["options"])]}
                 self.db.execute("INSERT INTO approvals VALUES (?, ?, 'pending')", (rec["id"], json.dumps(rec)))
-                self._queue("question.requested", info, request=rec, text=screen, summary=question["title"])
+                self._queue("question.requested", display, request=rec, text=screen, summary=question["title"])
         return snapshot["pending"]
 
     def transition(self, transition):
@@ -407,76 +442,105 @@ class Bridge:
             text = self.client.read_agent_once(info["pane_id"], 160, source="visible")
             if identity(self._agent(info["pane_id"])) != identity(info):
                 return
+            display = self._public_agent(info)
             with self.lock, self.db:
-                self._queue("agent.done", info, text=text)
+                self._queue("agent.done", display, text=text)
 
     def pending(self):
+        with self.lock:
+            rows = self.db.execute("SELECT id, record FROM approvals WHERE state='pending'").fetchall()
+        live = {a["pane_id"]: self._enrich_agent(a) for a in self.client.list_agents()}
+        obsolete = []
+        for request_id, raw in rows:
+            rec = json.loads(raw)
+            info = live.get(rec["pane_id"])
+            if info and info.get(AUTHORITY_ERROR):
+                obsolete.append((request_id, raw))
+                continue
+            if rec.get("kind") == "codex_question" and info and identity(info) == tuple(rec["identity"]):
+                try:
+                    question = self._question_snapshot(info, list(live.values()))["pending"].get(rec["question"]["id"])
+                except QuestionUnavailable:
+                    continue
+                if question and question_fingerprint(question) == rec["fingerprint"]:
+                    continue
+                obsolete.append((request_id, raw))
+            elif (not info or identity(info) != tuple(rec["identity"])
+                    or info.get("agent_status") != "blocked"
+                    or info.get("state_change_seq") != rec.get("sequence")):
+                obsolete.append((request_id, raw))
         with self.lock, self.db:
-            live = {a["pane_id"]: self._enrich_agent(a) for a in self.client.list_agents()}
-            for request_id, raw in self.db.execute("SELECT id, record FROM approvals WHERE state='pending'").fetchall():
-                rec = json.loads(raw)
-                info = live.get(rec["pane_id"])
-                if info and info.get(AUTHORITY_ERROR):
-                    self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request_id,))
-                    continue
-                if rec.get("kind") == "codex_question" and info and identity(info) == tuple(rec["identity"]):
-                    try:
-                        question = self._question_snapshot(info, list(live.values()))["pending"].get(rec["question"]["id"])
-                    except QuestionUnavailable:
-                        continue  # A failed read is not proof of expiry; dispatch still fails closed.
-                    if question and question_fingerprint(question) == rec["fingerprint"]:
-                        continue
-                    self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request_id,))
-                    continue
-                if (not info or identity(info) != tuple(rec["identity"])
-                        or info.get("agent_status") != "blocked"
-                        or info.get("state_change_seq") != rec.get("sequence")):
-                    self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request_id,))
-            return [json.loads(r[0]) for r in self.db.execute(
-                "SELECT record FROM approvals WHERE state='pending'")]
+            for request_id, raw in obsolete:
+                self.db.execute("UPDATE approvals SET state='superseded' WHERE id=? AND record=? AND state='pending'", (request_id, raw))
+            return [json.loads(r[0]) for r in self.db.execute("SELECT record FROM approvals WHERE state='pending'").fetchall()]
 
     def events(self, account_id=None):
-        self.pending()  # Retire cards whose pane has already advanced.
-        with self.lock, self.db:
-            ready = []
+        # Ready durable results take precedence. Background discovery handles
+        # full pending maintenance; polling never synchronously scans all panes.
+        with self.lock:
+            candidates = []
             for (raw,) in self.db.execute("SELECT event FROM outbox ORDER BY rowid").fetchall():
                 queued = json.loads(raw)
                 if account_id and queued["type"] not in ("approval.updated", "input.updated"):
                     a = queued["agent"]
                     if not queued.get("route") and not self.channels.route(account_id, a["pane_id"], a.get("terminal_id")):
                         continue
-                event = self._event_for_delivery(queued)
-                if event:
-                    ready.append(event)
-                    if len(ready) == 20:
-                        break  # Deferred attention cannot block ready completion/results.
-            return ready
+                candidates.append(queued)
+            ready = [e for e in candidates if e["type"] not in ATTENTION_EVENTS and not e.get("request")]
+        if ready:
+            return ready[:20]
+        return [event for queued in candidates if (event := self.event_for_delivery(queued["id"]))][:20]
 
     def event_for_delivery(self, event_id):
-        """Recheck one queued card immediately before its OpenClaw handoff."""
+        """Probe a detached card, then compare both request and outbox tokens."""
         with self.lock, self.db:
             row = self.db.execute("SELECT event FROM outbox WHERE id=?", (event_id,)).fetchone()
-            return self._event_for_delivery(json.loads(row[0])) if row else None
+            if not row:
+                return None
+            raw = row[0]
+            event = json.loads(raw)
+            request = event.get("request")
+            if not request:
+                return event
+            token = self.db.execute("SELECT record,state FROM approvals WHERE id=?", (request["id"],)).fetchone()
+            if not token or token[1] != "pending":
+                self.db.execute("DELETE FROM outbox WHERE id=?", (event_id,))
+                return None
+            if event["type"] not in ATTENTION_EVENTS:
+                return event
+            due = event.get("notify_after", event.get("at", request["created_at"]) + self.notification_delay)
+            if self.clock() < due:
+                return None
+        live = self._attention_still_pending(json.loads(token[0]))
+        with self.lock, self.db:
+            current_event = self.db.execute("SELECT event FROM outbox WHERE id=?", (event_id,)).fetchone()
+            current = self.db.execute("SELECT record,state FROM approvals WHERE id=?", (request["id"],)).fetchone()
+            if current_event != (raw,) or current != token:
+                return None
+            if live is False:
+                self.db.execute("UPDATE approvals SET state='superseded' WHERE id=?", (request["id"],))
+                self.db.execute("DELETE FROM outbox WHERE id=?", (event_id,))
+            return event if live is True else None
 
-    def _event_for_delivery(self, event):
-        request = event.get("request")
-        if not request:
-            return event
-        row = self.db.execute("SELECT state FROM approvals WHERE id=?", (request["id"],)).fetchone()
-        if not row or row[0] != "pending":
-            self.db.execute("DELETE FROM outbox WHERE id=?", (event["id"],))
+    def _claim_operation(self, rec):
+        terminal = rec.get("terminal_id") or rec["identity"][1]
+        if terminal in self.operations:
             return None
-        if event["type"] not in ATTENTION_EVENTS:
-            return event
-        # The deadline is persisted in JSON. Older queues use their discovery time.
-        due = event.get("notify_after", event.get("at", request["created_at"]) + self.notification_delay)
-        if self.clock() < due:
-            return None
-        live = self._attention_still_pending(request)
-        if live is False:
-            self.db.execute("UPDATE approvals SET state='superseded' WHERE id=? AND state='pending'", (request["id"],))
-            self.db.execute("DELETE FROM outbox WHERE id=?", (event["id"],))
-        return event if live is True else None
+        token = uuid.uuid4().hex
+        self.operations[terminal] = token
+        return (terminal, token)
+
+    def _release_operation(self, owner):
+        with self.lock:
+            if owner and self.operations.get(owner[0]) == owner[1]:
+                self.operations.pop(owner[0])
+
+    def _request_binding(self, rec):
+        adapter = self.adapters.get(rec["identity"][2])
+        return adapter.source.binding_snapshot({"terminal_id": rec["identity"][1]}) if adapter else None
+
+    def _same_request(self, rec, state, binding):
+        return self._record(rec["id"]) == (rec, state) and self._request_binding(rec) == binding
 
     def _attention_still_pending(self, request):
         """True=still needs attention, False=obsolete, None=read unavailable."""
@@ -522,7 +586,7 @@ class Bridge:
 
     def prepare_answer(self, request_id, option=None, retry_from=None, answer_text=None):
         """Reserve a human choice without writing, so OpenClaw can show progress first."""
-        with self.lock, self.db:
+        with self.lock:
             rec, state = self._record(request_id)
             if retry_from is not None:
                 if retry_from in {a.get("attempt_id") for a in rec.get("attempts", [])}:
@@ -535,7 +599,7 @@ class Bridge:
                         return {**self._result(rec, state), "outcome": "checking", "ready_to_dispatch": True}
                     raise BridgeError("Retry is stale or acceptance is unknown; check status first. Nothing was sent", code="stale_retry", details={"request_id": request_id}, outcome="not_sent")
                 option = rec["dispatch"]["option"]
-                self._reserve(rec, option, rec["dispatch"].get("answer") if option is None else None)
+                answer_text = rec["dispatch"].get("answer") if option is None else None
             else:
                 custom = rec.get("kind") == "codex_question" and answer_text is not None and option is None
                 if custom:
@@ -553,30 +617,50 @@ class Bridge:
                             "ready_to_dispatch": state == "reserved"}
                 if state != "pending":
                     raise BridgeError("Request was superseded; nothing was sent", code="request_superseded", details={"request_id": request_id}, outcome="not_sent")
-                self._reserve(rec, option, answer_text)
+            self._ensure_pane_available(rec)
+            binding = self._request_binding(rec)
+            owner = self._claim_operation(rec)
+            if not owner:
+                return {**self._result(rec, state), "outcome": "checking", "ready_to_dispatch": False}
+        try:
+            proof = self._reservation_proof(rec, option, answer_text)
+            with self.lock, self.db:
+                if not self._same_request(rec, state, binding):
+                    current, current_state = self._record(request_id)
+                    return {**self._result(current, current_state), "ready_to_dispatch": False}
+                self._reserve(rec, option, answer_text, proof=proof)
             return {**self._result(rec, "reserved"), "outcome": "checking", "ready_to_dispatch": True}
+        finally:
+            self._release_operation(owner)
 
     def dispatch_reserved(self, request_id, attempt_id):
         with self.lock:
-            with self.db:
-                rec, state = self._record(request_id)
-                if attempt_id != rec.get("dispatch", {}).get("attempt_id"):
-                    raise BridgeError("Submission is stale; nothing was sent", code="stale_submission", details={"request_id": request_id, "attempt_id": attempt_id}, outcome="not_sent")
-                if state != "reserved":
-                    return self._result(rec, state)  # A duplicate commit never writes again.
-                if rec.get("kind") == "codex_question":
-                    plan, fresh = self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
+            rec, state = self._record(request_id)
+            if attempt_id != rec.get("dispatch", {}).get("attempt_id"):
+                raise BridgeError("Submission is stale; nothing was sent", code="stale_submission", details={"request_id": request_id, "attempt_id": attempt_id}, outcome="not_sent")
+            if state != "reserved":
+                return self._result(rec, state)
+            binding = self._request_binding(rec)
+            owner = self._claim_operation(rec)
+            if not owner:
+                return {**self._result(rec, state), "outcome": "checking"}
+        try:
+            plan, fresh = self._reservation_proof(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
+            with self.lock:
+                with self.db:
+                    if not self._same_request(rec, state, binding):
+                        current, current_state = self._record(request_id)
+                        return self._result(current, current_state)
+                    self._ensure_pane_available(rec)
                     rec["dispatch"].update(plan)
-                else:
-                    _, fresh = self._live_dialog(rec)  # The Slack edit may have taken seconds.
-                self._ensure_pane_available(rec)
-                rec["dispatch"].update(started_at=self.clock(), focused=fresh.get("focused"), revision=fresh.get("revision"))
-                rec["followup_deadline"] = self.clock() + self.followup_timeout
-                self._save(rec, "dispatching")
-            self._claim_pane(rec)
-            self.active.add(request_id)
-
-        return self._finish_dispatch(rec)
+                    rec["dispatch"].update(started_at=self.clock(), focused=fresh.get("focused"), revision=fresh.get("revision"))
+                    rec["followup_deadline"] = self.clock() + self.followup_timeout
+                    self._save(rec, "dispatching")
+                self._claim_pane(rec)
+                self.active.add(request_id)
+            return self._finish_dispatch(rec)
+        finally:
+            self._release_operation(owner)
 
     def _record(self, request_id):
         row = self.db.execute("SELECT record, state FROM approvals WHERE id=?", (request_id,)).fetchone()
@@ -650,13 +734,17 @@ class Bridge:
         except QuestionUnavailable as exc:
             raise BridgeError(str(exc), code="question_unavailable") from exc
 
-    def _reserve(self, rec, option, answer_text=None):
+    def _reservation_proof(self, rec, option, answer_text=None):
         if rec.get("kind") == "codex_question":
             answer = answer_text if option is None else rec["question"]["options"][option]
             plan, fresh = self._live_question(rec, option, answer)
         else:
             dialog, fresh = self._live_dialog(rec)
             plan = {"keys": keys_for(dialog, option)}
+        return plan, fresh
+
+    def _reserve(self, rec, option, answer_text=None, *, proof):
+        plan, fresh = proof
         self._ensure_pane_available(rec)
         if rec.get("dispatch"):
             rec.setdefault("attempts", []).append(rec["dispatch"])
@@ -683,7 +771,11 @@ class Bridge:
                 # An ambiguous receipt is still consumed; observe, never auto-retry.
                 rec["dispatch"]["error_type"] = type(exc).__name__
             with self.lock, self.db:
-                self._save(rec, "dispatching")
+                current, current_state = self._record(rec["id"])
+                if current.get("dispatch", {}).get("attempt_id") == rec["dispatch"]["attempt_id"]:
+                    current["dispatch"].update({k: rec["dispatch"][k] for k in ("acknowledged_at", "error_type") if k in rec["dispatch"]})
+                    self._save(current, current_state)
+                    rec = current
             verification = self._confirm_answer(rec)
             with self.lock, self.db:
                 self.active.discard(rec["id"])
@@ -715,6 +807,14 @@ class Bridge:
 
     def _store_verification(self, rec, verification):
         """Stage verification and its outbox update in the caller's transaction."""
+        current, state = self._record(rec["id"])
+        if current.get("dispatch", {}).get("attempt_id") != rec.get("dispatch", {}).get("attempt_id") or state == "confirmed":
+            return self._result(current, state)
+        # Expiry is a monotonic same-attempt decision made by the locked
+        # reconciliation reducer. Preserve it while merging current metadata.
+        if rec.get("watch_expired"):
+            current["watch_expired"] = True
+        rec = current
         rec["verification"] = verification
         outcome = "reserved" if verification["outcome"] == "not_sent" else verification["outcome"]
         result = self._result(rec, outcome)
@@ -736,29 +836,38 @@ class Bridge:
 
     def check(self, request_id, *, timeout=None):
         with self.lock:
-            with self.db:
-                rec, state = self._record(request_id)
-                if state not in CONSUMED_STATES:
-                    raise BridgeError("No approval attempt to check; nothing was sent", code="approval_attempt_absent", details={"request_id": request_id}, outcome="not_sent")
-                if request_id in self.active or state == "confirmed":
-                    return self._result(rec, state)
-                if state == "reserved":
-                    try:
-                        if rec.get("kind") == "codex_question":
-                            self._live_question(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
-                        else:
-                            self._live_dialog(rec)
-                        retryable = True
-                    except Exception:
-                        retryable = False
-                    return self._store_verification(rec, {"outcome": "not_sent", "reason": "not_submitted",
-                                                         "retryable": retryable, "elapsed_ms": 0})
-                # Legacy/crashed records are queryable, never silently rearmed.
-                rec["dispatch"].setdefault("attempt_id", uuid.uuid4().hex)
-                self._save(rec, state)
-            self.active.add(request_id)
-
+            rec, state = self._record(request_id)
+            if state not in CONSUMED_STATES:
+                raise BridgeError("No approval attempt to check; nothing was sent", code="approval_attempt_absent", details={"request_id": request_id}, outcome="not_sent")
+            if request_id in self.active or state == "confirmed":
+                return self._result(rec, state)
+            binding = self._request_binding(rec)
+            owner = self._claim_operation(rec)
+            if not owner:
+                return {**self._result(rec, state), "outcome": "checking"}
         try:
+            if state == "reserved":
+                try:
+                    self._reservation_proof(rec, rec["dispatch"]["option"], rec["dispatch"].get("answer"))
+                    retryable = True
+                except Exception:
+                    retryable = False
+                with self.lock, self.db:
+                    if not self._same_request(rec, state, binding):
+                        current, current_state = self._record(request_id)
+                        return self._result(current, current_state)
+                    return self._store_verification(rec, {"outcome": "not_sent", "reason": "not_submitted", "retryable": retryable, "elapsed_ms": 0})
+            with self.lock:
+                with self.db:
+                    current, current_state = self._record(request_id)
+                    if (current_state not in CONSUMED_STATES or current_state == "confirmed"
+                            or current.get("dispatch", {}).get("attempt_id") != rec.get("dispatch", {}).get("attempt_id")
+                            or self._request_binding(current) != binding):
+                        return self._result(current, current_state)
+                    rec, state = current, current_state
+                    rec["dispatch"].setdefault("attempt_id", uuid.uuid4().hex)
+                    self._save(rec, state)
+                self.active.add(request_id)
             verification = self._confirm_answer(rec, timeout=timeout)
             with self.lock, self.db:
                 self.active.discard(request_id)
@@ -766,6 +875,7 @@ class Bridge:
         finally:
             with self.lock:
                 self.active.discard(request_id)
+            self._release_operation(owner)
 
     def retry(self, request_id, attempt_id):
         prepared = self.prepare_answer(request_id, retry_from=attempt_id)
@@ -953,11 +1063,24 @@ class Bridge:
     def _native_input_blocker(self, info, rec):
         if rec["agent_kind"] != "codex":
             return None
+        source = self.adapters["codex"].source
+        with self.lock:
+            previous = self.inputs.last_dispatched(rec)
+            detached = source.evidence_snapshot(info)
+            prefix = f"{rec['terminal_id']}:{session_of(info)}:"
+            states = {key: (raw,) for key, raw in self.db.execute("SELECT source_key,record FROM codex_input_readiness WHERE substr(source_key,1,?)=?", (len(prefix), prefix)).fetchall()}
+        deltas = {}
         try:
-            return self.adapters["codex"].source.input_blocker(info, self.inputs.last_dispatched(rec))
+            blocker = source.input_blocker(detached["info"], previous, states=states, deltas=deltas)
+            with self.lock, self.db:
+                current = {key: (raw,) for key, raw in self.db.execute("SELECT source_key,record FROM codex_input_readiness WHERE substr(source_key,1,?)=?", (len(prefix), prefix)).fetchall()}
+                if (current != states or self.inputs.last_dispatched(rec) != previous
+                        or source.binding_snapshot(info) != detached["binding"]):
+                    return "codex_native_readiness_unavailable"
+                for key, raw in deltas.items():
+                    self.db.execute("INSERT OR REPLACE INTO codex_input_readiness VALUES (?,?)", (key, raw))
+            return blocker
         except Exception:
-            # Unreadable/partial/replaced native evidence licenses no write.
-            # Keep the accepted request durable so a later read can resolve it.
             return "codex_native_readiness_unavailable"
 
     def ingest_input(self, account_id, conversation_id, message_ts, sender_id, text,
@@ -976,10 +1099,16 @@ class Bridge:
             binding = self._input_binding(account_id, conversation_id)
             if binding_id and binding["id"] != binding_id:
                 raise BridgeError("Pane channel binding changed; nothing was sent", code="channel_binding_changed", outcome="not_sent")
-            info = self._agent(binding["pane_id"])
-            snapshot = self._input_snapshot(info)
-            if snapshot["terminal_id"] != binding["terminal_id"]:
-                raise BridgeError("Pane channel terminal identity changed; nothing was sent", code="terminal_identity_changed", outcome="not_sent")
+        info = self._agent(binding["pane_id"])
+        snapshot = self._input_snapshot(info)
+        if snapshot["terminal_id"] != binding["terminal_id"]:
+            raise BridgeError("Pane channel terminal identity changed; nothing was sent", code="terminal_identity_changed", outcome="not_sent")
+        with self.lock, self.db:
+            duplicate = self.inputs.find("slack", account_id, conversation_id, message_ts)
+            if duplicate:
+                return self._input_result(duplicate)
+            if self._input_binding(account_id, conversation_id) != binding:
+                raise BridgeError("Pane channel binding changed; nothing was sent", code="channel_binding_changed", outcome="not_sent")
             rec = self.inputs.insert({"source": "slack", "account_id": account_id,
                 "channel_id": conversation_id, "message_ts": message_ts,
                 "sender_id": sender_id, "thread_id": str(thread_id) if thread_id is not None else None,
@@ -995,14 +1124,12 @@ class Bridge:
             if info.get("agent_status") not in ("idle", "done"):
                 rec = self.inputs.save(rec, "rejected", reason="agent_status_unknown")
                 return self.inputs.result(rec)
-            blocker = self._native_input_blocker(info, rec)
-            if blocker:
-                return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
         return self._dispatch_input(rec["seq"])
 
     def _revalidate_input(self, rec):
         if rec["source"] == "slack":
-            self._input_binding(rec["account_id"], rec["channel_id"], rec["binding"])
+            with self.lock:
+                self._input_binding(rec["account_id"], rec["channel_id"], rec["binding"])
         info = self._agent(rec["pane_id"])
         require_session_authority(info)
         if identity(info) != (rec["session_id"], rec["terminal_id"], rec["agent_kind"]):
@@ -1027,76 +1154,103 @@ class Bridge:
             rec = self.inputs.save(rec, rec["state"], last_notified_state=rec["state"])
         return self.inputs.result(rec)
 
+    def _probe_input(self, rec):
+        info = self._revalidate_input(rec)
+        source_info = self._source_info(info)
+        status = info.get("agent_status")
+        if status == "blocked":
+            return {"state": "rejected", "reason": "agent_blocked_use_approval"}
+        if status == "working":
+            return {"state": "queued", "reason": "agent_busy"}
+        if status not in ("idle", "done"):
+            return {"state": "rejected", "reason": "agent_status_unknown"}
+        blocker = self._native_input_blocker(info, rec)
+        if blocker:
+            return {"state": "queued", "reason": blocker}
+        adapter = self.adapters[rec["agent_kind"]]
+        try:
+            baseline = adapter.source.receipt_baseline(self._source_info(info))
+        except Exception as exc:
+            if info.get("codex_live_identity"):
+                raise  # A fresh native proof never permits an unavailable baseline.
+            baseline = {"unavailable": type(exc).__name__}
+        fresh = self._revalidate_input(rec)
+        if baseline.get("native_identity"):
+            current_baseline = adapter.source.receipt_baseline(self._source_info(fresh))
+            if any(current_baseline.get(key) != baseline.get(key) for key in ("source_key", "path")):
+                raise BridgeError("Codex native rollout path changed; nothing was sent", code="native_rollout_changed", outcome="not_sent")
+        if (fresh.get("agent_status") not in ("idle", "done")
+                or fresh.get("state_change_seq") != info.get("state_change_seq")):
+            return {"state": "queued", "reason": "agent_changed_or_busy"}
+        blocker = self._native_input_blocker(fresh, rec)
+        if blocker:
+            return {"state": "queued", "reason": blocker}
+        # Transcript resolution can be slow enough for a draft or a
+        # local native turn to appear. Recheck both before reserving.
+        screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
+        if not known_empty_composer(rec["agent_kind"], screen):
+            return {"state": "rejected", "reason": "composer_not_known_empty"}
+        if rec["agent_kind"] == "codex":
+            fresh = self._revalidate_input(rec)
+            if (fresh.get("agent_status") not in ("idle", "done")
+                    or fresh.get("state_change_seq") != info.get("state_change_seq")):
+                return {"state": "queued", "reason": "agent_changed_or_busy"}
+            blocker = self._native_input_blocker(fresh, rec)
+            if blocker:
+                return {"state": "queued", "reason": blocker}
+            # Native metadata reads can outlast a local composer edit.
+            # Keep the final external read the exact ANSI draft guard.
+            screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
+            if not known_empty_composer(rec["agent_kind"], screen):
+                return {"state": "rejected", "reason": "composer_not_known_empty"}
+        return {"baseline": baseline, "fresh": fresh, "binding": source_info["_bridge_binding"]}
+
     def _dispatch_input(self, seq):
-        with self.lock:
-            with self.db:
-                rec = self.inputs.get(seq)
-                if not rec or rec["state"] != "queued":
-                    return self._input_result(rec) if rec else {"input_id": seq, "outcome": "rejected", "reason": "input_absent"}
-                if (not self.inputs.is_first(rec) or self.inputs.blocker(rec)
-                        or rec["pane_id"] in self.sending):
-                    return self._input_result(rec)
-                try:
-                    info = self._revalidate_input(rec)
-                    status = info.get("agent_status")
-                    if status == "blocked":
-                        return self._input_result(self.inputs.save(rec, "rejected", reason="agent_blocked_use_approval"))
-                    if status == "working":
-                        return self._input_result(self.inputs.save(rec, "queued", reason="agent_busy"))
-                    if status not in ("idle", "done"):
-                        return self._input_result(self.inputs.save(rec, "rejected", reason="agent_status_unknown"))
-                    blocker = self._native_input_blocker(info, rec)
-                    if blocker:
-                        return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
-                    adapter = self.adapters[rec["agent_kind"]]
-                    try:
-                        baseline = adapter.source.receipt_baseline(info)
-                    except Exception as exc:
-                        if info.get("codex_live_identity"):
-                            raise  # A fresh native proof never permits an unavailable baseline.
-                        baseline = {"unavailable": type(exc).__name__}
-                    fresh = self._revalidate_input(rec)
-                    if baseline.get("native_identity"):
-                        current_baseline = adapter.source.receipt_baseline(fresh)
-                        if any(current_baseline.get(key) != baseline.get(key) for key in ("source_key", "path")):
-                            raise BridgeError("Codex native rollout path changed; nothing was sent", code="native_rollout_changed", outcome="not_sent")
-                    if (fresh.get("agent_status") not in ("idle", "done")
-                            or fresh.get("state_change_seq") != info.get("state_change_seq")):
-                        return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
-                    blocker = self._native_input_blocker(fresh, rec)
-                    if blocker:
-                        return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
-                    # Transcript resolution can be slow enough for a draft or a
-                    # local native turn to appear. Recheck both before reserving.
-                    screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
-                    if not known_empty_composer(rec["agent_kind"], screen):
-                        return self._input_result(self.inputs.save(rec, "rejected", reason="composer_not_known_empty"))
-                    if rec["agent_kind"] == "codex":
-                        fresh = self._revalidate_input(rec)
-                        if (fresh.get("agent_status") not in ("idle", "done")
-                                or fresh.get("state_change_seq") != info.get("state_change_seq")):
-                            return self._input_result(self.inputs.save(rec, "queued", reason="agent_changed_or_busy"))
-                        blocker = self._native_input_blocker(fresh, rec)
-                        if blocker:
-                            return self._input_result(self.inputs.save(rec, "queued", reason=blocker))
-                        # Native metadata reads can outlast a local composer edit.
-                        # Keep the final external read the exact ANSI draft guard.
-                        screen = self.client.read_agent_once(rec["pane_id"], 160, source="visible", format="ansi")
-                        if not known_empty_composer(rec["agent_kind"], screen):
-                            return self._input_result(self.inputs.save(rec, "rejected", reason="composer_not_known_empty"))
-                    self._ensure_pane_available({**rec, "id": f"input:{rec['seq']}"})
-                    rec = self.inputs.save(rec, "reserved", reason="terminal_write_reserved",
+        with self.lock, self.db:
+            rec = self.inputs.get(seq)
+            if not rec or rec["state"] != "queued":
+                return self._input_result(rec) if rec else {"input_id": seq, "outcome": "rejected", "reason": "input_absent"}
+            if not self.inputs.is_first(rec) or self.inputs.blocker(rec) or rec["pane_id"] in self.sending:
+                return self._input_result(rec)
+            previous = self.inputs.last_dispatched(rec)
+            owner = self._claim_operation(rec)
+            if not owner:
+                return self._input_result(rec)
+        try:
+            try:
+                proof = self._probe_input(rec)
+            except BridgeError as exc:
+                proof = {"state": "rejected", "reason": "revalidation_failed"}
+                log.info("Herdr prompt rejected before terminal write: input=%s error=%s", rec["seq"], type(exc).__name__)
+            except Exception as exc:
+                proof = {"state": "rejected", "reason": "guard_unavailable"}
+                log.info("Herdr prompt guard unavailable: input=%s error=%s", rec["seq"], type(exc).__name__)
+            with self.lock:
+                with self.db:
+                    current = self.inputs.get(seq)
+                    if current != rec or self.inputs.last_dispatched(rec) != previous:
+                        return self._input_result(current)
+                    if rec["source"] == "slack":
+                        try:
+                            self._input_binding(rec["account_id"], rec["channel_id"], rec["binding"])
+                        except BridgeError:
+                            proof = {"state": "rejected", "reason": "revalidation_failed"}
+                    if not self.inputs.is_first(rec) or self.inputs.blocker(rec) or rec["pane_id"] in self.sending:
+                        return self._input_result(current)
+                    if "state" not in proof and self.adapters[rec["agent_kind"]].source.binding_snapshot(proof["fresh"]) != proof["binding"]:
+                        return self._input_result(current)
+                    if "state" in proof:
+                        return self._input_result(self.inputs.save(current, proof["state"], reason=proof["reason"]))
+                    self._ensure_pane_available({**rec, "id": f"input:{seq}"})
+                    rec = self.inputs.save(current, "reserved", reason="terminal_write_reserved",
                         attempt_id=uuid.uuid4().hex, reserved_at=self.clock(),
-                        dispatch_sequence=fresh.get("state_change_seq"), receipt_baseline=baseline)
-                except BridgeError as exc:
-                    rec = self.inputs.save(rec, "rejected", reason="revalidation_failed")
-                    log.info("Herdr prompt rejected before terminal write: input=%s error=%s", rec["seq"], type(exc).__name__)
-                    return self._input_result(rec)
-                except Exception as exc:
-                    rec = self.inputs.save(rec, "rejected", reason="guard_unavailable")
-                    log.info("Herdr prompt guard unavailable: input=%s error=%s", rec["seq"], type(exc).__name__)
-                    return self._input_result(rec)
-            self._claim_pane({**rec, "id": f"input:{rec['seq']}"})
+                        dispatch_sequence=proof["fresh"].get("state_change_seq"), receipt_baseline=proof["baseline"])
+                self._claim_pane({**rec, "id": f"input:{seq}"})
+            return self._finish_input(rec)
+        finally:
+            self._release_operation(owner)
+
+    def _finish_input(self, rec):
         try:
             try:
                 self.client.prompt_agent(rec["pane_id"], rec["prompt"])
@@ -1114,7 +1268,7 @@ class Bridge:
                     live = self._revalidate_started_input(rec)
                     baseline = rec.get("receipt_baseline", {})
                     if not baseline.get("unavailable") and self.adapters[rec["agent_kind"]].source.receipt_recorded(
-                            live, baseline, rec["prompt"]):
+                            self._source_info(live), baseline, rec["prompt"]):
                         rec = self._save_input_progress(rec["seq"], "confirmed", reason="exact_user_transcript_recorded",
                                                         confirmed_at=self.clock())
                         return self.inputs.result(rec)
@@ -1205,7 +1359,7 @@ class Bridge:
             if baseline.get("unavailable"):
                 continue
             try:
-                if self.adapters[rec["agent_kind"]].source.receipt_recorded(info, baseline, rec["prompt"]):
+                if self.adapters[rec["agent_kind"]].source.receipt_recorded(self._source_info(info), baseline, rec["prompt"]):
                     with self.lock, self.db:
                         current = self.inputs.get(rec["seq"])
                         if current and current["state"] != "confirmed" and not current.get("arbiter_released"):
@@ -1227,9 +1381,9 @@ class Bridge:
         """Compatibility facade for `/herdr send`, using the same safe arbiter."""
         if not isinstance(text, str) or not text.strip() or len(text) > 16000:
             raise BridgeError("Prompt must contain 1–16000 characters", code="invalid_prompt", outcome="not_sent")
+        info = self._agent(pane)
+        snapshot = self._input_snapshot(info)
         with self.lock, self.db:
-            info = self._agent(pane)
-            snapshot = self._input_snapshot(info)
             rec = self.inputs.insert({"source": "command", "account_id": "local",
                 "channel_id": pane, "message_ts": uuid.uuid4().hex, "sender_id": "authorized-command",
                 "thread_id": None, "binding": None, "prompt": text.strip(), **snapshot})
@@ -1241,10 +1395,8 @@ class Bridge:
             if info.get("agent_status") not in ("idle", "done"):
                 rec = self.inputs.save(rec, "rejected", reason="agent_status_unknown")
                 raise BridgeError("Agent status is not recognized as safe; nothing was sent", code="agent_status_unknown", outcome="not_sent")
-            blocker = self._native_input_blocker(info, rec)
-            if blocker:
-                return self.inputs.result(self.inputs.save(rec, "queued", reason=blocker))
         return self._dispatch_input(rec["seq"])
 
     def close(self):
-        self.db.close()
+        with self.lock:
+            self.db.close()

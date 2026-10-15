@@ -166,7 +166,7 @@ def test_sending_cannot_answer_blocked_dialog(setup):
     client, bridge = setup
     # This composer/approval fake has no native UUID, daemon or rollout.
     # Native FIFO evidence is exercised by test_codex_input_readiness instead.
-    bridge.adapters["codex"].source.input_blocker = lambda info, previous=None: None
+    bridge.adapters["codex"].source.input_blocker = lambda info, previous=None, **kwargs: None
     with pytest.raises(BridgeError):
         bridge.send("w4:p2", "y")
     client.info["agent_status"] = "idle"

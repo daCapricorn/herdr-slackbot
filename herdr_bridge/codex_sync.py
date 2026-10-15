@@ -169,7 +169,7 @@ class CodexRolloutSync(TranscriptSync):
                 db.execute("INSERT OR IGNORE INTO codex_completion_turns VALUES (?,?,?)",
                            (record["source_key"], record["turn_id"], record["event_id"]))
 
-    def input_blocker(self, info, previous=None):
+    def input_blocker(self, info, previous=None, *, states=None, deltas=None):
         """Read-only FIFO evidence, independent of direct-input/steering capacity."""
         native = info.get(NATIVE_STATUS)
         if native:
@@ -193,18 +193,18 @@ class CodexRolloutSync(TranscriptSync):
         if native and (native.get("path") != str(path) or native.get("cwd") != info.get("cwd")
                        or native.get("home") != str(self.home)):
             raise SessionUnavailable("Codex readiness source changed")
-        owner = self._input_lifecycle(info, path, allow_orphan_close=bool(native))
+        owner = self._input_lifecycle(info, path, allow_orphan_close=bool(native), states=states, deltas=deltas)
         if not owner["complete"] or not owner["known"]:
             return "codex_native_readiness_unavailable"
         if owner["active"] is not None:
             return "codex_native_busy"
         if previous:
-            barrier = self._input_lifecycle(info, path, previous)
+            barrier = self._input_lifecycle(info, path, previous, states=states, deltas=deltas)
             if not barrier["complete"] or not barrier["closed"] or barrier["active"] is not None:
                 return "codex_native_turn_unsettled"
         return None
 
-    def _input_lifecycle(self, info, path, previous=None, limit=16 * 1024 * 1024, allow_orphan_close=False):
+    def _input_lifecycle(self, info, path, previous=None, limit=16 * 1024 * 1024, allow_orphan_close=False, *, states=None, deltas=None):
         """Persist bounded incremental lifecycle scans, never rescan old history.
 
         The general scan starts near EOF on first attach. A confirmed input's
@@ -226,7 +226,7 @@ class CodexRolloutSync(TranscriptSync):
                     or baseline.get("source_key") != f"{terminal}:{session_of(info)}"):
                 raise SessionUnavailable("Codex prior input source changed")
             expected = previous["prompt"]
-        row = self.db.execute("SELECT record FROM codex_input_readiness WHERE source_key=?", (key,)).fetchone()
+        row = states.get(key) if states is not None else self.db.execute("SELECT record FROM codex_input_readiness WHERE source_key=?", (key,)).fetchone()
         state = json.loads(row[0]) if row else None
         if state and state.get("anchor") and stat.st_size >= state["offset"]:
             with path.open("rb") as stream:
@@ -299,7 +299,10 @@ class CodexRolloutSync(TranscriptSync):
         after = path.stat()
         if (stat.st_dev, stat.st_ino) != (after.st_dev, after.st_ino) or after.st_size < stat.st_size:
             raise SessionUnavailable("Codex lifecycle source changed while reading")
-        self.db.execute("INSERT OR REPLACE INTO codex_input_readiness VALUES (?,?)", (key, json.dumps(state)))
+        if deltas is not None:
+            deltas[key] = json.dumps(state)
+        else:
+            self.db.execute("INSERT OR REPLACE INTO codex_input_readiness VALUES (?,?)", (key, json.dumps(state)))
         return {**state, "complete": state["offset"] == after.st_size}
 
     def latest_turn_offset(self, path):
@@ -340,15 +343,19 @@ class CodexRolloutSync(TranscriptSync):
             raise SessionUnavailable("Codex fresh receipt proof differs from current identity")
         return native_rollout_path(proof.get("path"), tid, self.home)
 
-    def initial_observation(self, info, session):
+    def initial_observation(self, info, session, *, records=None):
         # Reserve already commits the exact receipt baseline in Herdr SQLite.
         # Recover that cutoff even if a very fast first turn completes before
         # discovery, or the bridge restarts. Never override an existing cursor.
         tid, path, cwd = session
-        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminal_inputs'").fetchone():
-            terminal = info.get("terminal_id") or info.get("pane_id", "")
-            records = self.db.execute("SELECT record FROM terminal_inputs WHERE terminal_id=? AND session_id=? "
-                "AND state IN ('reserved','observing','uncertain','confirmed') ORDER BY seq", (terminal, tid))
+        if records is None:
+            records = []
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminal_inputs'").fetchone():
+                terminal = info.get("terminal_id") or info.get("pane_id", "")
+                records = self.db.execute("SELECT record FROM terminal_inputs WHERE terminal_id=? AND session_id=? "
+                    "AND state IN ('reserved','observing','uncertain','confirmed') ORDER BY seq", (terminal, tid)).fetchall()
+        terminal = info.get("terminal_id") or info.get("pane_id", "")
+        if records:
             for (raw,) in records:
                 rec = json.loads(raw)
                 baseline = rec.get("receipt_baseline", {})
@@ -374,28 +381,36 @@ class CodexRolloutSync(TranscriptSync):
         if session_of(info):
             return validate_rollout(resolve_session(info, home=self.home))
         key = info.get("terminal_id")
-        binding = self.db.execute("SELECT thread_id,cwd FROM codex_session_bindings WHERE terminal_id=?", (key,)).fetchone()
+        binding = info["_bridge_binding"] if "_bridge_binding" in info else self.binding_snapshot(info)
         if binding and binding[1] != info.get("cwd"):
             raise SessionUnavailable("Bound directory changed; bind the current session again")
         return validate_rollout(resolve_session(info, home=self.home,
             unique_workspace=unique_workspace, thread_id=binding[0] if binding else None))
 
-    def bound_info(self, info):
-        binding = self.db.execute("SELECT thread_id FROM codex_session_bindings WHERE terminal_id=?",
-                                  (info.get("terminal_id"),)).fetchone()
+    def binding_snapshot(self, info):
+        return self.db.execute("SELECT thread_id,cwd FROM codex_session_bindings WHERE terminal_id=?", (info.get("terminal_id"),)).fetchone()
+
+    def bound_info(self, info, *, binding=...):
+        if binding is ...:
+            binding = self.binding_snapshot(info)
         if not binding:
             return info
-        tid, _, _ = self._resolve(info)
+        tid, _, _ = self._resolve({**info, "_bridge_binding": binding})
         return {**info, "agent_session": {"value": tid}}
 
-    def bind(self, info, thread_id):
+    def validate_binding(self, info, thread_id):
         if not info.get("terminal_id"):
             raise SessionUnavailable("Exact terminal id required for binding")
-        tid, path, cwd = validate_rollout(resolve_session(info, home=self.home, thread_id=thread_id))
-        self.db.execute("INSERT OR REPLACE INTO codex_session_bindings VALUES (?, ?, ?)",
-                        (info["terminal_id"], tid, cwd))
+        return validate_rollout(resolve_session(info, home=self.home, thread_id=thread_id))
+
+    def apply_binding(self, info, session):
+        tid, _, cwd = session
+        self.db.execute("INSERT OR REPLACE INTO codex_session_bindings VALUES (?,?,?)", (info["terminal_id"], tid, cwd))
         self._status(info, "ready", thread_id=tid, source="explicit", reason="Bound; waiting for next scan")
         return self.diagnostic(info)
+
+    def bind(self, info, thread_id):
+        return self.apply_binding(info, self.validate_binding(info, thread_id))
 
     def record_answer(self, record, *, new=True):
         # Preserve immutable modern registration. Replayed IDs can revalidate
@@ -422,12 +437,17 @@ class CodexRolloutSync(TranscriptSync):
                 (event_id,source_key,turn_id,record) VALUES (?,?,?,?)""",
                 (record["event_id"], record["source_key"], record["turn_id"], json.dumps(record)))
 
+    def apply_reset(self, source_key):
+        self.db.execute("UPDATE codex_completion_pending SET validated=0 WHERE source_key=?", (source_key,))
+
     def reset_source(self, source_key, path=None):
-        turns = {row[0] for row in self.db.execute(
-            "SELECT turn_id FROM codex_completion_pending WHERE source_key=?", (source_key,))}
+        turns = {row[0] for row in self.db.execute("SELECT turn_id FROM codex_completion_pending WHERE source_key=?", (source_key,))}
         if not turns:
             return None
-        self.db.execute("UPDATE codex_completion_pending SET validated=0 WHERE source_key=?", (source_key,))
+        self.apply_reset(source_key)
+        return self.read_reset_offset(path, turns)
+
+    def read_reset_offset(self, path, turns):
         # Re-read only the bounded suffix needed by registered unresolved turns.
         # Ordinary first-attach history remains skipped, including legacy IDs.
         size = path.stat().st_size
